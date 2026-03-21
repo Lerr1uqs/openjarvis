@@ -1,0 +1,7 @@
+.qoder
+
+# Added by cargo
+
+/target
+/node_modules
+config.yaml

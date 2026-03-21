@@ -1,0 +1,11 @@
+{
+  "name": "openjarvis-feishu-sidecar",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "feishu:ws": "node scripts/feishu_ws_client.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.59.0"
+  }
+}

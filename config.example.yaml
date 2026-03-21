@@ -1,0 +1,23 @@
+server:
+  bind: "0.0.0.0:3000"
+
+feishu:
+  mode: "long_connection"
+  webhook_path: "/webhook/feishu"
+  open_base_url: "https://open.feishu.cn"
+  app_id: "cli_xxx"
+  app_secret: "xxx"
+  verification_token: ""
+  encrypt_key: ""
+  dry_run: true
+  auto_start_sidecar: true
+  node_bin: "node"
+  sidecar_script: "scripts/feishu_ws_client.mjs"
+
+llm:
+  provider: "mock"
+  model: "mock-received"
+  base_url: "https://api.openai.com/v1"
+  api_key: ""
+  system_prompt: "你是 OpenJarvis。当前阶段固定回复 [openjarvis][DEBUG] 测试回复。"
+  mock_response: "[openjarvis][DEBUG] 测试回复"
