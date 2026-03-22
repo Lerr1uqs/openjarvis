@@ -1,3 +1,5 @@
+//! Shared inbound and outbound message models exchanged between channels and the router.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -101,6 +101,32 @@ async fn mock_provider_does_not_require_api_key_path() {
     );
 }
 
+#[tokio::test]
+async fn anthropic_provider_builds_but_generate_is_not_implemented() {
+    let config = LlmConfig {
+        provider: "anthropic".to_string(),
+        model: "claude-3-7-sonnet".to_string(),
+        base_url: "https://api.anthropic.com".to_string(),
+        api_key: "test-key".to_string(),
+        ..LlmConfig::default()
+    };
+
+    let provider = build_provider(&config).expect("anthropic placeholder should build");
+    let error = provider
+        .generate(LLMRequest {
+            messages: build_messages("system", "hello"),
+            tools: Vec::new(),
+        })
+        .await
+        .expect_err("anthropic placeholder should not generate yet");
+
+    assert!(
+        error
+            .to_string()
+            .contains("provider protocol `anthropic` is not implemented yet")
+    );
+}
+
 fn build_messages(system_prompt: &str, user_message: &str) -> Vec<ChatMessage> {
     // 作用: 为 llm 单测构造最小结构化消息列表。
     // 参数: system_prompt 为系统提示词，user_message 为用户消息。

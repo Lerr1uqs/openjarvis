@@ -1,3 +1,9 @@
+//! In-memory session storage that groups conversation threads by channel and user.
+//!
+//! This store is responsible for session state, not execution scheduling. Today callers are
+//! expected to feed turns in order. When concurrent turn execution is introduced later, ordering
+//! should be enforced by the agent-side inbox or worker scheduler rather than by this store alone.
+
 use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::model::IncomingMessage;
 use crate::thread::ConversationThread;
@@ -13,9 +19,8 @@ pub struct SessionKey {
 }
 
 impl SessionKey {
+    /// Build a stable session key from a normalized incoming message.
     pub fn from_incoming(incoming: &IncomingMessage) -> Self {
-        // 作用: 从统一入站消息中提取 session 的唯一键。
-        // 参数: incoming 为标准化后的用户消息，包含 channel 和 user_id。
         Self {
             channel: incoming.channel.clone(),
             user_id: incoming.user_id.clone(),
@@ -30,9 +35,8 @@ pub struct Session {
 }
 
 impl Session {
+    /// Create an empty session snapshot.
     pub fn new(now: DateTime<Utc>) -> Self {
-        // 作用: 创建一个新的 session 容器。
-        // 参数: now 为 session 的初始更新时间。
         Self {
             threads: HashMap::new(),
             updated_at: now,
@@ -54,15 +58,16 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Create an empty in-memory session manager.
     pub fn new() -> Self {
-        // 作用: 创建内存态 session manager，用于维护当前进程内的会话状态。
-        // 参数: 无，内部会初始化空的 session 映射。
         Self::default()
     }
 
+    /// Start a new turn, creating the session and thread on demand and materializing the next context.
+    ///
+    /// This method only mutates session state for the new pending turn. It does not by itself
+    /// prevent two turns from the same session or thread from running concurrently.
     pub async fn begin_turn(&self, incoming: &IncomingMessage, system_prompt: &str) -> PendingTurn {
-        // 作用: 为当前入站消息找到或创建 session/thread，并生成本轮待执行上下文。
-        // 参数: incoming 为用户消息，system_prompt 为当前 agent 使用的系统提示词。
         let now = Utc::now();
         let session_key = SessionKey::from_incoming(incoming);
         let thread_id = resolve_thread_id(incoming);
@@ -92,9 +97,8 @@ impl SessionManager {
         }
     }
 
+    /// Complete a turn with a plain assistant reply.
     pub async fn complete_turn(&self, pending: &PendingTurn, assistant_message: &str) {
-        // 作用: 在 LLM 返回后把 assistant 回复补写回对应的 turn。
-        // 参数: pending 为 begin_turn 返回的挂起轮次，assistant_message 为回复文本。
         let completed_at = Utc::now();
         self.complete_turn_with_messages(
             pending,
@@ -114,8 +118,11 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         completed_at: DateTime<Utc>,
     ) {
-        // 作用: 在 LLM 返回后把本轮完整消息轨迹补写回对应 turn。
-        // 参数: pending 为 begin_turn 返回的挂起轮次，messages 为 assistant/tool 历史，completed_at 为完成时间。
+        // Complete the pending turn after the agent loop finishes.
+        //
+        // This write is intentionally narrow. Any future concurrent execution model still needs
+        // an external ordering guarantee so turns from the same session or thread are completed
+        // in the intended sequence.
         let mut sessions = self.sessions.write().await;
         let Some(session) = sessions.get_mut(&pending.session_key) else {
             return;
@@ -128,17 +135,15 @@ impl SessionManager {
         session.updated_at = completed_at;
     }
 
+    /// Return a cloned session snapshot for debugging or tests.
     pub async fn get_session(&self, key: &SessionKey) -> Option<Session> {
-        // 作用: 查询当前内存中的 session 快照，主要用于调试和测试。
-        // 参数: key 为 channel + user_id 组成的 session 唯一键。
         let sessions = self.sessions.read().await;
         sessions.get(key).cloned()
     }
 }
 
 fn resolve_thread_id(incoming: &IncomingMessage) -> String {
-    // 作用: 解析当前消息所属线程，没有线程 ID 时回落到 default。
-    // 参数: incoming 为统一入站消息，可能带平台原生 thread_id。
+    // Use the upstream thread id when present, otherwise keep a single default thread.
     incoming
         .thread_id
         .clone()

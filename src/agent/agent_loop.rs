@@ -1,3 +1,5 @@
+//! ReAct-style agent loop that calls the LLM, executes tools, and streams events to the router.
+
 use super::{
     hook::{HookEvent, HookEventKind},
     runtime::AgentRuntime,
@@ -32,6 +34,7 @@ pub struct AgentEventSender {
 }
 
 impl AgentEventSender {
+    /// Bind the router sender to one user/session context so agent events can be emitted directly.
     pub fn new(
         router_tx: mpsc::Sender<OutgoingMessage>,
         channel: impl Into<String>,
@@ -42,8 +45,6 @@ impl AgentEventSender {
         session_user_id: impl Into<String>,
         session_thread_id: impl Into<String>,
     ) -> Self {
-        // 作用: 绑定 router tx 和当前用户上下文，供 agent loop 直接推送事件消息。
-        // 参数: router_tx 为发往 router 的出站消息通道，其余字段用于生成统一 OutgoingMessage。
         Self {
             router_tx,
             channel: channel.into(),
@@ -57,9 +58,8 @@ impl AgentEventSender {
         }
     }
 
+    /// Convert one agent-loop event into an `OutgoingMessage` and forward it to the router.
     pub async fn send(&self, event: AgentLoopEvent) -> Result<()> {
-        // 作用: 把 agent loop 事件转换成统一出站消息，并立即转发给 router。
-        // 参数: event 为当前轮产生的 text_output、tool_call 或 tool_result 事件。
         let reply_to_message_id = if self.should_reply_to_source.swap(false, Ordering::AcqRel) {
             self.source_message_id.clone()
         } else {
@@ -88,7 +88,7 @@ impl AgentEventSender {
     }
 }
 
-pub struct AgentLoopInput {
+pub struct InfoContext {
     pub channel: String,
     pub user_id: String,
     pub thread_id: String,
@@ -122,29 +122,25 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// Create an agent loop bound to one LLM provider and runtime container.
     pub fn new(llm: Arc<dyn LLMProvider>, runtime: AgentRuntime) -> Self {
-        // 作用: 创建 agent loop 执行器，并绑定模型与运行时 registries。
-        // 参数: llm 为当前 loop 使用的模型提供者，runtime 为 hook/tool/mcp 运行时容器。
         Self { llm, runtime }
     }
 
+    /// Return the runtime used by this loop.
     pub fn runtime(&self) -> &AgentRuntime {
-        // 作用: 返回当前 agent loop 绑定的运行时，用于向外暴露 registries。
-        // 参数: 无，返回当前 loop 内部持有的 runtime 引用。
         &self.runtime
     }
 
-    /**
-    ReAct contract:
-    1. `run` 自己维护本轮可变 `messages` 历史，初始值来自 `context.as_messages()`。
-    2. 每次循环只调用一次 `llm.generate(messages)`，禁止再走“first/final”两段式专用请求。
-    3. 当前轮只要模型返回了可见文本，就立刻通过已绑定用户上下文的 `router_tx` 发送 `text_output` 事件。
-    4. 当前轮返回的全部 `tool_calls` 都要逐个发送 `tool_call`、执行工具、发送 `tool_result`，并把 assistant/tool 消息追加回 `messages`。
-    5. 只有当本次 `generate` 返回空 `tool_calls` 时才能结束循环；最终回复就是最后一次文本输出。
-    */
+    /// ReAct contract:
+    /// 1. `run` 自己维护本轮可变 `messages` 历史，初始值来自 `context.as_messages()`。
+    /// 2. 每次循环只调用一次 `llm.generate(messages)`，禁止再走“first/final”两段式专用请求。
+    /// 3. 当前轮只要模型返回了可见文本，就立刻通过已绑定用户上下文的 `router_tx` 发送 `text_output` 事件。
+    /// 4. 当前轮返回的全部 `tool_calls` 都要逐个发送 `tool_call`、执行工具、发送 `tool_result`，并把 assistant/tool 消息追加回 `messages`。
+    /// 5. 只有当本次 `generate` 返回空 `tool_calls` 时才能结束循环；最终回复就是最后一次文本输出。
     pub async fn run(
         &self,
-        input: AgentLoopInput,
+        input: InfoContext,
         context: &ContextMessage,
     ) -> Result<AgentLoopOutput> {
         self.runtime.tools().register_builtin_tools().await?;
@@ -338,8 +334,7 @@ fn build_assistant_tool_call_message(
     assistant_message: Option<&ChatMessage>,
     tool_calls: &[crate::llm::LLMToolCall],
 ) -> ChatMessage {
-    // 作用: 为持久化层构造 assistant 的原始 tool-call message，保证历史上下文可原样回放。
-    // 参数: assistant_message 为模型返回的可见文本部分，tool_calls 为模型原生函数调用列表。
+    // Preserve the original assistant tool-call message so persisted history can be replayed verbatim.
     let created_at = assistant_message
         .map(|message| message.created_at)
         .unwrap_or_else(Utc::now);
@@ -352,8 +347,7 @@ fn build_assistant_tool_call_message(
 }
 
 fn format_tool_result_content(content: &str, is_error: bool) -> String {
-    // 作用: 统一生成发送给模型和持久化的 tool result 文本，避免当前轮与历史回放不一致。
-    // 参数: content 为工具执行结果原文，is_error 表示本次工具执行是否失败。
+    // Keep tool result text identical between immediate replies and persisted history.
     if is_error {
         return format!("Tool execution failed: {content}");
     }
@@ -362,8 +356,7 @@ fn format_tool_result_content(content: &str, is_error: bool) -> String {
 }
 
 fn build_react_messages(context: &ContextMessage) -> Messages {
-    // 作用: 把当前上下文和工具使用约束拼接成第一次 LLM 请求消息列表。
-    // 参数: context 为当前上下文消息。
+    // Inject a tool-usage instruction into the first request assembled from the current context.
     let mut messages = context.as_messages();
     let insert_at = context.system.len() + context.memory.len();
     messages.insert(

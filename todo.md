@@ -1,3 +1,5 @@
 - [ ] Session的postgralsql落盘
 - [ ] agent的Outgoing返回
 - [ ] 飞书发送的限流阀（延时
+- [ ] hook改为agenthook 因为可能有其他种hook后面要添加
+- [ ] session manager是全局的 

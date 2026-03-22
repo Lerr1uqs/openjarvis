@@ -1,5 +1,7 @@
+//! LLM provider abstraction and OpenAI-compatible request/response serialization.
+
 use crate::{
-    agent::ToolDefinition,
+    agent::{ToolDefinition, ToolSchemaProtocol},
     config::LlmConfig,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
 };
@@ -40,14 +42,12 @@ pub struct LLMResponse {
 
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
-    /// 作用: 根据当前请求中的结构化消息和工具定义生成模型输出。
-    /// 参数: request 为已经整理好的 ChatMessage、tools 和工具执行上下文。
+    /// Generate one model response from structured messages and tool definitions.
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse>;
 }
 
+/// Build the configured LLM provider implementation.
 pub fn build_provider(config: &LlmConfig) -> Result<Arc<dyn LLMProvider>> {
-    // 作用: 按配置构造具体的 LLM provider 实现。
-    // 参数: config 为 llm 子配置，决定 provider 类型和所需鉴权信息。
     match LLMProviderProtocol::from_config(config)? {
         LLMProviderProtocol::Mock => {
             Ok(Arc::new(MockLLMProvider::new(config.mock_response.clone())))
@@ -56,9 +56,9 @@ pub fn build_provider(config: &LlmConfig) -> Result<Arc<dyn LLMProvider>> {
             let resolved_config = resolve_llm_config(config)?;
             Ok(Arc::new(OpenaiProvider::new(resolved_config)?))
         }
-        LLMProviderProtocol::Anthropic => {
-            bail!("provider protocol `anthropic` is not implemented yet")
-        }
+        LLMProviderProtocol::Anthropic => Ok(Arc::new(AnthropicProvider::new(resolve_llm_config(
+            config,
+        )?))),
     }
 }
 
@@ -70,11 +70,11 @@ enum LLMProviderProtocol {
 
 impl LLMProviderProtocol {
     fn from_config(config: &LlmConfig) -> Result<Self> {
-        // 作用: 从配置中的 provider 字段解析底层协议类型，统一处理别名。
-        // 参数: config 为 llm 子配置，provider 字段可为 mock、deepseek、openai 等别名。
+        // Normalize configured provider aliases into one internal protocol enum.
+        // TODO: 这里的check有问题 Provider很多 应该限制协议
         match config.provider.trim().to_ascii_lowercase().as_str() {
             "mock" | "mock_llm" => Ok(Self::Mock),
-            "openai_compatible" | "openai" | "deepseek" => Ok(Self::OpenAiCompatible),
+            "openai_compatible" | "openai" | "deepseek" | "ark" => Ok(Self::OpenAiCompatible),
             "anthropic" | "claude" => Ok(Self::Anthropic),
             other => bail!("unsupported llm provider `{other}`"),
         }
@@ -86,9 +86,8 @@ pub struct MockLLMProvider {
 }
 
 impl MockLLMProvider {
+    /// Create a fixed-response mock provider for local loop tests.
     pub fn new(response: impl Into<String>) -> Self {
-        // 作用: 创建一个固定回包的 mock provider，用于本地链路调试。
-        // 参数: response 为 generate 时直接返回的固定文本。
         Self {
             response: response.into(),
         }
@@ -98,8 +97,7 @@ impl MockLLMProvider {
 #[async_trait]
 impl LLMProvider for MockLLMProvider {
     async fn generate(&self, _request: LLMRequest) -> Result<LLMResponse> {
-        // 作用: 返回固定 mock 文本，不访问任何外部模型服务。
-        // 参数: _request 为兼容统一接口的入参，当前不会被实际使用。
+        // Return a deterministic assistant reply without calling any external service.
         Ok(LLMResponse {
             message: Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
@@ -118,8 +116,7 @@ pub struct OpenaiProvider {
 
 impl OpenaiProvider {
     fn new(config: LlmConfig) -> Result<Self> {
-        // 作用: 创建 OpenAI 兼容协议 provider，并校验必要配置。
-        // 参数: config 为 provider 的 base_url、api_key 和 model 配置。
+        // Validate the required fields and build an OpenAI-compatible client.
         if config.api_key.trim().is_empty() {
             bail!("llm.api_key is required when provider=openai_compatible");
         }
@@ -138,11 +135,21 @@ impl OpenaiProvider {
     }
 }
 
+pub struct AnthropicProvider {
+    config: LlmConfig,
+}
+
+impl AnthropicProvider {
+    fn new(config: LlmConfig) -> Self {
+        // Keep a dedicated protocol branch even before the Anthropic transport is implemented.
+        Self { config }
+    }
+}
+
 #[async_trait]
 impl LLMProvider for OpenaiProvider {
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse> {
-        // 作用: 调用 OpenAI SDK 生成结构化回复和原生 tool calls。
-        // 参数: request 为结构化 ChatMessage、tools 和工具执行上下文。
+        // Execute one OpenAI-compatible chat completion request and normalize the reply.
         if request.messages.is_empty() {
             bail!("llm request must contain at least one message");
         }
@@ -179,12 +186,20 @@ impl LLMProvider for OpenaiProvider {
     }
 }
 
+#[async_trait]
+impl LLMProvider for AnthropicProvider {
+    async fn generate(&self, request: LLMRequest) -> Result<LLMResponse> {
+        // Keep the protocol-specific entrypoint in place until the transport is implemented.
+        let _ = build_anthropic_request(&self.config, &request)?;
+        unreachable!("anthropic placeholder should always return an error before this point");
+    }
+}
+
 fn build_openai_request(
     config: &LlmConfig,
     request: LLMRequest,
 ) -> Result<CreateChatCompletionRequest> {
-    // 作用: 把统一 LLM 请求转换为 OpenAI SDK 的 chat completion 请求体。
-    // 参数: config 为当前模型配置，request 为统一结构化请求。
+    // Convert the protocol-agnostic request into the OpenAI SDK request shape.
     let messages = serialize_openai_messages(&request.messages)?;
     let tools = serialize_openai_tools(&request.tools)?;
     let mut builder = CreateChatCompletionRequestArgs::default();
@@ -207,8 +222,7 @@ fn build_openai_request(
 fn serialize_openai_messages(
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatCompletionRequestMessage>> {
-    // 作用: 把通用 ChatMessage 列表转换成 OpenAI SDK messages 数组。
-    // 参数: messages 为统一消息模型，已经包含完整的 assistant/tool 历史。
+    // Serialize the unified chat history into OpenAI chat-completion messages.
     messages
         .iter()
         .map(serialize_context_message)
@@ -216,8 +230,7 @@ fn serialize_openai_messages(
 }
 
 fn serialize_context_message(message: &ChatMessage) -> Result<ChatCompletionRequestMessage> {
-    // 作用: 把通用 ChatMessage 转换成 OpenAI SDK 的单条 message。
-    // 参数: message 为统一上下文消息。
+    // Convert one unified message into the matching OpenAI message variant.
     match message.role {
         ChatMessageRole::System | ChatMessageRole::Memory => {
             Ok(ChatCompletionRequestSystemMessageArgs::default()
@@ -266,15 +279,14 @@ fn serialize_context_message(message: &ChatMessage) -> Result<ChatCompletionRequ
 }
 
 fn serialize_openai_tools(tools: &[ToolDefinition]) -> Result<Vec<ChatCompletionTools>> {
-    // 作用: 把工具定义转换成 OpenAI SDK 原生 `tools` 数组。
-    // 参数: tools 为当前可用工具定义列表。
+    // Project unified tool definitions into OpenAI-compatible tool descriptors.
     tools
         .iter()
         .map(|tool| {
             let function = FunctionObjectArgs::default()
                 .name(tool.name.clone())
                 .description(tool.description.clone())
-                .parameters(tool.parameters.clone())
+                .parameters(tool.input_schema.for_protocol(ToolSchemaProtocol::OpenAi))
                 .build()
                 .with_context(|| format!("failed to build tool schema for `{}`", tool.name))?;
             Ok(ChatCompletionTools::Function(ChatCompletionTool {
@@ -284,9 +296,49 @@ fn serialize_openai_tools(tools: &[ToolDefinition]) -> Result<Vec<ChatCompletion
         .collect()
 }
 
+fn build_anthropic_request(config: &LlmConfig, request: &LLMRequest) -> Result<()> {
+    // Keep Anthropic request assembly behind its own protocol boundary for future implementation.
+    if request.messages.is_empty() {
+        bail!("llm request must contain at least one message");
+    }
+
+    let _ = serialize_anthropic_messages(&request.messages)?;
+    let _ = serialize_anthropic_tools(&request.tools)?;
+    let _ = config;
+    bail!("provider protocol `anthropic` is not implemented yet")
+}
+
+fn serialize_anthropic_messages(messages: &[ChatMessage]) -> Result<Vec<Value>> {
+    // Placeholder serializer for Anthropic-compatible message payloads.
+    let serialized = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": format!("{:?}", message.role).to_ascii_lowercase(),
+                "content": message.content.clone(),
+                "tool_call_id": message.tool_call_id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serialized)
+}
+
+fn serialize_anthropic_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
+    // Placeholder serializer for Anthropic-compatible tool descriptors.
+    Ok(tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name.clone(),
+                "description": tool.description.clone(),
+                "input_schema": tool.input_schema.for_protocol(ToolSchemaProtocol::Anthropic),
+            })
+        })
+        .collect())
+}
+
 fn serialize_openai_tool_call(tool_call: &LLMToolCall) -> ChatCompletionMessageToolCalls {
-    // 作用: 把统一工具调用结构转换为 OpenAI SDK assistant message 里的 tool_calls 项。
-    // 参数: tool_call 为模型已经发起的工具调用。
+    // Serialize one normalized tool call back into the OpenAI assistant-tool-call shape.
     ChatCompletionMessageToolCall {
         id: tool_call.id.clone(),
         function: FunctionCall {
@@ -298,8 +350,7 @@ fn serialize_openai_tool_call(tool_call: &LLMToolCall) -> ChatCompletionMessageT
 }
 
 fn parse_openai_tool_call(tool_call: ChatCompletionMessageToolCalls) -> Result<LLMToolCall> {
-    // 作用: 把 OpenAI SDK 原生 tool_call 结构转换成统一工具调用模型。
-    // 参数: tool_call 为 OpenAI assistant message 中的单条 tool_call。
+    // Parse one OpenAI SDK tool call into the unified tool call model.
     match tool_call {
         ChatCompletionMessageToolCalls::Function(tool_call) => {
             let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
@@ -323,8 +374,7 @@ fn parse_openai_tool_call(tool_call: ChatCompletionMessageToolCalls) -> Result<L
 }
 
 fn resolve_llm_config(config: &LlmConfig) -> Result<LlmConfig> {
-    // 作用: 解析 llm 配置中的 api key 来源，并返回可直接用于 provider 的配置副本。
-    // 参数: config 为原始 llm 配置，可能包含 api_key_path。
+    // Resolve the final config, loading the API key from `api_key_path` when needed.
     let mut resolved = config.clone();
     if resolved.api_key.trim().is_empty() && !resolved.api_key_path.as_os_str().is_empty() {
         let expanded_path = expand_home_dir(&resolved.api_key_path)?;
@@ -338,8 +388,7 @@ fn resolve_llm_config(config: &LlmConfig) -> Result<LlmConfig> {
 }
 
 fn expand_home_dir(path: &Path) -> Result<PathBuf> {
-    // 作用: 解析配置中的波浪线路径，展开为当前用户目录下的绝对路径。
-    // 参数: path 为原始配置路径，支持 `~` 和 `~/...` 两种形式。
+    // Expand `~` prefixes so API key paths can be resolved consistently across environments.
     let raw = path.to_string_lossy();
     if raw == "~" {
         return resolve_home_dir();
@@ -352,8 +401,7 @@ fn expand_home_dir(path: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_home_dir() -> Result<PathBuf> {
-    // 作用: 获取当前进程用户目录，用于展开波浪线路径。
-    // 参数: 无，优先读取 HOME，再回退 USERPROFILE。
+    // Resolve the current user's home directory for path expansion.
     if let Ok(home) = env::var("HOME") {
         if !home.trim().is_empty() {
             return Ok(PathBuf::from(home));

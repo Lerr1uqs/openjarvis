@@ -1,3 +1,5 @@
+//! Context and chat message types used to assemble prompt history for the agent loop.
+
 use crate::thread::ConversationThread;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,9 +16,8 @@ pub enum ChatMessageRole {
 }
 
 impl ChatMessageRole {
+    /// Return the stable label used when rendering messages into plain-text prompts.
     pub fn as_label(&self) -> &'static str {
-        // 作用: 把内部消息角色枚举转换成渲染 prompt 时使用的标签文本。
-        // 参数: 无，返回当前角色对应的稳定字符串。
         match self {
             Self::System => "system",
             Self::Memory => "memory",
@@ -47,13 +48,12 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Create a structured chat message with empty tool metadata.
     pub fn new(
         role: ChatMessageRole,
         content: impl Into<String>,
         created_at: DateTime<Utc>,
     ) -> Self {
-        // 作用: 创建一条结构化 chat message，用于 context 组织。
-        // 参数: role 为消息角色，content 为文本内容，created_at 为创建时间。
         Self {
             role,
             content: content.into(),
@@ -63,16 +63,14 @@ impl ChatMessage {
         }
     }
 
+    /// Attach assistant-side tool calls to the message.
     pub fn with_tool_calls(mut self, tool_calls: Vec<ChatToolCall>) -> Self {
-        // 作用: 为 assistant 消息追加原生 tool_calls，用于回放 tool use 历史。
-        // 参数: tool_calls 为本条 assistant 消息携带的函数调用列表。
         self.tool_calls = tool_calls;
         self
     }
 
+    /// Attach the originating `tool_call_id` to a tool result message.
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
-        // 作用: 为 tool 结果消息绑定对应的 tool_call_id。
-        // 参数: tool_call_id 为模型发起该次工具调用时生成的唯一 ID。
         self.tool_call_id = Some(tool_call_id.into());
         self
     }
@@ -95,17 +93,15 @@ pub struct RenderedPrompt {
 }
 
 impl MessageContext {
+    /// Create a context initialized with one system prompt message.
     pub fn with_system_prompt(system_prompt: impl Into<String>) -> Self {
-        // 作用: 创建一个带默认系统提示词的上下文容器。
-        // 参数: system_prompt 为当前 agent 的系统提示词文本。
         let mut context = Self::default();
         context.push_system(system_prompt);
         context
     }
 
+    /// Append a system message to the context.
     pub fn push_system(&mut self, content: impl Into<String>) {
-        // 作用: 向上下文的 system 区域追加一条系统消息。
-        // 参数: content 为系统提示词内容。
         self.system.push(ChatMessage::new(
             ChatMessageRole::System,
             content,
@@ -114,9 +110,8 @@ impl MessageContext {
     }
 
     #[allow(dead_code)]
+    /// Append a memory message to the context.
     pub fn push_memory(&mut self, content: impl Into<String>) {
-        // 作用: 向上下文的 memory 区域追加一条记忆消息。
-        // 参数: content 为命中的记忆文本内容。
         self.memory.push(ChatMessage::new(
             ChatMessageRole::Memory,
             content,
@@ -124,9 +119,8 @@ impl MessageContext {
         ));
     }
 
+    /// Extend chat history from an existing conversation thread.
     pub fn extend_from_thread(&mut self, thread: &ConversationThread) {
-        // 作用: 把 thread 中已有的 user/assistant turn 追加到 chat 区域。
-        // 参数: thread 为当前会话线程，包含历史 turn 记录。
         for turn in &thread.turns {
             if !turn.messages.is_empty() {
                 self.chat.extend(turn.messages.iter().cloned());
@@ -149,9 +143,8 @@ impl MessageContext {
         }
     }
 
+    /// Return a read-only-style copy of the context messages in prompt order.
     pub fn as_messages(&self) -> Messages {
-        // 作用: 按 system、memory、chat 顺序展开上下文，返回一份只读语义的消息副本给 LLM 或 agent loop 使用。
-        // 参数: 无，返回当前上下文中的全部消息副本。
         let mut messages =
             Vec::with_capacity(self.system.len() + self.memory.len() + self.chat.len());
         messages.extend(self.system.iter().cloned());
@@ -160,9 +153,8 @@ impl MessageContext {
         messages
     }
 
+    /// Render the context into the simplified prompt shape used by compatibility helpers.
     pub fn render_for_llm(&self) -> RenderedPrompt {
-        // 作用: 把结构化 context 渲染成当前 LLM provider 需要的 prompt 形式。
-        // 参数: 无，当前会输出一个 system_prompt 和一个 user_message 字符串。
         let mut system_sections: Vec<String> =
             self.system.iter().map(|msg| msg.content.clone()).collect();
         if !self.memory.is_empty() {

@@ -1,3 +1,5 @@
+//! Conversation-thread persistence types used by the session manager.
+
 use crate::context::{ChatMessage, ChatMessageRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,13 +18,12 @@ pub struct ConversationTurn {
 }
 
 impl ConversationTurn {
+    /// Create a new turn that starts with the user's message.
     pub fn new(
         external_message_id: Option<String>,
         user_message: impl Into<String>,
         started_at: DateTime<Utc>,
     ) -> Self {
-        // 作用: 创建一个新的用户输入 turn，初始状态还没有 assistant 回复。
-        // 参数: external_message_id 为平台原始消息 ID，user_message 为用户文本，started_at 为开始时间。
         let user_message = user_message.into();
         Self {
             id: Uuid::new_v4(),
@@ -39,9 +40,8 @@ impl ConversationTurn {
         }
     }
 
+    /// Complete the turn with a plain assistant message.
     pub fn complete(&mut self, assistant_message: impl Into<String>, completed_at: DateTime<Utc>) {
-        // 作用: 为当前 turn 填充 assistant 回复并标记完成时间。
-        // 参数: assistant_message 为回复文本，completed_at 为该轮完成时间。
         let assistant_message = assistant_message.into();
         self.complete_with_messages(
             vec![ChatMessage::new(
@@ -58,8 +58,6 @@ impl ConversationTurn {
         messages: Vec<ChatMessage>,
         completed_at: DateTime<Utc>,
     ) {
-        // 作用: 为当前 turn 追加一组完整的 assistant/tool 历史消息并标记完成时间。
-        // 参数: messages 为本轮生成的消息轨迹，completed_at 为该轮完成时间。
         self.assistant_message = select_final_assistant_message(&messages);
         self.messages.extend(messages);
         self.completed_at = Some(completed_at);
@@ -75,9 +73,8 @@ pub struct ConversationThread {
 }
 
 impl ConversationThread {
+    /// Create an empty thread with the provided identifier.
     pub fn new(id: impl Into<String>, now: DateTime<Utc>) -> Self {
-        // 作用: 创建一个新的会话线程容器。
-        // 参数: id 为线程标识，now 为创建和更新时间。
         Self {
             id: id.into(),
             turns: Vec::new(),
@@ -92,8 +89,6 @@ impl ConversationThread {
         user_message: impl Into<String>,
         started_at: DateTime<Utc>,
     ) -> Uuid {
-        // 作用: 向线程末尾追加一条新的用户 turn。
-        // 参数: external_message_id 为平台消息 ID，user_message 为用户文本，started_at 为该轮开始时间。
         let turn = ConversationTurn::new(external_message_id, user_message, started_at);
         let turn_id = turn.id;
         self.turns.push(turn);
@@ -107,8 +102,6 @@ impl ConversationThread {
         assistant_message: impl Into<String>,
         completed_at: DateTime<Utc>,
     ) -> bool {
-        // 作用: 根据 turn ID 补全 assistant 回复，并更新线程更新时间。
-        // 参数: turn_id 为目标 turn，assistant_message 为回复文本，completed_at 为完成时间。
         let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) else {
             return false;
         };
@@ -124,8 +117,6 @@ impl ConversationThread {
         messages: Vec<ChatMessage>,
         completed_at: DateTime<Utc>,
     ) -> bool {
-        // 作用: 根据 turn ID 追加一组结构化消息轨迹，并更新线程更新时间。
-        // 参数: turn_id 为目标 turn，messages 为本轮 assistant/tool 历史，completed_at 为完成时间。
         let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) else {
             return false;
         };
@@ -137,8 +128,7 @@ impl ConversationThread {
 }
 
 fn select_final_assistant_message(messages: &[ChatMessage]) -> Option<String> {
-    // 作用: 从一轮结构化消息中挑出最终 assistant 回复，兼容 tool-call 前导文本和最终回答。
-    // 参数: messages 为本轮 assistant/tool 历史消息列表。
+    // Prefer the last plain assistant reply, but fall back to the most recent assistant message.
     messages
         .iter()
         .rev()

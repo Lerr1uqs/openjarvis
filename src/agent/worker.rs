@@ -1,5 +1,13 @@
+//! Agent worker that stitches sessions, context construction, and the agent loop together.
+//!
+//! At the moment the worker is invoked directly by the router and processes one message at a
+//! time from that call path. This keeps ordering straightforward while the system still uses an
+//! in-memory session store. A later refactor should move the worker behind a long-lived inbox so
+//! router and agent communicate through stable channels, and then concurrency can be introduced
+//! in a controlled way without breaking per-session ordering.
+
 use super::{
-    agent_loop::{AgentEventSender, AgentLoop, AgentLoopInput, AgentLoopOutput},
+    agent_loop::{AgentEventSender, AgentLoop, AgentLoopOutput, InfoContext},
     runtime::AgentRuntime,
 };
 use crate::config::{DEFAULT_ASSISTANT_SYSTEM_PROMPT, LlmConfig};
@@ -18,19 +26,17 @@ pub struct AgentWorker {
 }
 
 impl AgentWorker {
+    /// Create a worker with a fresh default runtime and session store.
     pub fn new(llm: Arc<dyn LLMProvider>, system_prompt: impl Into<String>) -> Self {
-        // 作用: 创建 agent worker，并注入默认 runtime、会话管理器和系统提示词。
-        // 参数: llm 为当前 agent 使用的模型提供者，system_prompt 为系统提示词模板。
         Self::with_runtime(llm, system_prompt, AgentRuntime::new())
     }
 
+    /// Create a worker with an explicitly provided runtime.
     pub fn with_runtime(
         llm: Arc<dyn LLMProvider>,
         system_prompt: impl Into<String>,
         runtime: AgentRuntime,
     ) -> Self {
-        // 作用: 用指定 runtime 创建 agent worker，便于后续注入 hooks、tools 和 mcp。
-        // 参数: llm 为模型提供者，system_prompt 为系统提示词，runtime 为 agent 运行时。
         Self {
             agent_loop: AgentLoop::new(llm, runtime),
             system_prompt: system_prompt.into(),
@@ -38,35 +44,37 @@ impl AgentWorker {
         }
     }
 
+    /// Build a worker directly from the loaded LLM configuration.
     pub fn from_config(config: &LlmConfig) -> Result<Self> {
-        // 作用: 根据配置自动构造 agent 所需的 LLM provider 和系统提示词。
-        // 参数: config 为 llm 子配置，决定 provider 类型；系统提示词当前固定使用内置默认值。
         Ok(Self::new(
             build_provider(config)?,
             DEFAULT_ASSISTANT_SYSTEM_PROMPT,
         ))
     }
 
+    /// Return the runtime bound to this worker.
     pub fn runtime(&self) -> &AgentRuntime {
-        // 作用: 暴露当前 worker 绑定的 runtime，供外部注册 hooks、tools 和 mcp。
-        // 参数: 无，返回当前 worker 内部持有的 runtime 引用。
         self.agent_loop.runtime()
     }
+
+    /// Process one normalized incoming message through session assembly and the agent loop.
+    ///
+    /// The current version assumes turns arrive in execution order from the caller. When the
+    /// agent later owns its own inbox, this method should become the inner step of that loop
+    /// rather than the public concurrency boundary.
     pub async fn handle_message(
         &self,
         incoming: IncomingMessage,
         router_tx: mpsc::Sender<crate::model::OutgoingMessage>,
     ) -> Result<AgentLoopOutput> {
-        // 作用: 处理一条统一入站消息，补全 session/context 后通过 agent loop 生成回复。
-        // 参数: incoming 为 channel 已标准化后的用户消息。
-        let pending_turn = self
+        let pending_turn = self // TODO: begin or create session turn
             .sessions
             .begin_turn(&incoming, &self.system_prompt)
             .await;
         let loop_output = self
             .agent_loop
             .run(
-                AgentLoopInput {
+                InfoContext {
                     channel: incoming.channel.clone(),
                     user_id: incoming.user_id.clone(),
                     thread_id: pending_turn.thread_id.clone(),
@@ -84,7 +92,7 @@ impl AgentWorker {
                 &pending_turn.context,
             )
             .await?;
-        self.sessions
+        self.sessions// TODO: fillback
             .complete_turn_with_messages(
                 &pending_turn,
                 loop_output.turn_messages.clone(),

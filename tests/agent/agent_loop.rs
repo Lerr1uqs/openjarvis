@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use openjarvis::{
     agent::{
-        AgentEventSender, AgentLoop, AgentLoopEventKind, AgentLoopInput, AgentRuntime, HookEvent,
-        HookEventKind, HookHandler, HookRegistry,
+        AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime, HookEvent, HookEventKind,
+        HookHandler, HookRegistry, InfoContext,
     },
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
@@ -246,10 +246,10 @@ fn build_context(system_prompt: &str, user_message: &str) -> MessageContext {
     context
 }
 
-fn build_input() -> (AgentLoopInput, mpsc::Receiver<OutgoingMessage>) {
+fn build_input() -> (InfoContext, mpsc::Receiver<OutgoingMessage>) {
     let (tx, rx) = mpsc::channel(32);
     (
-        AgentLoopInput {
+        InfoContext {
             channel: "feishu".to_string(),
             user_id: "ou_xxx".to_string(),
             thread_id: "thread_1".to_string(),

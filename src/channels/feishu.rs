@@ -1,3 +1,5 @@
+//! Feishu channel implementation backed by long-connection sidecar ingestion and HTTP replies.
+
 use crate::channels::{Channel, ChannelRegistration};
 use crate::config::FeishuConfig;
 use crate::model::{IncomingMessage, OutgoingMessage, ReplyTarget};
@@ -25,9 +27,8 @@ pub struct FeishuChannel {
 }
 
 impl FeishuChannel {
+    /// Create a Feishu channel with its HTTP client and token cache initialized.
     pub fn new(config: FeishuConfig) -> Self {
-        // 作用: 创建飞书 channel，并初始化 HTTP 客户端和 access token 缓存。
-        // 参数: config 为飞书接入配置，包含长连接和发送消息所需信息。
         Self {
             config,
             http_client: Client::new(),
@@ -39,8 +40,6 @@ impl FeishuChannel {
         &self,
         payload: FeishuLongConnectionPayload,
     ) -> IncomingMessage {
-        // 作用: 把飞书长连接事件载荷转换成统一的 IncomingMessage。
-        // 参数: payload 为飞书 SDK/sidecar 转发过来的标准化消息事件。
         let content = extract_text_message(&payload.message_type, &payload.content);
         let thread_id = payload.thread_id.filter(|value| !value.trim().is_empty());
 
@@ -75,15 +74,13 @@ impl FeishuChannel {
         self: Arc<Self>,
         registration: ChannelRegistration,
     ) -> Result<()> {
-        // 作用: 启动飞书长连接模式的入站和出站循环。
-        // 参数: registration 提供 router 分配的双向 mpsc 通道。
+        // Start both the outgoing delivery loop and the incoming sidecar reader.
         self.spawn_outgoing_loop(registration.outgoing_rx);
         self.spawn_sidecar(registration.incoming_tx).await
     }
 
     fn spawn_outgoing_loop(self: &Arc<Self>, mut outgoing_rx: mpsc::Receiver<OutgoingMessage>) {
-        // 作用: 持续消费 router 下发的出站消息并调用飞书发送逻辑。
-        // 参数: outgoing_rx 为当前 channel 对应的出站消息接收端。
+        // Drain router-originated outgoing messages and forward them to Feishu.
         let channel = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -98,8 +95,7 @@ impl FeishuChannel {
         self: &Arc<Self>,
         incoming_tx: mpsc::Sender<IncomingMessage>,
     ) -> Result<()> {
-        // 作用: 拉起 Node sidecar 并把其 stdout 中的消息事件转发到 router。
-        // 参数: incoming_tx 为发往 router 的统一消息发送端。
+        // Spawn the Node sidecar and forward parsed events into the router queue.
         if !self.config.auto_start_sidecar {
             bail!("feishu long_connection requires auto_start_sidecar=true in current runtime");
         }
@@ -196,8 +192,7 @@ impl FeishuChannel {
     }
 
     async fn deliver_outgoing(&self, message: OutgoingMessage) -> Result<()> {
-        // 作用: 执行飞书消息发送前后的固定流程，当前会先加 reaction 再回文本。
-        // 参数: message 为 router 派发给飞书 channel 的统一出站消息。
+        // Add the debug reaction first and then send the actual text reply.
         if let Some(reply_to_message_id) = message.reply_to_message_id.as_deref() {
             if let Err(error) = self
                 .add_reaction(reply_to_message_id, FEISHU_DEBUG_REACTION_EMOJI_TYPE)
@@ -216,8 +211,7 @@ impl FeishuChannel {
     }
 
     async fn send_text_message(&self, message: &OutgoingMessage) -> Result<()> {
-        // 作用: 调用飞书发送消息接口回发文本消息。
-        // 参数: message 为已经完成路由定位的统一出站消息。
+        // Call the Feishu send-message API unless the channel is running in dry-run mode.
         if self.config.dry_run {
             info!(
                 receive_id = message.target.receive_id,
@@ -274,8 +268,7 @@ impl FeishuChannel {
     }
 
     async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<()> {
-        // 作用: 给用户原消息添加一个飞书 reaction，用于调试链路状态。
-        // 参数: message_id 为原消息 ID，emoji_type 为飞书 reaction 类型。
+        // Add a Feishu reaction to the source message so the debug loop is visible in chat.
         if self.config.dry_run {
             info!(
                 message_id,
@@ -330,8 +323,7 @@ impl FeishuChannel {
     }
 
     async fn get_tenant_access_token(&self) -> Result<String> {
-        // 作用: 获取并缓存飞书 tenant_access_token，减少重复认证请求。
-        // 参数: 无，认证信息直接读取当前 channel 配置。
+        // Reuse a cached tenant token when possible and refresh it otherwise.
         let now = Utc::now();
         {
             let cached_token = self.cached_token.lock().await;
@@ -390,14 +382,10 @@ impl FeishuChannel {
 #[async_trait]
 impl Channel for FeishuChannel {
     fn name(&self) -> &'static str {
-        // 作用: 返回 router 内部使用的固定 channel 名称。
-        // 参数: 无，名称用于路由出站消息。
         "feishu"
     }
 
     async fn start(self: Arc<Self>, registration: ChannelRegistration) -> Result<()> {
-        // 作用: 根据当前飞书模式启动对应的运行逻辑。
-        // 参数: registration 为 router 提供的当前 channel 通道注册信息。
         if self.config.is_long_connection() {
             self.start_long_connection(registration).await
         } else {
@@ -406,9 +394,8 @@ impl Channel for FeishuChannel {
     }
 }
 
+/// Extract user-visible text from a Feishu message payload, falling back to a placeholder for unsupported types.
 pub fn extract_text_message(message_type: &str, raw_content: &str) -> String {
-    // 作用: 从飞书原始消息内容中提取文本内容，非文本消息降级为占位文案。
-    // 参数: message_type 为飞书消息类型，raw_content 为飞书 content 原始 JSON。
     if message_type != "text" {
         return format!("[unsupported feishu message type: {message_type}]");
     }

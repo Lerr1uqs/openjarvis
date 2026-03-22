@@ -1,3 +1,5 @@
+//! OpenJarvis crate root that re-exports the main runtime modules.
+
 pub mod agent;
 pub mod channels;
 pub mod config;

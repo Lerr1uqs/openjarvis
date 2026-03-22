@@ -1,10 +1,14 @@
+//! Shared tool traits, schemas, and registry for the built-in agent tool set.
+
 pub mod edit;
 pub mod read;
 pub mod shell;
 pub mod write;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
@@ -19,7 +23,48 @@ pub use write::WriteTool;
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
-    pub parameters: Value,
+    pub input_schema: ToolInputSchema,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolSchemaProtocol {
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInputSchema {
+    json_schema: Value,
+}
+
+impl ToolInputSchema {
+    /// Wrap a protocol-agnostic JSON Schema definition.
+    pub fn new(json_schema: Value) -> Self {
+        Self { json_schema }
+    }
+
+    /// Return the stored protocol-agnostic JSON Schema.
+    pub fn json_schema(&self) -> &Value {
+        &self.json_schema
+    }
+
+    /// Project the stored schema into the OpenAI tool schema shape.
+    pub fn for_openai(&self) -> Value {
+        self.json_schema.clone()
+    }
+
+    /// Project the stored schema into the Anthropic tool schema shape.
+    pub fn for_anthropic(&self) -> Value {
+        self.json_schema.clone()
+    }
+
+    /// Project the stored schema for the selected LLM protocol.
+    pub fn for_protocol(&self, protocol: ToolSchemaProtocol) -> Value {
+        match protocol {
+            ToolSchemaProtocol::OpenAi => self.for_openai(),
+            ToolSchemaProtocol::Anthropic => self.for_anthropic(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,30 +82,49 @@ pub struct ToolCallResult {
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
-    /// 作用: 返回当前工具的定义信息，供 agent loop 和后续规划器使用。
-    /// 参数: 无，返回工具名称和描述。
+    /// Return the definition exposed to the agent loop and the model provider.
     fn definition(&self) -> ToolDefinition;
 
-    /// 作用: 执行一次工具调用请求，并返回标准化结果。
-    /// 参数: request 为工具名称和参数组成的调用请求。
+    /// Execute one tool call and return a normalized result payload.
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult>;
 }
 
 #[derive(Default)]
 pub struct ToolRegistry {
+    // AGENT-TODO: 对String起别名
     handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
 }
 
+pub fn tool_definition_from_args<T>(
+    name: impl Into<String>,
+    description: impl Into<String>,
+) -> ToolDefinition
+where
+    T: JsonSchema,
+{
+    ToolDefinition {
+        name: name.into(),
+        description: description.into(),
+        input_schema: tool_input_schema::<T>(),
+    }
+}
+
+pub fn parse_tool_arguments<T>(request: ToolCallRequest, tool_name: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(request.arguments)
+        .with_context(|| format!("invalid `{tool_name}` tool arguments"))
+}
+
 impl ToolRegistry {
+    /// Create an empty tool registry.
     pub fn new() -> Self {
-        // 作用: 创建一个空的工具注册表。
-        // 参数: 无，默认不包含任何可调用工具。
         Self::default()
     }
 
+    /// Register one tool handler by its unique tool name.
     pub async fn register(&self, handler: Arc<dyn ToolHandler>) -> Result<()> {
-        // 作用: 注册一个工具 handler，并以工具名称作为唯一键。
-        // 参数: handler 为实现 ToolHandler trait 的工具实例。
         let definition = handler.definition();
         let mut handlers = self.handlers.write().await;
         if handlers.contains_key(&definition.name) {
@@ -72,8 +136,7 @@ impl ToolRegistry {
     }
 
     pub async fn register_builtin_tools(&self) -> Result<()> {
-        // 作用: 一次性注册当前内置的四个基础文件与命令工具。
-        // 参数: 无，当前会注册 read、write、edit 和 shell。
+        // Register the current built-in four-tool set.
         self.register_if_missing(Arc::new(ReadTool::new())).await;
         self.register_if_missing(Arc::new(WriteTool::new())).await;
         self.register_if_missing(Arc::new(EditTool::new())).await;
@@ -81,13 +144,10 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Look up a registered tool and execute the request.
     pub async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
-        // 作用: 根据工具名称查找已注册 handler 并执行调用。
-        // 参数: request 为包含工具名和参数的标准化调用请求。
-        let handler = {
-            let handlers = self.handlers.read().await;
-            handlers.get(&request.name).cloned()
-        };
+        let handler = self.handlers.read().await.get(&request.name).cloned();
+
         let Some(handler) = handler else {
             bail!("tool `{}` is not registered", request.name);
         };
@@ -95,9 +155,8 @@ impl ToolRegistry {
         handler.call(request).await
     }
 
+    /// Return all registered tool definitions.
     pub async fn list(&self) -> Vec<ToolDefinition> {
-        // 作用: 返回当前全部已注册工具的定义列表。
-        // 参数: 无，结果可用于后续向模型暴露工具能力。
         self.handlers
             .read()
             .await
@@ -107,21 +166,31 @@ impl ToolRegistry {
     }
 
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
-        // 作用: 在工具未注册时追加注册，已存在时保持静默跳过。
-        // 参数: handler 为候选工具实例。
+        // Register the handler only when the name is not present yet.
         let definition = handler.definition();
         let mut handlers = self.handlers.write().await;
         handlers.entry(definition.name).or_insert(handler);
     }
 }
 
-pub fn empty_tool_parameters_schema() -> Value {
-    // 作用: 返回一个空对象参数 schema，用于暂时没有详细参数定义的工具。
-    // 参数: 无，输出兼容 OpenAI function calling 的 JSON Schema 对象。
-    json!({
+/// Return an empty object schema for tools that currently do not accept any arguments.
+pub fn empty_tool_input_schema() -> ToolInputSchema {
+    ToolInputSchema::new(json!({
         "type": "object",
         "properties": {},
         "required": [],
         "additionalProperties": false,
-    })
+    }))
+}
+
+pub fn tool_input_schema<T>() -> ToolInputSchema
+where
+    T: JsonSchema,
+{
+    let mut schema =
+        serde_json::to_value(schemars::schema_for!(T)).expect("tool input schema should serialize");
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+    }
+    ToolInputSchema::new(schema)
 }

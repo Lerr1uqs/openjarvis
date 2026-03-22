@@ -1,6 +1,12 @@
-use super::{ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler};
+//! Built-in `bash` tool implementation for one-shot shell command execution.
+
+use super::{
+    ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, parse_tool_arguments,
+    tool_definition_from_args,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
@@ -9,24 +15,26 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 30_000;
 #[cfg(windows)]
 const WINDOWS_UTF8_POWERSHELL_PREFIX: &str = "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); chcp.com 65001 > $null;";
 
 #[derive(Default)]
 pub struct ShellTool;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ShellToolArguments {
+    /// Shell command to execute.
     command: String,
-    workdir: Option<String>,
-    timeout_ms: Option<u64>,
+    /// Optional timeout in milliseconds.
+    #[serde(alias = "timeout_ms")]
+    timeout: Option<u64>,
 }
 
 impl ShellTool {
+    /// Create the built-in shell tool that backs the exposed `bash` capability.
     pub fn new() -> Self {
-        // 作用: 创建内置 shell 工具实例。
-        // 参数: 无，shell 工具用于执行一条系统命令。
         Self
     }
 }
@@ -34,43 +42,18 @@ impl ShellTool {
 #[async_trait]
 impl ToolHandler for ShellTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "shell".to_string(),
-            description: "Run a shell command in the local workspace.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to execute."
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Optional working directory for the command."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "Optional timeout in milliseconds."
-                    }
-                },
-                "required": ["command"],
-                "additionalProperties": false,
-            }),
-        }
+        tool_definition_from_args::<ShellToolArguments>(
+            "bash",
+            "Run a local shell command. `timeout` is measured in milliseconds.",
+        )
     }
 
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
-        // 作用: 执行一条 shell 命令，并返回 stdout/stderr 与退出状态。
-        // 参数: request.arguments 需要包含 command，可选 workdir 和 timeout_ms。
-        let args: ShellToolArguments =
-            serde_json::from_value(request.arguments).context("invalid shell tool arguments")?;
+        let args: ShellToolArguments = parse_tool_arguments(request, "bash")?;
         let mut command = build_shell_command(&args.command);
-        if let Some(workdir) = args.workdir.as_deref() {
-            command.current_dir(workdir);
-        }
         command.stdin(Stdio::null());
 
-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS);
+        let timeout_ms = args.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_MS);
         let output = match timeout(Duration::from_millis(timeout_ms), command.output()).await {
             Ok(result) => result.context("failed to execute shell command")?,
             Err(_) => {
@@ -100,7 +83,6 @@ impl ToolHandler for ShellTool {
             content,
             metadata: json!({
                 "command": args.command,
-                "workdir": args.workdir,
                 "timeout_ms": timeout_ms,
                 "status_code": status_code,
                 "stdout": stdout,
@@ -112,8 +94,7 @@ impl ToolHandler for ShellTool {
 }
 
 fn build_shell_command(command: &str) -> Command {
-    // 作用: 根据当前平台构造一条执行 shell 命令的进程。
-    // 参数: command 为需要执行的原始命令字符串。
+    // Build the platform-specific process wrapper used to execute one command string.
     #[cfg(windows)]
     {
         let command = normalize_windows_command(command);
@@ -136,8 +117,7 @@ fn build_shell_command(command: &str) -> Command {
 
 #[cfg(windows)]
 fn normalize_windows_command(command: &str) -> String {
-    // 作用: 在 Windows PowerShell 下兼容少量常见的 Unix 风格命令，避免模型直接调用时报错。
-    // 参数: command 为模型生成的原始 shell 命令字符串。
+    // Translate a few common Unix-style commands into PowerShell-friendly equivalents.
     match command.trim() {
         "env" | "printenv" => {
             "Get-ChildItem Env: | Sort-Object Name | ForEach-Object { \"{0}={1}\" -f $_.Name, $_.Value }"
