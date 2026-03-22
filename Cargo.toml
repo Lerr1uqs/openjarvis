@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+async-openai = { version = "0.33.1", default-features = false, features = ["chat-completion", "chat-completion-types", "rustls"] }
 async-trait = "0.1.89"
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
@@ -15,3 +16,7 @@ tokio = { version = "1.48.0", features = ["io-util", "macros", "process", "rt-mu
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+
+[[bin]]
+name = "llm_test"
+path = "scripts/llm_test.rs"

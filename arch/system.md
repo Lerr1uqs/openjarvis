@@ -50,8 +50,11 @@ ChatChannel trait:
 
 所有外部channel的消息走到统一的ChannelRouter组件进行路由 ChannelRouter和channel进行双向通信 agent也和这个去通信
 
+
+channels -> router -> worker -> SessionManager 拼历史 -> MessageContext -> AgentLoop
+
 ## 组件
-- agent沙箱环境 AgenticWorker 封装沙箱和agent context (沙箱实现待定 先实现一个空壳)
+- agent沙箱环境 AgenticWorker 封装沙箱和agent context (沙箱实现待定 先实现一个空壳) agent的组件只有一个实例 所有user的消息都会走入这个 但是有权限管控
 sessions[channel:userid] -> Session
 
 - SessionManager: 变量 包装下面这些概念 [单一变量 一般不会出现多次]
@@ -71,10 +74,65 @@ llm_provider:
 ```
 
 Worker: 包装沙箱容器 + AgenticLoop 
+```
+struct Worker {
+    pub sandbox;
+    struct AgenticLoop {
+        tools: List[Tool],
+        mcp: List[mcp],
+        hook: AgentHook
+    }
+    pub router_tx; // 发送数据回给router
+}
+```
+
+AgentHook: 从配置文件中加载hook
+```
+agent:
+    hook:
+        pre_tool_use: ["echo", "hello"] # 后期支持参数注入 现在先只支持脚本
+```
 - worker.run(messages)
-- agenticloop: agentic_loop.run(user_context{info+messages}, mcp, tools) # 记得对tools的权限做检查
+- agenticloop: agentic_loop.run(user_context{info+messages}) # 记得对tools的权限做检查
     - 绑定配置里的provider
     - 存在hook：比如使用工具前使用工具后的自定义hook 查看hook.md
+```
+async def run(user_context, ):
+
+    user, messages = user_context
+    while True:
+    
+        response, tool_calls = llm.generate(messages)
+        self.router_tx.send(// 对方有这个tx和user_info进行绑定的数据结构
+            AgentEvent(
+                type="text_output",
+                response
+            ),
+            ...
+        )
+        
+        messages = messages + response
+        if not tool_calls:
+            break
+            
+        for tcall in tool_calls:
+            self.router_tx.send(// 对方有这个tx和user_info进行绑定的数据结构
+                AgentEvent(
+                    type="tool_call",
+                    tcall
+                ),
+                ...
+            )
+            tool_res = tool_register.call(tool_use, user)
+            self.router_tx.send(// 对方有这个tx和user_info进行绑定的数据结构
+                AgentEvent(
+                    type="tool_result",
+                    tool_res
+                ),
+                ...
+            )
+
+```
 
 Context: 对Message的组织概念
 - agent只接受ChatMessage(asistant/system/tool_result这些)

@@ -65,7 +65,7 @@ impl ChannelRouter {
         health_channel.check_health().await
     }
 
-    pub async fn handle_incoming(&self, message: IncomingMessage) -> Result<()> {
+    pub async fn handle_incoming(self: &Arc<Self>, message: IncomingMessage) -> Result<()> {
         // 作用: 接收 channel 转发来的统一入站消息，去重后交给 agent 执行。
         // 参数: message 为已经归一化的用户消息。
         if !self
@@ -85,9 +85,21 @@ impl ChannelRouter {
             "router accepted incoming message"
         );
 
-        if let Some(outgoing) = self.agent.handle_message(message).await? {
-            self.dispatch_outgoing(outgoing).await?;
-        }
+        let (router_tx, mut router_rx) = mpsc::channel(128);
+        let router = Arc::clone(self);
+        let dispatch_task = tokio::spawn(async move {
+            while let Some(outgoing) = router_rx.recv().await {
+                if let Err(error) = router.dispatch_outgoing(outgoing).await {
+                    warn!(error = %error, "router failed to dispatch outgoing message");
+                }
+            }
+        });
+
+        let result = self.agent.handle_message(message, router_tx).await;
+        dispatch_task
+            .await
+            .map_err(|error| anyhow::anyhow!("router outgoing dispatch task failed: {}", error))?;
+        result?;
 
         Ok(())
     }

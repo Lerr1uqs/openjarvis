@@ -15,14 +15,15 @@
 3. `agent`
    - 负责单条消息的 agent 执行
    - 负责把 `IncomingMessage` 放进 `Session / Thread / Context`
-   - 负责调用 `LLMProvider`
+   - 负责调用 `AgentLoop`
+   - 负责挂接 `hook / tool / mcp`
 4. `session / thread / context`
    - `Session` 管用户级上下文空间
    - `Thread` 管单条会话链
    - `Context` 管送给 LLM 的消息组织
 5. `llm`
    - 负责具体模型协议适配
-   - 当前支持 `mock` 和 `openai_compatible`
+   - 当前支持 `mock` 和 `openai_compatible/openai/deepseek`
 
 ## 模块依赖方向
 
@@ -46,6 +47,10 @@
 - router 不感知平台实现细节
 - agent 不感知具体平台 SDK
 - session/thread/context 不直接操作外部 channel
+
+如果要看 agent 目录内部的模块拆分，额外参考：
+
+- [agent-doc/agent.md](F:/coding-workspace/openjarvis/agent-doc/agent.md)
 
 ## Channel 抽象
 
@@ -107,9 +112,17 @@
 
 `-> SessionManager::begin_turn`
 
+`-> AgentLoop::run(MessageContext)`
+
 `-> MessageContext::render_for_llm`
 
+`-> HookRegistry::emit(UserPromptSubmit)`
+
 `-> LlmProvider::generate`
+
+`-> 可选 ToolRegistry::call`
+
+`-> HookRegistry::emit(Notification)`
 
 `-> SessionManager::complete_turn`
 
@@ -125,6 +138,8 @@
 
 `-> channel 收到消息后决定如何发送`
 
+`-> 当前 agent loop 的 tool_call / tool_result 事件也会被回发到原群聊`
+
 `-> 当前 feishu 会先打 Typing reaction，再发文本`
 
 ## 当前实现边界
@@ -134,6 +149,9 @@
 - `Session / Thread / Context` 目前是内存态
 - 还没有持久化
 - 还没有 memory 检索
-- 还没有 command / tool / hook / sandbox
+- `hook / tool / mcp` 当前已经有源码骨架和 registry
+- `tool` 已经接入四个内置基础工具
+- `agent loop` 当前只支持一轮 ReAct
+- 还没有接入 MCP 通信和 hook 脚本加载
 - `Context` 目前先把线程历史渲染成一段文本再交给 LLM
 - 后续如果升级成真正多消息协议，可以直接从 `MessageContext` 扩展

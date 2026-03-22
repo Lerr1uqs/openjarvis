@@ -2,7 +2,7 @@
 
 当前仓库已经接入一条最小消息链路：
 
-`Feishu long connection -> ChannelRouter -> AgentWorker -> LLMProvider -> ChannelRouter -> Feishu sender`
+`Feishu long connection -> ChannelRouter -> AgentWorker -> AgentLoop(ReAct 1 round) -> LLMProvider / ToolRegistry -> ChannelRouter -> Feishu sender`
 
 当前阶段的实现范围：
 
@@ -11,11 +11,18 @@
 - 已实现统一 `IncomingMessage / OutgoingMessage`
 - 已实现 `ChannelRouter`
 - 已实现 `AgentWorker`
-- 已实现两种 LLM provider
+- 已实现单轮 ReAct loop
+- 已实现四个内置工具
+  - `read`
+  - `write`
+  - `edit`
+  - `shell`
+- 已实现两类 LLM provider
   - `mock`
-  - `openai_compatible`
+  - `openai_compatible` 及其别名 `openai` / `deepseek`
 - 已实现 Feishu 文本消息回发
-- `tool / memory / session / sandbox` 仍然为空壳，暂未接入
+- 已实现 tool call / tool result 事件回发到当前群聊
+- `memory / sandbox` 仍然为空壳，暂未接入
 
 ## 本地启动
 
@@ -70,7 +77,7 @@ llm:
   model: "mock-received"
   base_url: "https://api.openai.com/v1"
   api_key: ""
-  system_prompt: "你是 OpenJarvis。当前阶段固定回复 [openjarvis][DEBUG] 测试回复。"
+  api_key_path: ""
   mock_response: "[openjarvis][DEBUG] 测试回复"
 ```
 
@@ -108,10 +115,11 @@ llm:
 
 如果你要切到真实模型，需要提供：
 
-- `llm.provider: openai_compatible`
+- `llm.provider: openai_compatible` 或 `openai` 或 `deepseek`
 - `llm.base_url`
-- `llm.api_key`
+- `llm.api_key` 或 `llm.api_key_path`
 - `llm.model`
+- agent 的默认 system prompt 当前写死在代码里，不走配置文件
 
 ## 当前限制
 
@@ -119,6 +127,7 @@ llm:
 - 只发送文本消息
 - 长连接入口当前通过官方 Node SDK sidecar 接入，再转给 Rust router
 - 当前这版运行时未实现 webhook 模式
-- 不支持工具调用
+- 当前 ReAct loop 只支持一轮工具调用
+- 工具已经注册，但还没有做权限审批和沙箱隔离
 - 不支持 session/memory/thread 持久化
 - 当前虽然走 `register_channels` 批量注册，但实际只内置了 `feishu` 一个 channel

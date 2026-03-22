@@ -86,21 +86,22 @@
 5. session manager 找到或创建对应 `Thread`
 6. 把当前用户消息追加成一个 pending turn
 7. 用当前 thread 历史构造 `MessageContext`
-8. `MessageContext` 渲染成当前 LLM 需要的 prompt
-9. LLM 返回后，agent 调 `SessionManager::complete_turn`
-10. 把 assistant 回复写回对应 turn
+8. worker 把 `MessageContext` 直接交给 `AgentLoop`
+9. `AgentLoop` 内部再把 `MessageContext` 渲染成当前 LLM 需要的 prompt
+10. LLM 返回后，agent 调 `SessionManager::complete_turn`
+11. 把 assistant 回复写回对应 turn
 
 ## 为什么先这样实现
 
-当前 LLM provider 还是最小协议：
+当前 `MessageContext` 内部已经是结构化消息：
 
-- 一个 `system_prompt`
-- 一个 `user_message`
+- `system / memory / chat`
+- provider 侧消费的是 `List[ChatMessage]`
 
 所以 `Context` 当前先做了一层过渡：
 
 - 内部仍然保留结构化 `system / memory / chat`
-- 对外先渲染成单段 prompt
+- 同时也能展开成给 provider 使用的消息列表
 
 这样后面切到真正多 message 协议时，不需要推翻 session/thread 结构，只需要调整 `Context -> LLMRequest` 这层映射。
 
@@ -110,8 +111,7 @@
 
 1. 给 `SessionManager` 增加持久化
 2. 给 `Context` 接 memory 命中逻辑
-3. 把 `LLMRequest` 升级成多消息结构
-4. 再接 command / tool / hook
+3. 再接 command / tool / hook
 
 原因是：
 

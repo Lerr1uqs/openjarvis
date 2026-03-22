@@ -1,4 +1,4 @@
-use openjarvis::config::AppConfig;
+use openjarvis::config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT};
 use std::{env::temp_dir, fs};
 use uuid::Uuid;
 
@@ -35,4 +35,9 @@ llm:
     assert_eq!(config.channel_config().feishu_config().mode, "");
     assert_eq!(config.llm_config().provider, "mock_llm");
     assert_eq!(config.llm_config().mock_response, "pong");
+}
+
+#[test]
+fn default_assistant_system_prompt_is_not_empty() {
+    assert!(!DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim().is_empty());
 }

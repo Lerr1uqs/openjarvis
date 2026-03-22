@@ -4,13 +4,14 @@
 
 当前项目只实现一条最小闭环：
 
-`Feishu -> message -> router -> agent -> mock llm -> message -> Feishu`
+`Feishu -> message -> router -> agent -> react loop -> llm/tool -> message -> Feishu`
 
 其中：
 
 - 入站使用 Feishu 长连接
 - 出站使用 Feishu 服务端发送消息 API
 - 额外会先给用户原消息添加一个 `Typing` reaction
+- agent loop 里的 `tool_call / tool_result` 事件也会直接回到当前群聊
 
 ## 当前实现结构
 
@@ -205,8 +206,8 @@ Rust 出站调用 Feishu 服务端 API 时，先通过：
 - 只支持文本消息
 - 只发送文本消息
 - reaction 固定写死为 `Typing`
-- 当前 mock llm 固定回复：
-  - `[openjarvis][DEBUG] 测试回复`
+- 当前支持 mock 和 OpenAI-compatible/deepseek
+- 当前 ReAct 只支持一轮工具调用
 - webhook 加密回调未实现
 - 长连接是 sidecar 方案，不是 Rust 原生实现
 - 当前这版运行时未实现 webhook 模式

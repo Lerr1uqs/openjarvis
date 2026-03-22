@@ -6,6 +6,7 @@ use openjarvis::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -31,15 +32,19 @@ async fn handle_message_generates_reply_and_session_metadata() {
         },
     };
 
-    let outgoing = agent
-        .handle_message(incoming)
+    let (tx, mut rx) = mpsc::channel(8);
+    let output = agent
+        .handle_message(incoming, tx)
         .await
-        .expect("agent should handle message")
-        .expect("agent should reply");
+        .expect("agent should handle message");
+    let final_message = rx.recv().await.expect("agent should emit final reply");
 
-    assert_eq!(outgoing.content, "mock-reply");
-    assert_eq!(outgoing.thread_id.as_deref(), Some("default"));
-    assert_eq!(outgoing.metadata["session_channel"], "feishu");
-    assert_eq!(outgoing.metadata["session_user_id"], "ou_xxx");
-    assert_eq!(outgoing.metadata["session_thread_id"], "default");
+    assert_eq!(output.reply, "mock-reply");
+    assert_eq!(final_message.content, "mock-reply");
+    assert_eq!(final_message.thread_id.as_deref(), Some("default"));
+    assert_eq!(final_message.metadata["event_kind"], "TextOutput");
+    assert_eq!(final_message.metadata["session_channel"], "feishu");
+    assert_eq!(final_message.metadata["session_user_id"], "ou_xxx");
+    assert_eq!(final_message.metadata["session_thread_id"], "default");
+    assert_eq!(final_message.reply_to_message_id.as_deref(), Some("msg_1"));
 }

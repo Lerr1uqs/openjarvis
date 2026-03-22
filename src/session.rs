@@ -1,4 +1,4 @@
-use crate::context::MessageContext;
+use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::model::IncomingMessage;
 use crate::thread::ConversationThread;
 use chrono::{DateTime, Utc};
@@ -95,6 +95,27 @@ impl SessionManager {
     pub async fn complete_turn(&self, pending: &PendingTurn, assistant_message: &str) {
         // 作用: 在 LLM 返回后把 assistant 回复补写回对应的 turn。
         // 参数: pending 为 begin_turn 返回的挂起轮次，assistant_message 为回复文本。
+        let completed_at = Utc::now();
+        self.complete_turn_with_messages(
+            pending,
+            vec![ChatMessage::new(
+                ChatMessageRole::Assistant,
+                assistant_message,
+                completed_at,
+            )],
+            completed_at,
+        )
+        .await;
+    }
+
+    pub async fn complete_turn_with_messages(
+        &self,
+        pending: &PendingTurn,
+        messages: Vec<ChatMessage>,
+        completed_at: DateTime<Utc>,
+    ) {
+        // 作用: 在 LLM 返回后把本轮完整消息轨迹补写回对应 turn。
+        // 参数: pending 为 begin_turn 返回的挂起轮次，messages 为 assistant/tool 历史，completed_at 为完成时间。
         let mut sessions = self.sessions.write().await;
         let Some(session) = sessions.get_mut(&pending.session_key) else {
             return;
@@ -103,8 +124,8 @@ impl SessionManager {
             return;
         };
 
-        thread.complete_turn(pending.turn_id, assistant_message.to_string(), Utc::now());
-        session.updated_at = Utc::now();
+        thread.complete_turn_with_messages(pending.turn_id, messages, completed_at);
+        session.updated_at = completed_at;
     }
 
     pub async fn get_session(&self, key: &SessionKey) -> Option<Session> {

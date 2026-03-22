@@ -1,6 +1,11 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{env, fs, path::Path};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -153,7 +158,7 @@ pub struct LlmConfig {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
-    pub system_prompt: String,
+    pub api_key_path: PathBuf,
     pub mock_response: String,
 }
 
@@ -166,8 +171,7 @@ impl Default for LlmConfig {
             model: "mock-received".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
-            system_prompt: "你是 OpenJarvis。当前阶段固定回复 [openjarvis][DEBUG] 测试回复。"
-                .to_string(),
+            api_key_path: PathBuf::new(),
             mock_response: "[openjarvis][DEBUG] 测试回复".to_string(),
         }
     }

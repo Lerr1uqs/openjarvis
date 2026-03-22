@@ -1,6 +1,7 @@
 use crate::thread::ConversationThread;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChatMessageRole {
@@ -27,10 +28,21 @@ impl ChatMessageRole {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatMessageRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -45,10 +57,29 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             created_at,
         }
     }
+
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ChatToolCall>) -> Self {
+        // 作用: 为 assistant 消息追加原生 tool_calls，用于回放 tool use 历史。
+        // 参数: tool_calls 为本条 assistant 消息携带的函数调用列表。
+        self.tool_calls = tool_calls;
+        self
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        // 作用: 为 tool 结果消息绑定对应的 tool_call_id。
+        // 参数: tool_call_id 为模型发起该次工具调用时生成的唯一 ID。
+        self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
 }
+
+pub type Messages = Vec<ChatMessage>;
+pub type ContextMessage = MessageContext;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageContext {
@@ -97,6 +128,11 @@ impl MessageContext {
         // 作用: 把 thread 中已有的 user/assistant turn 追加到 chat 区域。
         // 参数: thread 为当前会话线程，包含历史 turn 记录。
         for turn in &thread.turns {
+            if !turn.messages.is_empty() {
+                self.chat.extend(turn.messages.iter().cloned());
+                continue;
+            }
+
             self.chat.push(ChatMessage::new(
                 ChatMessageRole::User,
                 turn.user_message.clone(),
@@ -111,6 +147,17 @@ impl MessageContext {
                 ));
             }
         }
+    }
+
+    pub fn as_messages(&self) -> Messages {
+        // 作用: 按 system、memory、chat 顺序展开上下文，返回一份只读语义的消息副本给 LLM 或 agent loop 使用。
+        // 参数: 无，返回当前上下文中的全部消息副本。
+        let mut messages =
+            Vec::with_capacity(self.system.len() + self.memory.len() + self.chat.len());
+        messages.extend(self.system.iter().cloned());
+        messages.extend(self.memory.iter().cloned());
+        messages.extend(self.chat.iter().cloned());
+        messages
     }
 
     pub fn render_for_llm(&self) -> RenderedPrompt {
