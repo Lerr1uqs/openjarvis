@@ -11,7 +11,7 @@ use openjarvis::{
     llm::MockLLMProvider,
     model::{IncomingMessage, OutgoingMessage, ReplyTarget},
     router::ChannelRouter,
-    session::{SessionKey, SessionManager, SessionStrategy, ThreadLocator},
+    session::{SessionKey, SessionManager, SessionStrategy},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -98,7 +98,10 @@ async fn router_ignores_duplicate_messages() {
     assert_eq!(recorded[0].metadata["event_kind"], "TextOutput");
     assert_eq!(recorded[0].metadata["session_channel"], "feishu");
     assert_eq!(recorded[0].metadata["session_user_id"], "ou_xxx");
-    assert_eq!(recorded[0].metadata["session_thread_id"], "default");
+    assert_eq!(
+        recorded[0].metadata["session_external_thread_id"],
+        "default"
+    );
     assert_eq!(recorded[0].reply_to_message_id.as_deref(), Some("msg_1"));
 }
 
@@ -163,11 +166,8 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
     .await
     .expect("all outgoing messages should be recorded");
 
-    let locator = ThreadLocator {
-        channel: "feishu".to_string(),
-        user_id: "ou_shared".to_string(),
-        thread_id: "thread_shared".to_string(),
-    };
+    let observed_requests = observed_requests.lock().await.clone();
+    let locator = observed_requests[0].locator.clone();
     let history = router.sessions().load_turn(&locator).await;
     let session = router
         .sessions()
@@ -179,9 +179,8 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
         .expect("session should exist");
     let thread = session
         .threads
-        .get("thread_shared")
+        .get(&locator.thread_id)
         .expect("thread should exist");
-    let observed_requests = observed_requests.lock().await.clone();
     let recorded = sent.lock().await.clone();
 
     assert_eq!(observed_requests.len(), 2);
@@ -189,12 +188,27 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
     assert_eq!(observed_requests[1].incoming.content, "second question");
     assert_eq!(observed_requests[0].locator.channel, "feishu");
     assert_eq!(observed_requests[0].locator.user_id, "ou_shared");
-    assert_eq!(observed_requests[0].locator.thread_id, "thread_shared");
+    assert_eq!(
+        observed_requests[0].locator.external_thread_id,
+        "thread_shared"
+    );
     assert_eq!(observed_requests[1].locator.channel, "feishu");
     assert_eq!(observed_requests[1].locator.user_id, "ou_shared");
-    assert_eq!(observed_requests[1].locator.thread_id, "thread_shared");
+    assert_eq!(
+        observed_requests[1].locator.external_thread_id,
+        "thread_shared"
+    );
+    assert_eq!(
+        observed_requests[0].locator.session_id,
+        observed_requests[1].locator.session_id
+    );
+    assert_eq!(
+        observed_requests[0].locator.thread_id,
+        observed_requests[1].locator.thread_id
+    );
 
     assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.external_thread_id, "thread_shared");
     assert_eq!(history.len(), 6);
     assert_eq!(thread.turns[0].messages.len(), 2);
     assert_eq!(thread.turns[1].messages.len(), 4);
@@ -278,11 +292,8 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     .await
     .expect("all truncation outgoing messages should be recorded");
 
-    let locator = ThreadLocator {
-        channel: "feishu".to_string(),
-        user_id: "ou_truncation".to_string(),
-        thread_id: "thread_truncation".to_string(),
-    };
+    let observed_requests = observed_requests.lock().await.clone();
+    let locator = observed_requests[0].locator.clone();
     let history = router.sessions().load_turn(&locator).await;
     let session = router
         .sessions()
@@ -294,9 +305,8 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
         .expect("session should exist");
     let thread = session
         .threads
-        .get("thread_truncation")
+        .get(&locator.thread_id)
         .expect("thread should exist");
-    let observed_requests = observed_requests.lock().await.clone();
     let recorded = sent.lock().await.clone();
 
     assert_eq!(observed_requests.len(), 2);
@@ -318,6 +328,7 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     );
 
     assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.external_thread_id, "thread_truncation");
     assert_eq!(thread.turns[0].messages.len(), 5);
     assert_eq!(
         thread.turns[0]
@@ -345,9 +356,7 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     assert_eq!(recorded[6].content, "final-after-truncation");
 }
 
-fn build_mock_agent_handle(
-    observed_requests: Arc<Mutex<Vec<AgentRequest>>>,
-) -> AgentWorkerHandle {
+fn build_mock_agent_handle(observed_requests: Arc<Mutex<Vec<AgentRequest>>>) -> AgentWorkerHandle {
     let (request_tx, request_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(32);
 
@@ -581,12 +590,14 @@ fn build_dispatch_event(
         content: content.to_string(),
         metadata,
         channel: request.incoming.channel.clone(),
-        thread_id: request.locator.thread_id.clone(),
+        thread_id: request.incoming.thread_id.clone(),
         source_message_id: request.incoming.external_message_id.clone(),
         target: request.incoming.reply_target.clone(),
+        session_id: request.locator.session_id.to_string(),
         session_channel: request.locator.channel.clone(),
         session_user_id: request.locator.user_id.clone(),
-        session_thread_id: request.locator.thread_id.clone(),
+        session_external_thread_id: request.locator.external_thread_id.clone(),
+        session_thread_id: request.locator.thread_id.to_string(),
         reply_to_source,
     }
 }

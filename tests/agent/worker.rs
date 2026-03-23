@@ -6,7 +6,7 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
-    session::ThreadLocator,
+    session::SessionManager,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
     );
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
-    let locator = ThreadLocator::from_incoming(&incoming);
+    let locator = SessionManager::new().load_or_create_thread(&incoming).await;
 
     handle
         .request_tx
@@ -41,7 +41,8 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
     match &events[0] {
         AgentWorkerEvent::Dispatch(event) => {
             assert_eq!(event.content, "mock-reply");
-            assert_eq!(event.thread_id, "default");
+            assert_eq!(event.thread_id, None);
+            assert_eq!(event.session_external_thread_id, "default");
             assert_eq!(format!("{:?}", event.kind), "TextOutput");
             assert!(event.reply_to_source);
             assert_eq!(event.source_message_id.as_deref(), Some("msg_1"));
@@ -89,11 +90,12 @@ async fn worker_builds_context_from_history_and_current_user_message() {
     );
     let handle = worker.spawn();
     let incoming = build_incoming("what happened");
+    let locator = SessionManager::new().load_or_create_thread(&incoming).await;
 
     handle
         .request_tx
         .send(AgentRequest {
-            locator: ThreadLocator::from_incoming(&incoming),
+            locator,
             incoming,
             history: vec![ChatMessage::new(
                 ChatMessageRole::Assistant,
@@ -109,7 +111,11 @@ async fn worker_builds_context_from_history_and_current_user_message() {
     let messages = &captured_requests[0].messages;
 
     assert_eq!(messages[0].content, "system prompt");
-    assert!(messages.iter().any(|message| message.content == "previous reply"));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content == "previous reply")
+    );
     assert_eq!(
         messages.last().map(|message| message.content.as_str()),
         Some("what happened")

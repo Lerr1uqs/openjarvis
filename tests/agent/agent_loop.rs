@@ -256,14 +256,16 @@ fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
             event_tx: AgentEventSender::new(
                 tx,
                 "feishu",
-                "thread_1",
+                Some("thread_1".to_string()),
                 Some("msg_1".to_string()),
                 ReplyTarget {
                     receive_id: "oc_xxx".to_string(),
                     receive_id_type: "chat_id".to_string(),
                 },
+                "session_1",
                 "feishu",
                 "ou_xxx",
+                "thread_1",
                 "thread_1",
             ),
         },

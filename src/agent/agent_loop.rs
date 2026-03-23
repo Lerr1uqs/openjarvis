@@ -25,11 +25,13 @@ pub struct AgentDispatchEvent {
     pub content: String,
     pub metadata: Value,
     pub channel: String,
-    pub thread_id: String,
+    pub thread_id: Option<String>,
     pub source_message_id: Option<String>,
     pub target: ReplyTarget,
+    pub session_id: String,
     pub session_channel: String,
     pub session_user_id: String,
+    pub session_external_thread_id: String,
     pub session_thread_id: String,
     pub reply_to_source: bool,
 }
@@ -38,11 +40,13 @@ pub struct AgentDispatchEvent {
 pub struct AgentEventSender {
     router_tx: mpsc::Sender<AgentDispatchEvent>,
     channel: String,
-    thread_id: String,
+    thread_id: Option<String>,
     source_message_id: Option<String>,
     target: ReplyTarget,
+    session_id: String,
     session_channel: String,
     session_user_id: String,
+    session_external_thread_id: String,
     session_thread_id: String,
     should_reply_to_source: Arc<AtomicBool>,
 }
@@ -52,21 +56,25 @@ impl AgentEventSender {
     pub fn new(
         router_tx: mpsc::Sender<AgentDispatchEvent>,
         channel: impl Into<String>,
-        thread_id: impl Into<String>,
+        thread_id: Option<String>,
         source_message_id: Option<String>,
         target: ReplyTarget,
+        session_id: impl Into<String>,
         session_channel: impl Into<String>,
         session_user_id: impl Into<String>,
+        session_external_thread_id: impl Into<String>,
         session_thread_id: impl Into<String>,
     ) -> Self {
         Self {
             router_tx,
             channel: channel.into(),
-            thread_id: thread_id.into(),
+            thread_id,
             source_message_id,
             target,
+            session_id: session_id.into(),
             session_channel: session_channel.into(),
             session_user_id: session_user_id.into(),
+            session_external_thread_id: session_external_thread_id.into(),
             session_thread_id: session_thread_id.into(),
             should_reply_to_source: Arc::new(AtomicBool::new(true)),
         }
@@ -85,8 +93,10 @@ impl AgentEventSender {
                 thread_id: self.thread_id.clone(),
                 source_message_id: self.source_message_id.clone(),
                 target: self.target.clone(),
+                session_id: self.session_id.clone(),
                 session_channel: self.session_channel.clone(),
                 session_user_id: self.session_user_id.clone(),
+                session_external_thread_id: self.session_external_thread_id.clone(),
                 session_thread_id: self.session_thread_id.clone(),
                 reply_to_source,
             })
@@ -165,7 +175,7 @@ impl AgentLoop {
 
         let tools = self.runtime.tools().list().await;
         let mut messages = build_react_messages(context);
-        let mut events = Vec::new();// events有无必要？
+        let mut events = Vec::new(); // events有无必要？
         let mut turn_messages = Vec::new();
         let mut used_tool_names = Vec::new();
 

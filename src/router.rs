@@ -107,7 +107,8 @@ impl ChannelRouter {
         let (outgoing_tx, outgoing_rx) = mpsc::channel(128);
 
         channel.on_start().await?;
-        self.channels.insert(channel.name().to_string(), outgoing_tx);
+        self.channels
+            .insert(channel.name().to_string(), outgoing_tx);
         self.channel_incoming_streams
             .insert(channel.name().to_string(), ReceiverStream::new(incoming_rx));
 
@@ -122,9 +123,7 @@ impl ChannelRouter {
 
     /// Run the main router loop and multiplex channel and agent traffic with `tokio::select!`.
     pub async fn run(&mut self) -> Result<()> {
-        
         loop {
-
             let channel_incoming_streams = &mut self.channel_incoming_streams;
             let agent_event_rx = &mut self.agent_event_rx;
 
@@ -164,7 +163,7 @@ impl ChannelRouter {
             "router accepted incoming message"
         );
 
-        let locator = ThreadLocator::from_incoming(&message);
+        let locator = self.sessions.load_or_create_thread(&message).await;
         if self.try_mark_thread_pending(&locator).await {
             self.dispatch_to_agent(locator, message).await?;
         } else {
@@ -187,11 +186,13 @@ impl ChannelRouter {
             id: Uuid::new_v4(),
             channel: event.channel,
             content: event.content,
-            thread_id: Some(event.thread_id),
+            thread_id: event.thread_id,
             metadata: serde_json::json!({
                 "source_message_id": source_message_id,
+                "session_id": event.session_id,
                 "session_channel": event.session_channel,
                 "session_user_id": event.session_user_id,
+                "session_external_thread_id": event.session_external_thread_id,
                 "session_thread_id": event.session_thread_id,
                 "event_kind": format!("{:?}", event.kind),
                 "event_metadata": event.metadata,
@@ -249,13 +250,15 @@ impl ChannelRouter {
             id: Uuid::new_v4(),
             channel: turn.incoming.channel.clone(),
             content: failure_reply.clone(),
-            thread_id: Some(turn.locator.thread_id.clone()),
+            thread_id: turn.incoming.thread_id.clone(),
             metadata: serde_json::json!({
                 "event_kind": "AgentError",
+                "session_id": turn.locator.session_id.to_string(),
                 "error": turn.error,
                 "session_channel": turn.locator.channel,
                 "session_user_id": turn.locator.user_id,
-                "session_thread_id": turn.locator.thread_id,
+                "session_external_thread_id": turn.locator.external_thread_id,
+                "session_thread_id": turn.locator.thread_id.to_string(),
             }),
             reply_to_message_id: turn.incoming.external_message_id.clone(),
             target: turn.incoming.reply_target.clone(),
@@ -272,11 +275,7 @@ impl ChannelRouter {
                         turn.incoming.content,
                         turn.incoming.received_at,
                     ),
-                    ChatMessage::new(
-                        ChatMessageRole::Assistant,
-                        failure_reply,
-                        turn.completed_at,
-                    ),
+                    ChatMessage::new(ChatMessageRole::Assistant, failure_reply, turn.completed_at),
                 ],
                 turn.incoming.received_at,
                 turn.completed_at,
@@ -324,9 +323,7 @@ impl ChannelRouter {
             .await
         {
             self.pending_threads.lock().await.remove(&locator);
-            return Err(anyhow::anyhow!(
-                "failed to enqueue agent request: {error}"
-            ));
+            return Err(anyhow::anyhow!("failed to enqueue agent request: {error}"));
         }
         Ok(())
     }

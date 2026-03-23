@@ -26,6 +26,11 @@ pub struct IncomingMessage {
     pub user_id: String,
     pub user_name: Option<String>,
     pub content: String,
+    /// Upstream chat-software thread identifier.
+    ///
+    /// This field is owned by the external channel implementation such as Feishu or Telegram.
+    /// It is only used to resolve the internal OpenJarvis thread identity and is not the real
+    /// persisted conversation thread ID inside `SessionManager`.
     pub thread_id: Option<String>,
     pub received_at: DateTime<Utc>,
     pub metadata: Value,
@@ -34,7 +39,7 @@ pub struct IncomingMessage {
 }
 
 impl IncomingMessage {
-    /// Return the effective thread id used by router and session storage.
+    /// Return the normalized external thread id reported by the upstream chat software.
     ///
     /// # 示例
     /// ```rust
@@ -60,14 +65,21 @@ impl IncomingMessage {
     ///     },
     /// };
     ///
-    /// assert_eq!(message.resolved_thread_id(), "default");
+    /// assert_eq!(message.resolved_external_thread_id(), "default");
     /// ```
-    pub fn resolved_thread_id(&self) -> String {
+    pub fn resolved_external_thread_id(&self) -> String {
         self.thread_id
             .clone()
             .filter(|thread_id| !thread_id.trim().is_empty())
             .unwrap_or_else(|| "default".to_string())
-            // UUID : 如果没有就创建
+    }
+
+    /// Return the normalized external thread id.
+    ///
+    /// This compatibility helper keeps older call sites working while the internal thread
+    /// identity is resolved by the session layer.
+    pub fn resolved_thread_id(&self) -> String {
+        self.resolved_external_thread_id()
     }
 }
 

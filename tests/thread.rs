@@ -4,6 +4,7 @@ use openjarvis::{
     thread::ConversationThread,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 #[test]
 fn store_turn_updates_thread_and_preserves_final_assistant_message() {
@@ -58,4 +59,22 @@ fn load_messages_preserves_tool_call_metadata() {
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[1].tool_calls[0].id, "call_1");
     assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+}
+
+#[test]
+fn load_or_create_turn_reuses_existing_turn_for_same_external_message_id() {
+    let now = Utc::now();
+    let mut thread = ConversationThread::new("default", now);
+    let first_turn_id = Uuid::new_v4();
+
+    let stored_turn_id = thread
+        .load_or_create_turn(Some("msg_1".to_string()), first_turn_id, now, now)
+        .id;
+    let reused_turn_id = thread
+        .load_or_create_turn(Some("msg_1".to_string()), Uuid::new_v4(), now, now)
+        .id;
+
+    assert_eq!(stored_turn_id, first_turn_id);
+    assert_eq!(reused_turn_id, first_turn_id);
+    assert_eq!(thread.turns.len(), 1);
 }
