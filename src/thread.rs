@@ -9,58 +9,34 @@ use uuid::Uuid;
 pub struct ConversationTurn {
     pub id: Uuid,
     pub external_message_id: Option<String>,
-    pub user_message: String,
-    pub assistant_message: Option<String>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
     pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: DateTime<Utc>,
 }
 
 impl ConversationTurn {
-    /// Create a new turn that starts with the user's message.
+    /// Create a new stored turn from normalized chat messages.
     pub fn new(
         external_message_id: Option<String>,
-        user_message: impl Into<String>,
+        messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
     ) -> Self {
-        let user_message = user_message.into();
         Self {
             id: Uuid::new_v4(),
             external_message_id,
-            user_message: user_message.clone(),
-            assistant_message: None,
-            messages: vec![ChatMessage::new(
-                ChatMessageRole::User,
-                user_message,
-                started_at,
-            )],
+            messages,
             started_at,
-            completed_at: None,
+            completed_at,
         }
     }
 
-    /// Complete the turn with a plain assistant message.
-    pub fn complete(&mut self, assistant_message: impl Into<String>, completed_at: DateTime<Utc>) {
-        let assistant_message = assistant_message.into();
-        self.complete_with_messages(
-            vec![ChatMessage::new(
-                ChatMessageRole::Assistant,
-                assistant_message,
-                completed_at,
-            )],
-            completed_at,
-        );
-    }
-
-    pub fn complete_with_messages(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        completed_at: DateTime<Utc>,
-    ) {
-        self.assistant_message = select_final_assistant_message(&messages);
-        self.messages.extend(messages);
-        self.completed_at = Some(completed_at);
+    /// Return the final assistant-visible message recorded in this turn.
+    pub fn final_assistant_message(&self) -> Option<&ChatMessage> {
+        self.messages.iter().rev().find(|message| {
+            message.role == ChatMessageRole::Assistant && !message.content.trim().is_empty()
+        })
     }
 }
 
@@ -83,65 +59,25 @@ impl ConversationThread {
         }
     }
 
-    pub fn append_user_turn(
+    pub fn store_turn(
         &mut self,
         external_message_id: Option<String>,
-        user_message: impl Into<String>,
+        messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
     ) -> Uuid {
-        let turn = ConversationTurn::new(external_message_id, user_message, started_at);
+        let turn = ConversationTurn::new(external_message_id, messages, started_at, completed_at);
         let turn_id = turn.id;
         self.turns.push(turn);
-        self.updated_at = started_at;
+        self.updated_at = completed_at;
         turn_id
     }
 
-    pub fn complete_turn(
-        &mut self,
-        turn_id: Uuid,
-        assistant_message: impl Into<String>,
-        completed_at: DateTime<Utc>,
-    ) -> bool {
-        let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) else {
-            return false;
-        };
-
-        turn.complete(assistant_message, completed_at);
-        self.updated_at = completed_at;
-        true
+    /// Load the flattened message history for the whole thread.
+    pub fn load_messages(&self) -> Vec<ChatMessage> {
+        self.turns
+            .iter()
+            .flat_map(|turn| turn.messages.iter().cloned())
+            .collect()
     }
-
-    pub fn complete_turn_with_messages(
-        &mut self,
-        turn_id: Uuid,
-        messages: Vec<ChatMessage>,
-        completed_at: DateTime<Utc>,
-    ) -> bool {
-        let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) else {
-            return false;
-        };
-
-        turn.complete_with_messages(messages, completed_at);
-        self.updated_at = completed_at;
-        true
-    }
-}
-
-fn select_final_assistant_message(messages: &[ChatMessage]) -> Option<String> {
-    // Prefer the last plain assistant reply, but fall back to the most recent assistant message.
-    messages
-        .iter()
-        .rev()
-        .find(|message| {
-            message.role == ChatMessageRole::Assistant
-                && message.tool_calls.is_empty()
-                && !message.content.trim().is_empty()
-        })
-        .or_else(|| {
-            messages
-                .iter()
-                .rev()
-                .find(|message| message.role == ChatMessageRole::Assistant)
-        })
-        .map(|message| message.content.clone())
 }

@@ -1,10 +1,11 @@
-//! In-memory session storage that groups conversation threads by channel and user.
+//! In-memory session storage keyed by channel, user, and thread.
 //!
-//! This store is responsible for session state, not execution scheduling. Today callers are
-//! expected to feed turns in order. When concurrent turn execution is introduced later, ordering
-//! should be enforced by the agent-side inbox or worker scheduler rather than by this store alone.
+//! Router owns the session store and uses `load_turn`/`store_turn` to bridge external incoming
+//! messages with the agent's normalized chat history. The stored payload is the unified chat
+//! protocol message list so providers such as OpenAI and Anthropic can share one persistence
+//! layer while keeping provider-specific serialization in the LLM layer.
 
-use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
+use crate::context::ChatMessage;
 use crate::model::IncomingMessage;
 use crate::thread::ConversationThread;
 use chrono::{DateTime, Utc};
@@ -28,6 +29,61 @@ impl SessionKey {
     }
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ThreadLocator {
+    pub channel: String,
+    pub user_id: String,
+    pub thread_id: String,
+}
+
+impl ThreadLocator {
+    /// Build a stable session-thread locator from a normalized incoming message.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::model::{IncomingMessage, ReplyTarget};
+    /// use openjarvis::session::ThreadLocator;
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let incoming = IncomingMessage {
+    ///     id: Uuid::new_v4(),
+    ///     external_message_id: None,
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    ///     user_name: None,
+    ///     content: "hello".to_string(),
+    ///     thread_id: None,
+    ///     received_at: Utc::now(),
+    ///     metadata: json!({}),
+    ///     attachments: Vec::new(),
+    ///     reply_target: ReplyTarget {
+    ///         receive_id: "oc_xxx".to_string(),
+    ///         receive_id_type: "chat_id".to_string(),
+    ///     },
+    /// };
+    ///
+    /// let locator = ThreadLocator::from_incoming(&incoming);
+    /// assert_eq!(locator.thread_id, "default");
+    /// ```
+    pub fn from_incoming(incoming: &IncomingMessage) -> Self {
+        Self {
+            channel: incoming.channel.clone(),
+            user_id: incoming.user_id.clone(),
+            thread_id: incoming.resolved_thread_id(),
+        }
+    }
+
+    /// Return the parent session key for this thread locator.
+    pub fn session_key(&self) -> SessionKey {
+        SessionKey {
+            channel: self.channel.clone(),
+            user_id: self.user_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub threads: HashMap<String, ConversationThread>,
@@ -45,94 +101,138 @@ impl Session {
 }
 
 #[derive(Debug, Clone)]
-pub struct PendingTurn {
-    pub session_key: SessionKey,
-    pub thread_id: String,
-    pub turn_id: Uuid,
-    pub context: MessageContext,
+pub struct SessionStrategy {
+    pub max_messages_per_turn: usize,
+}
+
+impl Default for SessionStrategy {
+    fn default() -> Self {
+        Self {
+            max_messages_per_turn: 5,
+        }
+    }
+}
+
+impl SessionStrategy {
+    /// Apply the current turn-storage policy to one normalized turn message list.
+    pub fn retain_messages(&self, mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        if self.max_messages_per_turn == 0 {
+            return Vec::new();
+        }
+
+        let drop_count = messages.len().saturating_sub(self.max_messages_per_turn);
+        if drop_count > 0 {
+            messages.drain(0..drop_count);
+        }
+        messages
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct SessionManager {
     sessions: RwLock<HashMap<SessionKey, Session>>,
+    strategy: SessionStrategy,
 }
 
 impl SessionManager {
     /// Create an empty in-memory session manager.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::session::SessionManager;
+    ///
+    /// let manager = SessionManager::new();
+    /// assert_eq!(manager.strategy().max_messages_per_turn, 5);
+    /// ```
     pub fn new() -> Self {
-        Self::default()
+        Self::with_strategy(SessionStrategy::default())
     }
 
-    /// Start a new turn, creating the session and thread on demand and materializing the next context.
-    ///
-    /// This method only mutates session state for the new pending turn. It does not by itself
-    /// prevent two turns from the same session or thread from running concurrently.
-    pub async fn begin_turn(&self, incoming: &IncomingMessage, system_prompt: &str) -> PendingTurn {
-        let now = Utc::now();
-        let session_key = SessionKey::from_incoming(incoming);
-        let thread_id = resolve_thread_id(incoming);
-        let received_at = incoming.received_at;
-        let external_message_id = incoming.external_message_id.clone();
-        let user_message = incoming.content.clone();
-
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .entry(session_key.clone())
-            .or_insert_with(|| Session::new(now));
-        let thread = session
-            .threads
-            .entry(thread_id.clone())
-            .or_insert_with(|| ConversationThread::new(thread_id.clone(), now));
-        let turn_id = thread.append_user_turn(external_message_id, user_message, received_at);
-        session.updated_at = now;
-
-        let mut context = MessageContext::with_system_prompt(system_prompt.to_string());
-        context.extend_from_thread(thread);
-
-        PendingTurn {
-            session_key,
-            thread_id,
-            turn_id,
-            context,
+    /// Create an empty in-memory session manager with a custom storage strategy.
+    pub fn with_strategy(strategy: SessionStrategy) -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            strategy,
         }
     }
 
-    /// Complete a turn with a plain assistant reply.
-    pub async fn complete_turn(&self, pending: &PendingTurn, assistant_message: &str) {
-        let completed_at = Utc::now();
-        self.complete_turn_with_messages(
-            pending,
-            vec![ChatMessage::new(
-                ChatMessageRole::Assistant,
-                assistant_message,
-                completed_at,
-            )],
-            completed_at,
-        )
-        .await;
+    /// Return the configured session storage strategy.
+    pub fn strategy(&self) -> &SessionStrategy {
+        &self.strategy
     }
 
-    pub async fn complete_turn_with_messages(
-        &self,
-        pending: &PendingTurn,
-        messages: Vec<ChatMessage>,
-        completed_at: DateTime<Utc>,
-    ) {
-        // Complete the pending turn after the agent loop finishes.
-        //
-        // This write is intentionally narrow. Any future concurrent execution model still needs
-        // an external ordering guarantee so turns from the same session or thread are completed
-        // in the intended sequence.
-        let mut sessions = self.sessions.write().await;
-        let Some(session) = sessions.get_mut(&pending.session_key) else {
-            return;
-        };
-        let Some(thread) = session.threads.get_mut(&pending.thread_id) else {
-            return;
-        };
+    /// Load the current flattened history for one channel/user/thread tuple.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::session::{SessionManager, ThreadLocator};
+    ///
+    /// let manager = SessionManager::new();
+    /// let locator = ThreadLocator {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    ///     thread_id: "default".to_string(),
+    /// };
+    ///
+    /// let _future = manager.load_turn(&locator);
+    /// ```
+    pub async fn load_turn(&self, locator: &ThreadLocator) -> Vec<ChatMessage> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&locator.session_key())
+            .and_then(|session| session.threads.get(&locator.thread_id))
+            .map(ConversationThread::load_messages)
+            .unwrap_or_default()
+    }
 
-        thread.complete_turn_with_messages(pending.turn_id, messages, completed_at);
+    /// Store one completed turn for the provided channel/user/thread tuple.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::context::{ChatMessage, ChatMessageRole};
+    /// use openjarvis::session::{SessionManager, ThreadLocator};
+    ///
+    /// let manager = SessionManager::new();
+    /// let locator = ThreadLocator {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    ///     thread_id: "default".to_string(),
+    /// };
+    /// let _future = manager.store_turn(
+    ///     &locator,
+    ///     Some("msg_1".to_string()),
+    ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", Utc::now())],
+    ///     Utc::now(),
+    ///     Utc::now(),
+    /// );
+    /// ```
+    pub async fn store_turn(
+        &self,
+        locator: &ThreadLocator,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    ) -> Uuid {
+        let session_key = locator.session_key();
+        let retained_messages = self.strategy.retain_messages(messages);
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .entry(session_key)
+            .or_insert_with(|| Session::new(completed_at));
+        let thread = session
+            .threads
+            .entry(locator.thread_id.clone())
+            .or_insert_with(|| ConversationThread::new(locator.thread_id.clone(), completed_at));
+        let turn_id = thread.store_turn(
+            external_message_id,
+            retained_messages,
+            started_at,
+            completed_at,
+        );
         session.updated_at = completed_at;
+        turn_id
     }
 
     /// Return a cloned session snapshot for debugging or tests.
@@ -140,13 +240,4 @@ impl SessionManager {
         let sessions = self.sessions.read().await;
         sessions.get(key).cloned()
     }
-}
-
-fn resolve_thread_id(incoming: &IncomingMessage) -> String {
-    // Use the upstream thread id when present, otherwise keep a single default thread.
-    incoming
-        .thread_id
-        .clone()
-        .filter(|thread_id| !thread_id.trim().is_empty())
-        .unwrap_or_else(|| "default".to_string())
 }

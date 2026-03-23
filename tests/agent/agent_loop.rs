@@ -2,12 +2,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use openjarvis::{
     agent::{
-        AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime, HookEvent, HookEventKind,
-        HookHandler, HookRegistry, InfoContext,
+        AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime,
+        HookEvent, HookEventKind, HookHandler, HookRegistry, InfoContext,
     },
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
-    model::{OutgoingMessage, ReplyTarget},
+    model::ReplyTarget,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -69,7 +69,7 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
     assert_eq!(output.turn_messages.len(), 1);
     assert_eq!(output.turn_messages[0].content, "loop-reply");
     assert_eq!(outgoing[0].content, "loop-reply");
-    assert_eq!(outgoing[0].metadata["event_kind"], "TextOutput");
+    assert_eq!(format!("{:?}", outgoing[0].kind), "TextOutput");
     assert_eq!(
         emitted_kinds,
         vec![HookEventKind::UserPromptSubmit, HookEventKind::Notification]
@@ -246,7 +246,7 @@ fn build_context(system_prompt: &str, user_message: &str) -> MessageContext {
     context
 }
 
-fn build_input() -> (InfoContext, mpsc::Receiver<OutgoingMessage>) {
+fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
     let (tx, rx) = mpsc::channel(32);
     (
         InfoContext {
@@ -272,9 +272,9 @@ fn build_input() -> (InfoContext, mpsc::Receiver<OutgoingMessage>) {
 }
 
 async fn collect_outgoing(
-    mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
+    mut outgoing_rx: mpsc::Receiver<AgentDispatchEvent>,
     expected_count: usize,
-) -> Vec<OutgoingMessage> {
+) -> Vec<AgentDispatchEvent> {
     timeout(Duration::from_millis(500), async move {
         let mut messages = Vec::new();
         while messages.len() < expected_count {

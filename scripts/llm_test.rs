@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use openjarvis::{
-    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LlmConfig},
+    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig},
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMRequest, build_provider},
 };
@@ -15,12 +15,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TODO: 改动注释 符合rust规范
     // 作用: 单独读取 LLM 配置并发起一次测试请求，用于验证 provider/base_url/api_key_path 是否可用。
     // 参数: 支持 `--config <path>` 覆盖配置文件路径，位置参数为测试消息，默认发送 `Hello`。
     let args = parse_args()?;
     let config = load_config(args.config_path.as_deref())?;
     let llm_config = config.llm_config();
-    ensure_real_llm_config(llm_config)?;
+    ensure_real_provider_config(llm_config)?;
     let system_prompt = resolve_system_prompt(&args);
 
     eprintln!(
@@ -103,7 +104,7 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<AppConfig> {
     }
 }
 
-fn ensure_real_llm_config(config: &LlmConfig) -> Result<()> {
+fn ensure_real_provider_config(config: &LLMConfig) -> Result<()> {
     // 作用: 校验当前配置适合做真实 LLM 连通性测试，避免误走 mock provider。
     // 参数: config 为当前加载出的 llm 子配置。
     match config.provider.as_str() {

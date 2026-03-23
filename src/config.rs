@@ -15,7 +15,7 @@ pub struct AppConfig {
     server: ServerConfig,
     #[serde(flatten)]
     channels: ChannelConfig,
-    llm: LlmConfig,
+    llm: LLMConfig,
 }
 
 impl Default for AppConfig {
@@ -23,7 +23,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig::default(),
             channels: ChannelConfig::default(),
-            llm: LlmConfig::default(),
+            llm: LLMConfig::default(),
         }
     }
 }
@@ -55,7 +55,7 @@ impl AppConfig {
     }
 
     /// Return the read-only LLM configuration view.
-    pub fn llm_config(&self) -> &LlmConfig {
+    pub fn llm_config(&self) -> &LLMConfig {
         &self.llm
     }
 }
@@ -141,7 +141,7 @@ impl FeishuConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct LlmConfig {
+pub struct LLMConfig {
     pub provider: String,
     pub model: String,
     pub base_url: String,
@@ -150,7 +150,7 @@ pub struct LlmConfig {
     pub mock_response: String,
 }
 
-impl Default for LlmConfig {
+impl Default for LLMConfig {
     fn default() -> Self {
         Self {
             provider: "mock".to_string(),

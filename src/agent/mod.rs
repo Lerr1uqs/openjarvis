@@ -8,7 +8,8 @@ pub mod tool;
 pub mod worker;
 
 pub use agent_loop::{
-    AgentEventSender, AgentLoop, AgentLoopEvent, AgentLoopEventKind, AgentLoopOutput, InfoContext,
+    AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEvent, AgentLoopEventKind,
+    AgentLoopOutput, InfoContext,
 };
 pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
 pub use mcp::{McpRegistry, McpServerDefinition, McpTransport};
@@ -17,4 +18,7 @@ pub use tool::{
     EditTool, ReadTool, ShellTool, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
     ToolInputSchema, ToolRegistry, ToolSchemaProtocol, WriteTool,
 };
-pub use worker::AgentWorker;
+pub use worker::{
+    AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle, CompletedAgentTurn,
+    FailedAgentTurn,
+};

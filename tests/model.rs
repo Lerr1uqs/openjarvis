@@ -49,9 +49,32 @@ fn message_models_roundtrip_with_serde() {
 
     assert_eq!(decoded_incoming.content, "hello");
     assert_eq!(decoded_incoming.attachments.len(), 1);
+    assert_eq!(decoded_incoming.resolved_thread_id(), "thread_1");
     assert_eq!(decoded_outgoing.content, "reply");
     assert_eq!(
         decoded_outgoing.reply_to_message_id.as_deref(),
         Some("msg_1")
     );
+}
+
+#[test]
+fn missing_thread_id_falls_back_to_default() {
+    let incoming = IncomingMessage {
+        id: Uuid::new_v4(),
+        external_message_id: None,
+        channel: "feishu".to_string(),
+        user_id: "ou_xxx".to_string(),
+        user_name: None,
+        content: "hello".to_string(),
+        thread_id: None,
+        received_at: Utc::now(),
+        metadata: json!({}),
+        attachments: Vec::new(),
+        reply_target: ReplyTarget {
+            receive_id: "oc_xxx".to_string(),
+            receive_id_type: "chat_id".to_string(),
+        },
+    };
+
+    assert_eq!(incoming.resolved_thread_id(), "default");
 }

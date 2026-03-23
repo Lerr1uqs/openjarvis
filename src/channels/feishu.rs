@@ -15,7 +15,7 @@ use tokio::{
     process::Command,
     sync::{Mutex, mpsc},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const FEISHU_DEBUG_REACTION_EMOJI_TYPE: &str = "Typing";
@@ -41,11 +41,25 @@ impl FeishuChannel {
         payload: FeishuLongConnectionPayload,
     ) -> IncomingMessage {
         let content = extract_text_message(&payload.message_type, &payload.content);
-        let thread_id = payload.thread_id.filter(|value| !value.trim().is_empty());
+        let message_id = payload.message_id.clone();
+        let chat_id = payload.chat_id.clone();
+        let raw_thread_id = payload.thread_id.clone();
+        let thread_id = raw_thread_id
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+
+        debug!(
+            message_id,
+            chat_id,
+            has_thread_id = raw_thread_id.is_some(),
+            raw_thread_id = ?raw_thread_id,
+            resolved_thread_id = ?thread_id,
+            "parsed feishu long-connection thread_id"
+        );
 
         IncomingMessage {
             id: Uuid::new_v4(),
-            external_message_id: Some(payload.message_id.clone()),
+            external_message_id: Some(message_id.clone()),
             channel: self.name().to_string(),
             user_id: payload.sender_open_id,
             user_name: None,
@@ -55,9 +69,9 @@ impl FeishuChannel {
             metadata: json!({
                 "event_id": payload.event_id,
                 "event_type": "im.message.receive_v1",
-                "chat_id": payload.chat_id,
+                "chat_id": chat_id,
                 "chat_type": payload.chat_type,
-                "message_id": payload.message_id,
+                "message_id": message_id,
                 "message_type": payload.message_type,
                 "tenant_key": payload.tenant_key,
                 "source": "feishu_long_connection",

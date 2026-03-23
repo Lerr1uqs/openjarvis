@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     }
 
     let agent = AgentWorker::from_config(config.llm_config())?;
-    let router = ChannelRouter::new(agent);
+    let mut router = ChannelRouter::new(agent);
 
     router.register_channels(config.channel_config()).await?;
     info!(
@@ -23,7 +23,15 @@ async fn main() -> Result<()> {
         "openjarvis server started"
     );
 
-    shutdown_signal().await;
+    let router_loop = router.run();
+    tokio::pin!(router_loop);
+
+    tokio::select! {
+        result = &mut router_loop => {
+            result?;
+        }
+        _ = shutdown_signal() => {}
+    }
     Ok(())
 }
 

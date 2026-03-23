@@ -1,11 +1,18 @@
-# openJarvis整体架构设计
 
-第一层外部输入层：
-- channels 封装(飞书机器人 tg discord)
-- gateway: ws/http/sse 管理员控制面板
-- 管理员 cli 命令管理工具 可以控制任何配置更改 另外配置是热更新的TODO
+# 整体架构
+- 外部输入层: channel 对飞书 telegram等的封装 对服务器建立长连接并返回IncomingMessage
+    - channel运行在各自的异步任务中 多个channel被包装为StreamMap
+- 路由层: Router 是连接 Agent 跟多个 Channel 的桥梁，它们是双向连接 Agent也是运行在一个独立的异步任务中
+    - Router是运行在主线程中 作为持续loop一直运行
+    - Router接收到消息后 通过SessionManager进行处理
+- 处理层: AgentWorker接收到消息 开始串行执行处理任务
 
-都变成 IncomingMessage
+# 组件
+## Router
+主要负责各类事件 消息的转换和转发(transform+forward) 并不直接进行进行逻辑执行
+
+## Channel
+外部输入点 向外部服务建立长连接 接收消息并发送出去
 ```rs
 pub struct IncomingMessage {
     /// Unique message ID.
@@ -29,142 +36,78 @@ pub struct IncomingMessage {
 }
 ```
 
-## 外部输入层
+## SessionManager
 
-### channel
-channel是独立线程 通过配置文件注册 config.yaml
-```
-channel:
-    feishu:
-        appid:
-        secret:
-        admin
-```
-
-ChatChannel trait:
-- on_start
-- on_message_incoming -> IncomingMessage
-- on_message_outgoing(OutgoingMessage)
-- on_end
-- check_health
-
-所有外部channel的消息走到统一的ChannelRouter组件进行路由 ChannelRouter和channel进行双向通信 agent也和这个去通信
-
-
-channels -> router -> worker -> SessionManager 拼历史 -> MessageContext -> AgentLoop
-
-## 组件
-- agent沙箱环境 AgenticWorker 封装沙箱和agent context (沙箱实现待定 先实现一个空壳) agent的组件只有一个实例 所有user的消息都会走入这个 但是有权限管控
-sessions[channel:userid] -> Session
+用户和Agent交流的Message的上下文件都放在这个里面 因为Agent是无状态的 会话历史需要从中获取
 
 - SessionManager: 变量 包装下面这些概念 [单一变量 一般不会出现多次]
     - Session: 一个用户的上下文回话空间
         - Thread: 一个用户和一个agent单次交互的全部聊天记录
             - Turn: 用户输入 + AgentLoop循环完成的一轮Message
 
+通过 uuid:channel:external_thread_id来定位已有的thread
+注意thread第一次遇到会创建 后续会使用创建的thread (单一uuid)
+后期这些都会落盘到postgres sql中去(TBD)
 
-所有agent先走默认的配置 也是在配置文件里
-```
-llm_provider:
-    agent:
-        default:
-            protocol: anthropic/openai
-            base_url: ...
-            api_key: ...
-```
+另外有一个SessionStrategy 负责做会话保存的策略 比如turn只保留五个 多余进行丢弃(暂时)
+session message实现两个接口：一个是 load_turn，一个是 store_turn。
 
-Worker: 包装沙箱容器 + AgenticLoop 
-```
-struct Worker {
-    pub sandbox;
-    struct AgenticLoop {
-        tools: List[Tool],
-        mcp: List[mcp],
-        hook: AgentHook
-    }
-    pub router_tx; // 发送数据回给router
-}
-```
+1. store：存储新增的消息。
+2. load：加载当前传入的 history。
 
-AgentHook: 从配置文件中加载hook
-```
+目前的策略是：message 只存储最新的 5 个，多余的就丢弃。
+
+## Agent
+
+### AgentWorker
+Worker: 包装沙箱容器 + AgenticLoop
+
+### AgenticLoop
+负责Agent整个react循环和执行 还有事件外放给Router
+
+### AgentHook: 从配置文件中加载hook
+```yaml
 agent:
     hook:
         pre_tool_use: ["echo", "hello"] # 后期支持参数注入 现在先只支持脚本
 ```
-- worker.run(messages)
-- agenticloop: agentic_loop.run(user_context{info+messages}) # 记得对tools的权限做检查
-    - 绑定配置里的provider
-    - 存在hook：比如使用工具前使用工具后的自定义hook 查看hook.md
-```
-async def run(user_context, ):
 
-    user, messages = user_context
-    while True:
-    
-        response, tool_calls = llm.generate(messages)
-        self.router_tx.send(// 对方有这个tx和user_info进行绑定的数据结构
-            AgentEvent(
-                type="text_output",
-                response
-            ),
-            ...
-        )
-        
-        messages = messages + response
-        if not tool_calls:
-            break
-            
-        for tcall in tool_calls:
-            self.router_tx.send(// 对方有这个tx和user_info进行绑定的数据结构
-                AgentEvent(
-                    type="tool_call",
-                    tcall
-                ),
-                ...
-            )
-            tool_res = tool_register.call(tool_use, user)
-            self.router_tx.send(// 对方有这个tx和user_info进行绑定的数据结构
-                AgentEvent(
-                    type="tool_result",
-                    tool_res
-                ),
-                ...
-            )
+### Context: 对Message的组织概念
 
-```
-
-Context: 对Message的组织概念
-- agent只接受ChatMessage(asistant/system/tool_result这些)
-- 对各种类型的ChatMessage做上下文组织
-```
+agent只接受ChatMessage(asistant/system/tool_result这些)
+对各种类型的ChatMessage做上下文组织 可以导出为Vec<ChatMessage>
 MessageContext = order{
     SYSTEM: List[ChatMessage],
     MEMORY: List[ChatMessage],
     CHAT: List[ChatMessage], 
 }
-```
 
-Command:
-    - 用户传入的消息会先被Command组件截取 如果发现是注册的Command比如 `/approve` 开头 就会执行对应的命令而不需要执行相关上下文 Command的使用方式也能转换为docs暴露给agent 从而让agent 通过 openjarvis命令行去执行比如 `openjarvis command approve --channel feishu --username sakiko` 但是要通过某种方式确认当前cli是哪个agent执行的 agent有当前用户交互的userid来判断有没有权限
+## Command
+用户传入的消息会先被Command组件截取 如果发现是注册的Command比如 /approve 开头 就会执行对应的命令而不需要执行相关上下文 Command的使用方式也能转换为docs暴露给agent 从而让agent 通过 openjarvis命令行去执行比如 openjarvis command approve --channel feishu --username sakiko 但是要通过某种方式确认当前cli是哪个agent执行的 agent有当前用户交互的userid来判断有没有权限
 
-Cron: 定时器
+## Cron: 定时器
 
-memory: 本地内存crud 长短期 记忆命中机制
-- 提供memory_search + memory_write两套逻辑 当前只支持文本匹配或者bm25改进版 未来支持qmd 
-- 写在当前的./.memory/... 下面
-- 其中MEMORY.md是永久性记忆 要加载到上下文里 其他是搜索性质的记忆
+## memory: 本地内存crud 长短期 记忆命中机制
 
-LLMProvider: 兼容openai和anthropic协议 允许配置不同的提供者
+提供memory_search + memory_write两套逻辑 当前只支持文本匹配或者bm25改进版 未来支持qmd
+写在当前的./.memory/... 下面
+其中MEMORY.md是永久性记忆 要加载到上下文里 其他是搜索性质的记忆
 
-CLIAbility: 注册使用的cli能力工具
+## LLMProvider
+兼容openai和anthropic协议 允许配置不同的提供者
 
-ToolRegistry: 基本工具的使用 bash memory等等
+## CLIAbility
+注册使用的cli能力工具
 
-## 记忆
+## ToolRegistry
+基本工具的使用 bash memory等等
 
+### MCP
+工具中心可以通过配置文件配置mcp协议 从而让模型有调用mcp的能力
 
-## 安全
+# TODO
+记忆
+安全
 安全认证 + 工具审批 + 防注入能力？
 
 限制agent在群聊的能力
@@ -172,11 +115,15 @@ ToolRegistry: 基本工具的使用 bash memory等等
 通过admin_token进行单人管理 登录后端界面
 
 ## 评估
-
-## 其他功能
-
-### auto-compact
-
-### compact
-
+## 其他功能 TBD
+auto-compact
+compact
 参考claude和codex？再提供一点点机制
+
+
+
+
+
+
+## TODO
+打印飞书消息

@@ -119,28 +119,32 @@ impl MessageContext {
         ));
     }
 
+    /// Append chat messages that were already normalized to the unified protocol shape.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::context::{ChatMessage, ChatMessageRole, MessageContext};
+    ///
+    /// let mut context = MessageContext::with_system_prompt("system");
+    /// context.extend_chat_messages(vec![ChatMessage::new(
+    ///     ChatMessageRole::User,
+    ///     "hello",
+    ///     Utc::now(),
+    /// )]);
+    ///
+    /// assert_eq!(context.chat.len(), 1);
+    /// ```
+    pub fn extend_chat_messages<I>(&mut self, messages: I)
+    where
+        I: IntoIterator<Item = ChatMessage>,
+    {
+        self.chat.extend(messages);
+    }
+
     /// Extend chat history from an existing conversation thread.
     pub fn extend_from_thread(&mut self, thread: &ConversationThread) {
-        for turn in &thread.turns {
-            if !turn.messages.is_empty() {
-                self.chat.extend(turn.messages.iter().cloned());
-                continue;
-            }
-
-            self.chat.push(ChatMessage::new(
-                ChatMessageRole::User,
-                turn.user_message.clone(),
-                turn.started_at,
-            ));
-
-            if let Some(assistant_message) = turn.assistant_message.as_ref() {
-                self.chat.push(ChatMessage::new(
-                    ChatMessageRole::Assistant,
-                    assistant_message.clone(),
-                    turn.completed_at.unwrap_or(turn.started_at),
-                ));
-            }
-        }
+        self.extend_chat_messages(thread.load_messages());
     }
 
     /// Return a read-only-style copy of the context messages in prompt order.

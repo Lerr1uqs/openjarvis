@@ -2,7 +2,7 @@
 
 use crate::{
     agent::{ToolDefinition, ToolSchemaProtocol},
-    config::LlmConfig,
+    config::LLMConfig,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
 };
 use anyhow::{Context, Result, bail};
@@ -47,16 +47,16 @@ pub trait LLMProvider: Send + Sync {
 }
 
 /// Build the configured LLM provider implementation.
-pub fn build_provider(config: &LlmConfig) -> Result<Arc<dyn LLMProvider>> {
+pub fn build_provider(config: &LLMConfig) -> Result<Arc<dyn LLMProvider>> {
     match LLMProviderProtocol::from_config(config)? {
         LLMProviderProtocol::Mock => {
             Ok(Arc::new(MockLLMProvider::new(config.mock_response.clone())))
         }
         LLMProviderProtocol::OpenAiCompatible => {
-            let resolved_config = resolve_llm_config(config)?;
+            let resolved_config = resolve_provider_config(config)?;
             Ok(Arc::new(OpenaiProvider::new(resolved_config)?))
         }
-        LLMProviderProtocol::Anthropic => Ok(Arc::new(AnthropicProvider::new(resolve_llm_config(
+        LLMProviderProtocol::Anthropic => Ok(Arc::new(AnthropicProvider::new(resolve_provider_config(
             config,
         )?))),
     }
@@ -69,7 +69,7 @@ enum LLMProviderProtocol {
 }
 
 impl LLMProviderProtocol {
-    fn from_config(config: &LlmConfig) -> Result<Self> {
+    fn from_config(config: &LLMConfig) -> Result<Self> {
         // Normalize configured provider aliases into one internal protocol enum.
         // TODO: 这里的check有问题 Provider很多 应该限制协议
         match config.provider.trim().to_ascii_lowercase().as_str() {
@@ -110,12 +110,12 @@ impl LLMProvider for MockLLMProvider {
 }
 
 pub struct OpenaiProvider {
-    config: LlmConfig,
+    config: LLMConfig,
     client: Client<OpenAIConfig>,
 }
 
 impl OpenaiProvider {
-    fn new(config: LlmConfig) -> Result<Self> {
+    fn new(config: LLMConfig) -> Result<Self> {
         // Validate the required fields and build an OpenAI-compatible client.
         if config.api_key.trim().is_empty() {
             bail!("llm.api_key is required when provider=openai_compatible");
@@ -136,11 +136,11 @@ impl OpenaiProvider {
 }
 
 pub struct AnthropicProvider {
-    config: LlmConfig,
+    config: LLMConfig,
 }
 
 impl AnthropicProvider {
-    fn new(config: LlmConfig) -> Self {
+    fn new(config: LLMConfig) -> Self {
         // Keep a dedicated protocol branch even before the Anthropic transport is implemented.
         Self { config }
     }
@@ -196,7 +196,7 @@ impl LLMProvider for AnthropicProvider {
 }
 
 fn build_openai_request(
-    config: &LlmConfig,
+    config: &LLMConfig,
     request: LLMRequest,
 ) -> Result<CreateChatCompletionRequest> {
     // Convert the protocol-agnostic request into the OpenAI SDK request shape.
@@ -296,7 +296,7 @@ fn serialize_openai_tools(tools: &[ToolDefinition]) -> Result<Vec<ChatCompletion
         .collect()
 }
 
-fn build_anthropic_request(config: &LlmConfig, request: &LLMRequest) -> Result<()> {
+fn build_anthropic_request(config: &LLMConfig, request: &LLMRequest) -> Result<()> {
     // Keep Anthropic request assembly behind its own protocol boundary for future implementation.
     if request.messages.is_empty() {
         bail!("llm request must contain at least one message");
@@ -373,7 +373,7 @@ fn parse_openai_tool_call(tool_call: ChatCompletionMessageToolCalls) -> Result<L
     }
 }
 
-fn resolve_llm_config(config: &LlmConfig) -> Result<LlmConfig> {
+fn resolve_provider_config(config: &LLMConfig) -> Result<LLMConfig> {
     // Resolve the final config, loading the API key from `api_key_path` when needed.
     let mut resolved = config.clone();
     if resolved.api_key.trim().is_empty() && !resolved.api_key_path.as_os_str().is_empty() {

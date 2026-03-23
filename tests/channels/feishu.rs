@@ -45,3 +45,25 @@ fn long_connection_payload_is_mapped_to_unified_model() {
     assert_eq!(incoming.reply_target.receive_id, "oc_xxx");
     assert_eq!(incoming.thread_id.as_deref(), Some("omt_xxx"));
 }
+
+#[test]
+fn long_connection_payload_without_thread_id_keeps_none() {
+    let channel = FeishuChannel::new(FeishuConfig::default());
+    let incoming = channel.parse_long_connection_incoming(
+        serde_json::from_value::<FeishuLongConnectionPayload>(json!({
+            "event_id": "evt_ws_2",
+            "sender_open_id": "ou_xxx",
+            "sender_type": "user",
+            "tenant_key": "tenant_xxx",
+            "message_id": "om_xxx_ws_2",
+            "chat_id": "oc_xxx",
+            "thread_id": null,
+            "chat_type": "group",
+            "message_type": "text",
+            "content": "{\"text\":\"hello\"}"
+        }))
+        .expect("long connection payload should deserialize"),
+    );
+
+    assert_eq!(incoming.thread_id, None);
+}

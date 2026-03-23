@@ -1,6 +1,6 @@
 use chrono::Utc;
 use openjarvis::{
-    config::LlmConfig,
+    config::LLMConfig,
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMRequest, build_provider},
 };
@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn mock_provider_returns_configured_response() {
-    let config = LlmConfig {
+    let config = LLMConfig {
         provider: "mock".to_string(),
         mock_response: "收到".to_string(),
-        ..LlmConfig::default()
+        ..LLMConfig::default()
     };
     let provider = build_provider(&config).expect("mock provider should build");
     let reply = provider
@@ -34,10 +34,10 @@ async fn mock_provider_returns_configured_response() {
 
 #[tokio::test]
 async fn mock_llm_alias_builds_same_provider() {
-    let config = LlmConfig {
+    let config = LLMConfig {
         provider: "mock_llm".to_string(),
         mock_response: "pong".to_string(),
-        ..LlmConfig::default()
+        ..LLMConfig::default()
     };
     let provider = build_provider(&config).expect("mock_llm alias should build");
     let reply = provider
@@ -62,12 +62,12 @@ fn openai_compatible_provider_can_read_api_key_from_path() {
     let path = temp_dir().join(format!("openjarvis-api-key-{}.txt", Uuid::new_v4()));
     fs::write(&path, "sk-test-token\n").expect("api key file should be written");
 
-    let config = LlmConfig {
+    let config = LLMConfig {
         provider: "deepseek".to_string(),
         model: "deepseek-chat".to_string(),
         base_url: "https://api.deepseek.com/v1".to_string(),
         api_key_path: path.clone(),
-        ..LlmConfig::default()
+        ..LLMConfig::default()
     };
 
     build_provider(&config).expect("provider should build from api_key_path");
@@ -76,11 +76,11 @@ fn openai_compatible_provider_can_read_api_key_from_path() {
 
 #[tokio::test]
 async fn mock_provider_does_not_require_api_key_path() {
-    let config = LlmConfig {
+    let config = LLMConfig {
         provider: "mock".to_string(),
         mock_response: "still-mock".to_string(),
         api_key_path: PathBuf::from("Z:/this/path/should/not/be/read.txt"),
-        ..LlmConfig::default()
+        ..LLMConfig::default()
     };
 
     let provider = build_provider(&config).expect("mock provider should ignore api_key_path");
@@ -103,12 +103,12 @@ async fn mock_provider_does_not_require_api_key_path() {
 
 #[tokio::test]
 async fn anthropic_provider_builds_but_generate_is_not_implemented() {
-    let config = LlmConfig {
+    let config = LLMConfig {
         provider: "anthropic".to_string(),
         model: "claude-3-7-sonnet".to_string(),
         base_url: "https://api.anthropic.com".to_string(),
         api_key: "test-key".to_string(),
-        ..LlmConfig::default()
+        ..LLMConfig::default()
     };
 
     let provider = build_provider(&config).expect("anthropic placeholder should build");

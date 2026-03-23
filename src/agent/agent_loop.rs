@@ -8,7 +8,7 @@ use super::{
 use crate::{
     context::{ChatMessage, ChatMessageRole, ContextMessage, Messages},
     llm::{LLMProvider, LLMRequest},
-    model::{OutgoingMessage, ReplyTarget},
+    model::ReplyTarget,
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -18,11 +18,25 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
-use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct AgentDispatchEvent {
+    pub kind: AgentLoopEventKind,
+    pub content: String,
+    pub metadata: Value,
+    pub channel: String,
+    pub thread_id: String,
+    pub source_message_id: Option<String>,
+    pub target: ReplyTarget,
+    pub session_channel: String,
+    pub session_user_id: String,
+    pub session_thread_id: String,
+    pub reply_to_source: bool,
+}
 
 #[derive(Clone)]
 pub struct AgentEventSender {
-    router_tx: mpsc::Sender<OutgoingMessage>,
+    router_tx: mpsc::Sender<AgentDispatchEvent>,
     channel: String,
     thread_id: String,
     source_message_id: Option<String>,
@@ -36,7 +50,7 @@ pub struct AgentEventSender {
 impl AgentEventSender {
     /// Bind the router sender to one user/session context so agent events can be emitted directly.
     pub fn new(
-        router_tx: mpsc::Sender<OutgoingMessage>,
+        router_tx: mpsc::Sender<AgentDispatchEvent>,
         channel: impl Into<String>,
         thread_id: impl Into<String>,
         source_message_id: Option<String>,
@@ -58,30 +72,23 @@ impl AgentEventSender {
         }
     }
 
-    /// Convert one agent-loop event into an `OutgoingMessage` and forward it to the router.
+    /// Convert one agent-loop event into a structured dispatch event for the router.
     pub async fn send(&self, event: AgentLoopEvent) -> Result<()> {
-        let reply_to_message_id = if self.should_reply_to_source.swap(false, Ordering::AcqRel) {
-            self.source_message_id.clone()
-        } else {
-            None
-        };
+        let reply_to_source = self.should_reply_to_source.swap(false, Ordering::AcqRel);
 
         self.router_tx
-            .send(OutgoingMessage {
-                id: Uuid::new_v4(),
-                channel: self.channel.clone(),
+            .send(AgentDispatchEvent {
+                kind: event.kind,
                 content: event.content,
-                thread_id: Some(self.thread_id.clone()),
-                metadata: json!({
-                    "source_message_id": self.source_message_id,
-                    "session_channel": self.session_channel,
-                    "session_user_id": self.session_user_id,
-                    "session_thread_id": self.session_thread_id,
-                    "event_kind": format!("{:?}", event.kind),
-                    "event_metadata": event.metadata,
-                }),
-                reply_to_message_id,
+                metadata: event.metadata,
+                channel: self.channel.clone(),
+                thread_id: self.thread_id.clone(),
+                source_message_id: self.source_message_id.clone(),
                 target: self.target.clone(),
+                session_channel: self.session_channel.clone(),
+                session_user_id: self.session_user_id.clone(),
+                session_thread_id: self.session_thread_id.clone(),
+                reply_to_source,
             })
             .await
             .map_err(|error| anyhow::anyhow!("failed to forward agent event to router: {}", error))
@@ -158,7 +165,7 @@ impl AgentLoop {
 
         let tools = self.runtime.tools().list().await;
         let mut messages = build_react_messages(context);
-        let mut events = Vec::new();
+        let mut events = Vec::new();// events有无必要？
         let mut turn_messages = Vec::new();
         let mut used_tool_names = Vec::new();
 
@@ -214,10 +221,10 @@ impl AgentLoop {
             messages.push(assistant_tool_message.clone());
             turn_messages.push(assistant_tool_message);
 
-            for llm_tool_call in response.tool_calls {
+            for provider_tool_call in response.tool_calls {
                 let tool_call = ToolCallRequest {
-                    name: llm_tool_call.name.clone(),
-                    arguments: llm_tool_call.arguments.clone(),
+                    name: provider_tool_call.name.clone(),
+                    arguments: provider_tool_call.arguments.clone(),
                 };
                 let tool_call_event = AgentLoopEvent {
                     kind: AgentLoopEventKind::ToolCall,
@@ -228,7 +235,7 @@ impl AgentLoop {
                     metadata: json!({
                         "tool": tool_call.name,
                         "arguments": tool_call.arguments,
-                        "tool_call_id": llm_tool_call.id,
+                        "tool_call_id": provider_tool_call.id.clone(),
                     }),
                 };
                 input.event_tx.send(tool_call_event.clone()).await?;
@@ -285,7 +292,7 @@ impl AgentLoop {
                         "tool": tool_call.name.clone(),
                         "is_error": tool_result.is_error,
                         "metadata": tool_result.metadata,
-                        "tool_call_id": llm_tool_call.id,
+                        "tool_call_id": provider_tool_call.id.clone(),
                     }),
                 };
                 input.event_tx.send(tool_result_event.clone()).await?;
@@ -293,7 +300,7 @@ impl AgentLoop {
 
                 let tool_result_message =
                     ChatMessage::new(ChatMessageRole::ToolResult, tool_result_content, Utc::now())
-                        .with_tool_call_id(llm_tool_call.id.clone());
+                        .with_tool_call_id(provider_tool_call.id.clone());
                 messages.push(tool_result_message.clone());
                 turn_messages.push(tool_result_message);
             }
@@ -354,7 +361,7 @@ fn format_tool_result_content(content: &str, is_error: bool) -> String {
 
     content.to_string()
 }
-
+// TODO: 这里直接用Vec<ChatMessage>就行了
 fn build_react_messages(context: &ContextMessage) -> Messages {
     // Inject a tool-usage instruction into the first request assembled from the current context.
     let mut messages = context.as_messages();
