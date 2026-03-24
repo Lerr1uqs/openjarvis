@@ -170,29 +170,48 @@ impl Session {
 
 #[derive(Debug, Clone)]
 pub struct SessionStrategy {
-    pub max_messages_per_turn: usize,
+    pub max_messages_per_thread: usize,
 }
 
 impl Default for SessionStrategy {
     fn default() -> Self {
         Self {
-            max_messages_per_turn: 5,
+            max_messages_per_thread: 5,
         }
     }
 }
 
 impl SessionStrategy {
-    /// Apply the current turn-storage policy to one normalized turn message list.
-    pub fn retain_messages(&self, mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-        if self.max_messages_per_turn == 0 {
-            return Vec::new();
-        }
-
-        let drop_count = messages.len().saturating_sub(self.max_messages_per_turn);
-        if drop_count > 0 {
-            messages.drain(0..drop_count);
-        }
-        messages
+    /// Apply the current thread-storage policy to one conversation thread.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::context::{ChatMessage, ChatMessageRole};
+    /// use openjarvis::session::SessionStrategy;
+    /// use openjarvis::thread::ConversationThread;
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = ConversationThread::new("default", now);
+    /// thread.store_turn(
+    ///     Some("msg_1".to_string()),
+    ///     vec![
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_0", now),
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_1", now),
+    ///     ],
+    ///     now,
+    ///     now,
+    /// );
+    ///
+    /// SessionStrategy {
+    ///     max_messages_per_thread: 1,
+    /// }
+    /// .retain_thread_messages(&mut thread);
+    ///
+    /// assert_eq!(thread.load_messages().len(), 1);
+    /// ```
+    pub fn retain_thread_messages(&self, thread: &mut ConversationThread) {
+        thread.retain_latest_messages(self.max_messages_per_thread);
     }
 }
 
@@ -210,7 +229,7 @@ impl SessionManager {
     /// use openjarvis::session::SessionManager;
     ///
     /// let manager = SessionManager::new();
-    /// assert_eq!(manager.strategy().max_messages_per_turn, 5);
+    /// assert_eq!(manager.strategy().max_messages_per_thread, 5);
     /// ```
     pub fn new() -> Self {
         Self::with_strategy(SessionStrategy::default())
@@ -341,7 +360,6 @@ impl SessionManager {
         completed_at: DateTime<Utc>,
     ) -> Uuid {
         let session_key = locator.session_key();
-        let retained_messages = self.strategy.retain_messages(messages);
         let mut sessions = self.sessions.write().await;
         let session = sessions
             .entry(session_key)
@@ -351,12 +369,8 @@ impl SessionManager {
             locator.thread_id,
             completed_at,
         );
-        let turn_id = thread.store_turn(
-            external_message_id,
-            retained_messages,
-            started_at,
-            completed_at,
-        );
+        let turn_id = thread.store_turn(external_message_id, messages, started_at, completed_at);
+        self.strategy.retain_thread_messages(thread);
         session.updated_at = completed_at;
         turn_id
     }

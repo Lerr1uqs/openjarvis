@@ -209,11 +209,12 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
 
     assert_eq!(thread.turns.len(), 2);
     assert_eq!(thread.external_thread_id, "thread_shared");
-    assert_eq!(history.len(), 6);
-    assert_eq!(thread.turns[0].messages.len(), 2);
+    assert_eq!(history.len(), 5);
+    assert_eq!(history[0].content, "reply-first");
+    assert_eq!(history[4].content, "reply-second");
+    assert_eq!(thread.turns[0].messages.len(), 1);
     assert_eq!(thread.turns[1].messages.len(), 4);
-    assert_eq!(thread.turns[0].messages[0].content, "first question");
-    assert_eq!(thread.turns[0].messages[1].content, "reply-first");
+    assert_eq!(thread.turns[0].messages[0].content, "reply-first");
     assert_eq!(thread.turns[1].messages[0].content, "second question");
     assert_eq!(thread.turns[1].messages[1].tool_calls[0].id, "call_mock_1");
     assert_eq!(
@@ -236,7 +237,7 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     let observed_requests = Arc::new(Mutex::new(Vec::new()));
     let agent_handle = build_truncation_mock_agent_handle(Arc::clone(&observed_requests));
     let sessions = SessionManager::with_strategy(SessionStrategy {
-        max_messages_per_turn: 5,
+        max_messages_per_thread: 5,
     });
     let mut router = ChannelRouter::with_session_manager_and_agent_handle(agent_handle, sessions);
 
@@ -329,7 +330,8 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
 
     assert_eq!(thread.turns.len(), 2);
     assert_eq!(thread.external_thread_id, "thread_truncation");
-    assert_eq!(thread.turns[0].messages.len(), 5);
+    assert_eq!(thread.turns[0].messages.len(), 3);
+    assert_eq!(thread.turns[1].messages.len(), 2);
     assert_eq!(
         thread.turns[0]
             .messages
@@ -337,18 +339,27 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
         vec![
-            "message_2".to_string(),
-            "message_3".to_string(),
             "message_4".to_string(),
             "message_5".to_string(),
             "message_6".to_string(),
         ]
     );
-    assert_eq!(history.len(), 7);
-    assert_eq!(history[0].content, "message_2");
-    assert_eq!(history[4].content, "message_6");
-    assert_eq!(history[5].content, "check history after truncation");
-    assert_eq!(history[6].content, "final-after-truncation");
+    assert_eq!(
+        thread.turns[1]
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "check history after truncation".to_string(),
+            "final-after-truncation".to_string(),
+        ]
+    );
+    assert_eq!(history.len(), 5);
+    assert_eq!(history[0].content, "message_4");
+    assert_eq!(history[2].content, "message_6");
+    assert_eq!(history[3].content, "check history after truncation");
+    assert_eq!(history[4].content, "final-after-truncation");
 
     assert_eq!(recorded.len(), 7);
     assert_eq!(recorded[0].content, "message_1");

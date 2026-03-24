@@ -78,3 +78,77 @@ fn load_or_create_turn_reuses_existing_turn_for_same_external_message_id() {
     assert_eq!(reused_turn_id, first_turn_id);
     assert_eq!(thread.turns.len(), 1);
 }
+
+#[test]
+fn retain_latest_messages_trims_across_turns_and_removes_empty_turns() {
+    let now = Utc::now();
+    let mut thread = ConversationThread::new("default", now);
+
+    thread.store_turn(
+        Some("msg_1".to_string()),
+        vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "message_0", now),
+            ChatMessage::new(ChatMessageRole::Assistant, "message_1", now),
+        ],
+        now,
+        now,
+    );
+    thread.store_turn(
+        Some("msg_2".to_string()),
+        vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "message_2", now),
+            ChatMessage::new(ChatMessageRole::Assistant, "message_3", now),
+        ],
+        now,
+        now,
+    );
+    thread.store_turn(
+        Some("msg_3".to_string()),
+        vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "message_4", now),
+            ChatMessage::new(ChatMessageRole::Assistant, "message_5", now),
+        ],
+        now,
+        now,
+    );
+
+    thread.retain_latest_messages(3);
+
+    assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.turns[0].messages.len(), 1);
+    assert_eq!(thread.turns[0].messages[0].content, "message_3");
+    assert_eq!(
+        thread
+            .load_messages()
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>(),
+        vec![
+            "message_3".to_string(),
+            "message_4".to_string(),
+            "message_5".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn retain_latest_messages_with_zero_clears_all_turns() {
+    let now = Utc::now();
+    let mut thread = ConversationThread::new("default", now);
+
+    thread.store_turn(
+        Some("msg_1".to_string()),
+        vec![ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "message_0",
+            now,
+        )],
+        now,
+        now,
+    );
+
+    thread.retain_latest_messages(0);
+
+    assert!(thread.turns.is_empty());
+    assert!(thread.load_messages().is_empty());
+}

@@ -2,4 +2,7 @@
 - [ ] agent的Outgoing返回
 - [ ] 飞书发送的限流阀（延时
 - [ ] hook改为agenthook 因为可能有其他种hook后面要添加
-- [ ] session manager是全局的 
+- [x] session manager是全局的 
+- [ ] 外部user传入消息 通过名字对content序列化一下
+- [ ] session/turn/thread移动到一个模块中
+- [ ] 目前turn是全量的 后续需要改成增量吗？

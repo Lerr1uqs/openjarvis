@@ -19,7 +19,8 @@ pub trait Channel: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Run pre-start checks or initialization before the channel enters its main loop.
-    async fn on_start(&self) -> Result<()> { // TODO: 也许不需要？
+    async fn on_start(&self) -> Result<()> {
+        // TODO: 也许不需要？
         Ok(())
     }
 

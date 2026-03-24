@@ -12,18 +12,19 @@
 
 ## 不符合项
 
-### 1. Thread 定位策略与架构定义不一致
+### 1. Thread 定位策略与架构定义不一致[已完成]
 
 - 架构要求： ` SessionManager ` 通过 ` uuid:channel:external_thread_id ` 定位 thread，首次遇到时创建内部唯一 uuid。证据： ` arch/system.md:48 `, ` arch/system.md:49 `
 - 当前实现： ` SessionKey ` 只包含 ` channel + user_id `， ` ThreadLocator ` 只包含 ` channel + user_id + thread_id `；当外部线程为空时会退化成固定值 ` default `，没有建立 ` external_thread_id -> internal_uuid ` 的映射。证据： ` src/session.rs:17 `, ` src/session.rs:33 `, ` src/session.rs:74 `, ` src/model.rs:24 `, ` src/model.rs:65 `, ` src/model.rs:69 `
 - 影响：当前 thread 身份模型和设计稿不一致，后续如果接 PostgreSQL 或做 thread 迁移，键设计需要重做。
 - Uuid::parse_str(external_thread_id)
 
-### 2. SessionStrategy 的保留语义与文档不一致
+### 2. SessionStrategy 的保留语义与文档不一致[已完成]
 
 - 架构要求：当前策略是“只保留最新 5 个 message”。证据： ` arch/system.md:52 `, ` arch/system.md:58 `
 - 当前实现：策略字段是 ` max_messages_per_turn `，只会在单次 ` store_turn ` 时裁剪该 turn 内的消息；整个 thread 的历史 turn 仍会持续累积。证据： ` src/session.rs:105 `, ` src/session.rs:118 `, ` src/session.rs:123 `, ` src/session.rs:219 `, ` src/thread.rs:62 `
 - 影响：长线程不会按“最近 5 条消息”收敛，真实上下文增长行为与架构文档描述不同。
+- 修复结果： ` SessionStrategy ` 已改为 thread 级 ` max_messages_per_thread `，在 ` store_turn ` 后统一裁剪整个 thread，并清理被裁空的旧 turn。
 
 ### 3. AgentWorker 未包装沙箱容器
 

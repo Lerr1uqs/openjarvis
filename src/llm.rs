@@ -56,9 +56,9 @@ pub fn build_provider(config: &LLMConfig) -> Result<Arc<dyn LLMProvider>> {
             let resolved_config = resolve_provider_config(config)?;
             Ok(Arc::new(OpenaiProvider::new(resolved_config)?))
         }
-        LLMProviderProtocol::Anthropic => Ok(Arc::new(AnthropicProvider::new(resolve_provider_config(
-            config,
-        )?))),
+        LLMProviderProtocol::Anthropic => Ok(Arc::new(AnthropicProvider::new(
+            resolve_provider_config(config)?,
+        ))),
     }
 }
 

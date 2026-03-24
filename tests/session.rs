@@ -90,9 +90,9 @@ async fn load_turn_keeps_tool_call_id_history() {
 }
 
 #[tokio::test]
-async fn strategy_keeps_only_latest_five_messages_per_turn() {
+async fn strategy_keeps_only_latest_five_messages_per_thread() {
     let manager = SessionManager::with_strategy(SessionStrategy {
-        max_messages_per_turn: 5,
+        max_messages_per_thread: 5,
     });
     let incoming = build_incoming("msg_1", "trim this");
     let locator = manager.load_or_create_thread(&incoming).await;
@@ -114,7 +114,25 @@ async fn strategy_keeps_only_latest_five_messages_per_turn() {
             Utc::now(),
         )
         .await;
+    manager
+        .store_turn(
+            &locator,
+            Some("msg_2".to_string()),
+            (7..10)
+                .map(|index| {
+                    ChatMessage::new(
+                        ChatMessageRole::Assistant,
+                        format!("message_{index}"),
+                        Utc::now(),
+                    )
+                })
+                .collect(),
+            incoming.received_at,
+            Utc::now(),
+        )
+        .await;
 
+    let history = manager.load_turn(&locator).await;
     let session = manager
         .get_session(&SessionKey::from_incoming(&incoming))
         .await
@@ -124,9 +142,25 @@ async fn strategy_keeps_only_latest_five_messages_per_turn() {
         .get(&locator.thread_id)
         .expect("default thread should exist");
 
-    assert_eq!(thread.turns[0].messages.len(), 5);
-    assert_eq!(thread.turns[0].messages[0].content, "message_2");
-    assert_eq!(thread.turns[0].messages[4].content, "message_6");
+    assert_eq!(history.len(), 5);
+    assert_eq!(
+        history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "message_5".to_string(),
+            "message_6".to_string(),
+            "message_7".to_string(),
+            "message_8".to_string(),
+            "message_9".to_string(),
+        ]
+    );
+    assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.turns[0].messages.len(), 2);
+    assert_eq!(thread.turns[1].messages.len(), 3);
+    assert_eq!(thread.turns[0].messages[0].content, "message_5");
+    assert_eq!(thread.turns[1].messages[2].content, "message_9");
 }
 
 #[tokio::test]

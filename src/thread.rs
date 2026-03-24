@@ -198,6 +198,73 @@ impl ConversationThread {
         turn_id
     }
 
+    /// Retain only the latest `max_messages` across the whole thread.
+    ///
+    /// Empty turns left behind by trimming are removed so the stored thread shape converges with
+    /// the retained history window.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::context::{ChatMessage, ChatMessageRole};
+    /// use openjarvis::thread::ConversationThread;
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = ConversationThread::new("default", now);
+    /// thread.store_turn(
+    ///     Some("msg_1".to_string()),
+    ///     vec![
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_0", now),
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_1", now),
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_2", now),
+    ///     ],
+    ///     now,
+    ///     now,
+    /// );
+    ///
+    /// thread.retain_latest_messages(2);
+    ///
+    /// assert_eq!(
+    ///     thread
+    ///         .load_messages()
+    ///         .into_iter()
+    ///         .map(|message| message.content)
+    ///         .collect::<Vec<_>>(),
+    ///     vec!["message_1".to_string(), "message_2".to_string()]
+    /// );
+    /// ```
+    pub fn retain_latest_messages(&mut self, max_messages: usize) {
+        if max_messages == 0 {
+            self.turns.clear();
+            return;
+        }
+
+        let mut remaining_drop = self
+            .turns
+            .iter()
+            .map(|turn| turn.messages.len())
+            .sum::<usize>()
+            .saturating_sub(max_messages);
+
+        if remaining_drop == 0 {
+            return;
+        }
+
+        for turn in &mut self.turns {
+            if remaining_drop == 0 {
+                break;
+            }
+
+            let turn_drop = remaining_drop.min(turn.messages.len());
+            if turn_drop > 0 {
+                turn.messages.drain(0..turn_drop);
+                remaining_drop -= turn_drop;
+            }
+        }
+
+        self.turns.retain(|turn| !turn.messages.is_empty());
+    }
+
     /// Load the flattened message history for the whole thread.
     pub fn load_messages(&self) -> Vec<ChatMessage> {
         self.turns
