@@ -26,18 +26,20 @@
 - 影响：长线程不会按“最近 5 条消息”收敛，真实上下文增长行为与架构文档描述不同。
 - 修复结果： ` SessionStrategy ` 已改为 thread 级 ` max_messages_per_thread `，在 ` store_turn ` 后统一裁剪整个 thread，并清理被裁空的旧 turn。
 
-### 3. AgentWorker 未包装沙箱容器
+### 3. AgentWorker 未包装沙箱容器[已完成]
 
 - 架构要求： ` AgentWorker ` = 沙箱容器 + ` AgenticLoop `。证据： ` arch/system.md:62 `, ` arch/system.md:63 `
 - 当前实现： ` AgentWorker ` 只持有 ` AgentLoop ` 和 ` system_prompt `；内置 ` bash ` 工具直接执行本机 ` powershell/sh `；README 也明确写了 ` memory / sandbox ` 仍为空壳。证据： ` src/agent/worker.rs:53 `, ` src/agent/worker.rs:54 `, ` src/agent/worker.rs:55 `, ` src/agent/worker.rs:79 `, ` src/agent/tool/shell.rs:46 `, ` src/agent/tool/shell.rs:53 `, ` src/agent/tool/shell.rs:96 `, ` README.md:25 `
 - 影响：工具执行边界和安全模型尚未达到架构稿对 Worker 的预期。
 - 用户结论: 现阶段不需要沙箱 只需要一个占位沙箱即可
 
-### 4. Hook 体系存在，但没有从配置文件加载
+### 4. Hook 体系存在，但没有从配置文件加载[已完成]
 
 - 架构要求：Hook 由配置文件加载。证据： ` arch/system.md:68 `, ` arch/system.md:69 `
 - 当前实现：配置模型只有 ` server/channels/llm `，没有 ` agent.hook ` 相关字段； ` AgentWorker::from_config ` 只接收 ` LLMConfig ` 并注入默认 prompt； ` AgentRuntime::new ` 只创建空的 ` HookRegistry `。证据： ` src/config.rs:14 `, ` src/config.rs:15 `, ` src/config.rs:17 `, ` src/config.rs:18 `, ` src/agent/worker.rs:85 `, ` src/agent/worker.rs:88 `, ` src/agent/runtime.rs:17 `, ` src/agent/hook.rs:47 `
 - 影响：Hook 目前只能在代码中手工注册，不能按 YAML 配置驱动。
+- 补充: 增加各种不完整malform的config文件 看看程序能不能正确拒绝
+- 修复结果：新增 ` agent.hook ` 配置模型与校验，支持按事件从 YAML 注册脚本型 hook； ` AgentWorker::from_config ` 改为直接消费 ` AppConfig ` 并构建带 hook 的 ` AgentRuntime `；新增 malformed hook config 拒绝测试和基于配置的 hook 执行测试。
 
 ### 5. Command 组件未落地
 

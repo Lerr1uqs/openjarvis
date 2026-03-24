@@ -129,6 +129,115 @@ async fn agent_loop_runs_single_tool_round_and_returns_final_answer() {
 }
 
 #[tokio::test]
+async fn agent_loop_can_be_driven_by_mock_provider_to_verify_tool_hooks() {
+    let hooks = Arc::new(HookRegistry::new());
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Mutex::new(Vec::new()));
+    hooks
+        .register(Arc::new(RecordingHook {
+            kinds: Arc::clone(&kinds),
+            payloads: Arc::clone(&payloads),
+        }))
+        .await;
+
+    let runtime = AgentRuntime::with_parts(
+        Arc::clone(&hooks),
+        Arc::new(openjarvis::agent::ToolRegistry::new()),
+        Arc::new(openjarvis::agent::McpRegistry::new()),
+    );
+    let loop_runner = AgentLoop::new(
+        Arc::new(SequenceProvider {
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response("read", serde_json::json!({ "path": "Cargo.toml" })),
+                text_response("读取完成"),
+            ])),
+        }),
+        runtime,
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "请读取 Cargo.toml"))
+        .await
+        .expect("loop should succeed");
+
+    let emitted_kinds = kinds.lock().await.clone();
+    let emitted_payloads = payloads.lock().await.clone();
+
+    assert_eq!(output.reply, "读取完成");
+    assert_eq!(
+        emitted_kinds,
+        vec![
+            HookEventKind::UserPromptSubmit,
+            HookEventKind::PreToolUse,
+            HookEventKind::PostToolUse,
+            HookEventKind::Notification,
+        ]
+    );
+    assert_eq!(emitted_payloads[1]["tool"], "read");
+    assert_eq!(emitted_payloads[1]["tool_call_id"], "call_test_1");
+    assert_eq!(emitted_payloads[2]["tool"], "read");
+    assert_eq!(emitted_payloads[2]["result"]["path"], "Cargo.toml");
+    assert!(emitted_payloads[2]["result"]["returned_line_count"].is_number());
+}
+
+#[tokio::test]
+async fn agent_loop_emits_post_tool_use_failure_when_mock_provider_requests_unknown_tool() {
+    let hooks = Arc::new(HookRegistry::new());
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Mutex::new(Vec::new()));
+    hooks
+        .register(Arc::new(RecordingHook {
+            kinds: Arc::clone(&kinds),
+            payloads: Arc::clone(&payloads),
+        }))
+        .await;
+
+    let runtime = AgentRuntime::with_parts(
+        Arc::clone(&hooks),
+        Arc::new(openjarvis::agent::ToolRegistry::new()),
+        Arc::new(openjarvis::agent::McpRegistry::new()),
+    );
+    let loop_runner = AgentLoop::new(
+        Arc::new(SequenceProvider {
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response("missing_tool", serde_json::json!({})),
+                text_response("失败已处理"),
+            ])),
+        }),
+        runtime,
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "执行一个不存在的工具"))
+        .await
+        .expect("loop should succeed even when one tool call fails");
+
+    let emitted_kinds = kinds.lock().await.clone();
+    let emitted_payloads = payloads.lock().await.clone();
+
+    assert_eq!(output.reply, "失败已处理");
+    assert_eq!(
+        emitted_kinds,
+        vec![
+            HookEventKind::UserPromptSubmit,
+            HookEventKind::PreToolUse,
+            HookEventKind::PostToolUseFailure,
+            HookEventKind::Notification,
+        ]
+    );
+    assert_eq!(emitted_payloads[1]["tool"], "missing_tool");
+    assert_eq!(emitted_payloads[2]["tool"], "missing_tool");
+    assert!(
+        emitted_payloads[2]["error"]
+            .as_str()
+            .expect("failure payload should contain error text")
+            .contains("missing_tool")
+    );
+}
+
+#[tokio::test]
 async fn agent_loop_accepts_protocol_prefix_with_colon() {
     let runtime = AgentRuntime::new();
     let loop_runner = AgentLoop::new(

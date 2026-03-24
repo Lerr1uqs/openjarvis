@@ -14,6 +14,13 @@ feishu:
   node_bin: "node"
   sidecar_script: "scripts/feishu_ws_client.mjs"
 
+agent:
+  hook: {}
+  # 示例:
+  # hook:
+  #   user_prompt_submit: ["echo", "user prompt submitted"]
+  #   pre_tool_use: ["echo", "tool about to run"]
+
 llm:
   provider: "mock"
   model: "mock-received"

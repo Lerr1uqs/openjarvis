@@ -1,6 +1,8 @@
 //! Shared runtime container that holds hooks, tools, and MCP registries for one agent.
 
 use super::{hook::HookRegistry, mcp::McpRegistry, tool::ToolRegistry};
+use crate::config::AgentConfig;
+use anyhow::Result;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -18,6 +20,27 @@ impl AgentRuntime {
             tools: Arc::new(ToolRegistry::new()),
             mcp: Arc::new(McpRegistry::new()),
         }
+    }
+
+    /// Create a runtime from the loaded `agent` config section.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::{agent::AgentRuntime, config::AppConfig};
+    ///
+    /// let config = AppConfig::default();
+    /// let runtime = AgentRuntime::from_config(config.agent_config()).await?;
+    /// assert_eq!(runtime.hooks().len().await, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_config(config: &AgentConfig) -> Result<Self> {
+        Ok(Self {
+            hooks: Arc::new(HookRegistry::from_config(config.hook_config()).await?),
+            tools: Arc::new(ToolRegistry::new()),
+            mcp: Arc::new(McpRegistry::new()),
+        })
     }
 
     pub fn with_parts(

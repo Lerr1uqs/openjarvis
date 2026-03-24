@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
         warn!("feishu.dry_run=true, outgoing messages will be logged instead of delivered");
     }
 
-    let agent = AgentWorker::from_config(config.llm_config())?;
+    let agent = AgentWorker::from_config(&config).await?;
     let mut router = ChannelRouter::new(agent);
 
     router.register_channels(config.channel_config()).await?;

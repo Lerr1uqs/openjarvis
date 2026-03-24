@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{AgentRequest, AgentWorker, AgentWorkerEvent},
+    config::AppConfig,
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
@@ -58,6 +59,17 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
         }
         other => panic!("unexpected second event: {other:?}"),
     }
+}
+
+#[test]
+fn worker_holds_dummy_sandbox_container() {
+    let worker = AgentWorker::new(
+        Arc::new(MockLLMProvider::new("mock-reply")),
+        "system prompt",
+    );
+
+    assert_eq!(worker.sandbox().kind(), "dummy");
+    assert!(worker.sandbox().is_placeholder());
 }
 
 struct RecordingProvider {
@@ -120,6 +132,26 @@ async fn worker_builds_context_from_history_and_current_user_message() {
         messages.last().map(|message| message.content.as_str()),
         Some("what happened")
     );
+}
+
+#[tokio::test]
+async fn worker_from_config_loads_configured_hooks() {
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  hook:
+    notification: ["echo", "hook loaded"]
+llm:
+  provider: "mock"
+"#,
+    )
+    .expect("config should parse");
+    let worker = AgentWorker::from_config(&config)
+        .await
+        .expect("worker should build from config");
+
+    assert_eq!(worker.runtime().hooks().len().await, 1);
+    assert!(worker.sandbox().is_placeholder());
 }
 
 async fn collect_events(

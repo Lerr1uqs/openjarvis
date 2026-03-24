@@ -3,8 +3,9 @@
 use super::{
     agent_loop::{AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopOutput, InfoContext},
     runtime::AgentRuntime,
+    sandbox::DummySandboxContainer,
 };
-use crate::config::{DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
+use crate::config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT};
 use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::llm::{LLMProvider, build_provider};
 use crate::model::IncomingMessage;
@@ -52,6 +53,7 @@ pub struct AgentWorkerHandle {
 
 pub struct AgentWorker {
     agent_loop: AgentLoop,
+    sandbox: DummySandboxContainer,
     system_prompt: String,
 }
 
@@ -77,21 +79,48 @@ impl AgentWorker {
     ) -> Self {
         Self {
             agent_loop: AgentLoop::new(llm, runtime),
+            sandbox: DummySandboxContainer::new(),
             system_prompt: system_prompt.into(),
         }
     }
 
-    /// Build a worker directly from the loaded LLM configuration.
-    pub fn from_config(config: &LLMConfig) -> Result<Self> {
-        Ok(Self::new(
-            build_provider(config)?,
+    /// Build a worker directly from the loaded app configuration.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::{agent::AgentWorker, config::AppConfig};
+    ///
+    /// let worker = AgentWorker::from_config(&AppConfig::default()).await?;
+    /// assert!(worker.sandbox().is_placeholder());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_config(config: &AppConfig) -> Result<Self> {
+        Ok(Self::with_runtime(
+            build_provider(config.llm_config())?,
             DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+            AgentRuntime::from_config(config.agent_config()).await?,
         ))
     }
 
     /// Return the runtime bound to this worker.
     pub fn runtime(&self) -> &AgentRuntime {
         self.agent_loop.runtime()
+    }
+
+    /// Return the sandbox container currently owned by this worker.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
+    /// use std::sync::Arc;
+    ///
+    /// let worker = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// assert!(worker.sandbox().is_placeholder());
+    /// ```
+    pub fn sandbox(&self) -> &DummySandboxContainer {
+        &self.sandbox
     }
 
     /// Spawn the long-lived agent worker loop and return its router-facing channels.

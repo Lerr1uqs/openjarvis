@@ -15,6 +15,7 @@ pub struct AppConfig {
     server: ServerConfig,
     #[serde(flatten)]
     channels: ChannelConfig,
+    agent: AgentConfig,
     llm: LLMConfig,
 }
 
@@ -23,6 +24,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig::default(),
             channels: ChannelConfig::default(),
+            agent: AgentConfig::default(),
             llm: LLMConfig::default(),
         }
     }
@@ -46,6 +48,9 @@ impl AppConfig {
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let config = serde_yaml::from_str::<Self>(&raw)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("failed to validate config file {}", path.display()))?;
         Ok(config)
     }
 
@@ -54,9 +59,26 @@ impl AppConfig {
         &self.channels
     }
 
+    /// Return the read-only agent runtime configuration view.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.agent_config().hook_config().is_empty());
+    /// ```
+    pub fn agent_config(&self) -> &AgentConfig {
+        &self.agent
+    }
+
     /// Return the read-only LLM configuration view.
     pub fn llm_config(&self) -> &LLMConfig {
         &self.llm
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.agent.validate()
     }
 }
 
@@ -136,6 +158,198 @@ impl FeishuConfig {
             self.mode.as_str(),
             "long_connection" | "long-connection" | "long_connection_sdk" | "ws" | "websocket"
         )
+    }
+}
+
+/// Agent-level runtime configuration loaded from YAML.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert!(config.agent_config().hook_config().is_empty());
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    hook: AgentHookConfig,
+}
+
+impl AgentConfig {
+    /// Return the configured hook section.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.agent_config().hook_config().is_empty());
+    /// ```
+    pub fn hook_config(&self) -> &AgentHookConfig {
+        &self.hook
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.hook.validate()
+    }
+}
+
+/// Hook script configuration keyed by hook event name.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert!(config.agent_config().hook_config().is_empty());
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentHookConfig {
+    pre_tool_use: Option<HookCommandConfig>,
+    post_tool_use: Option<HookCommandConfig>,
+    post_tool_use_failure: Option<HookCommandConfig>,
+    user_prompt_submit: Option<HookCommandConfig>,
+    stop: Option<HookCommandConfig>,
+    subagent_start: Option<HookCommandConfig>,
+    subagent_stop: Option<HookCommandConfig>,
+    pre_compact: Option<HookCommandConfig>,
+    permission_request: Option<HookCommandConfig>,
+    notification: Option<HookCommandConfig>,
+    session_start: Option<HookCommandConfig>,
+    session_end: Option<HookCommandConfig>,
+    setup: Option<HookCommandConfig>,
+    teammate_idle: Option<HookCommandConfig>,
+    task_completed: Option<HookCommandConfig>,
+    config_change: Option<HookCommandConfig>,
+    worktree_create: Option<HookCommandConfig>,
+    worktree_remove: Option<HookCommandConfig>,
+}
+
+impl AgentHookConfig {
+    /// Return whether no hook script has been configured.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.agent_config().hook_config().is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.configured_commands().is_empty()
+    }
+
+    pub(crate) fn configured_commands(&self) -> Vec<(&'static str, &HookCommandConfig)> {
+        let mut commands = Vec::new();
+        push_command(&mut commands, "pre_tool_use", self.pre_tool_use.as_ref());
+        push_command(&mut commands, "post_tool_use", self.post_tool_use.as_ref());
+        push_command(
+            &mut commands,
+            "post_tool_use_failure",
+            self.post_tool_use_failure.as_ref(),
+        );
+        push_command(
+            &mut commands,
+            "user_prompt_submit",
+            self.user_prompt_submit.as_ref(),
+        );
+        push_command(&mut commands, "stop", self.stop.as_ref());
+        push_command(
+            &mut commands,
+            "subagent_start",
+            self.subagent_start.as_ref(),
+        );
+        push_command(&mut commands, "subagent_stop", self.subagent_stop.as_ref());
+        push_command(&mut commands, "pre_compact", self.pre_compact.as_ref());
+        push_command(
+            &mut commands,
+            "permission_request",
+            self.permission_request.as_ref(),
+        );
+        push_command(&mut commands, "notification", self.notification.as_ref());
+        push_command(&mut commands, "session_start", self.session_start.as_ref());
+        push_command(&mut commands, "session_end", self.session_end.as_ref());
+        push_command(&mut commands, "setup", self.setup.as_ref());
+        push_command(&mut commands, "teammate_idle", self.teammate_idle.as_ref());
+        push_command(
+            &mut commands,
+            "task_completed",
+            self.task_completed.as_ref(),
+        );
+        push_command(&mut commands, "config_change", self.config_change.as_ref());
+        push_command(
+            &mut commands,
+            "worktree_create",
+            self.worktree_create.as_ref(),
+        );
+        push_command(
+            &mut commands,
+            "worktree_remove",
+            self.worktree_remove.as_ref(),
+        );
+        commands
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (event_name, command) in self.configured_commands() {
+            command.validate(event_name)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// One hook command represented as `[program, arg1, arg2, ...]`.
+///
+/// # 示例
+/// ```rust
+/// let command: openjarvis::config::HookCommandConfig =
+///     serde_yaml::from_str("[\"echo\", \"hello\"]").expect("command should parse");
+///
+/// assert_eq!(command.parts(), ["echo", "hello"]);
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct HookCommandConfig(Vec<String>);
+
+impl HookCommandConfig {
+    /// Return the configured command parts in order.
+    ///
+    /// # 示例
+    /// ```rust
+    /// let command: openjarvis::config::HookCommandConfig =
+    ///     serde_yaml::from_str("[\"echo\", \"hello\"]").expect("command should parse");
+    ///
+    /// assert_eq!(command.parts(), ["echo", "hello"]);
+    /// ```
+    pub fn parts(&self) -> &[String] {
+        &self.0
+    }
+
+    fn validate(&self, event_name: &str) -> Result<()> {
+        if self.0.is_empty() {
+            anyhow::bail!("{event_name} hook command must not be empty");
+        }
+
+        for (index, part) in self.0.iter().enumerate() {
+            if part.trim().is_empty() {
+                anyhow::bail!("{event_name} hook command part at index {index} must not be blank");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn push_command<'a>(
+    commands: &mut Vec<(&'static str, &'a HookCommandConfig)>,
+    event_name: &'static str,
+    command: Option<&'a HookCommandConfig>,
+) {
+    if let Some(command) = command {
+        commands.push((event_name, command));
     }
 }
 

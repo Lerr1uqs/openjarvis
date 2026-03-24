@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod hook;
 pub mod mcp;
 pub mod runtime;
+pub mod sandbox;
 pub mod tool;
 pub mod worker;
 
@@ -14,6 +15,7 @@ pub use agent_loop::{
 pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
 pub use mcp::{McpRegistry, McpServerDefinition, McpTransport};
 pub use runtime::AgentRuntime;
+pub use sandbox::DummySandboxContainer;
 pub use tool::{
     EditTool, ReadTool, ShellTool, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
     ToolInputSchema, ToolRegistry, ToolSchemaProtocol, WriteTool,
