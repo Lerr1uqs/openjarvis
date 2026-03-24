@@ -23,16 +23,7 @@ async fn main() -> Result<()> {
         "openjarvis server started"
     );
 
-    let router_loop = router.run();
-    tokio::pin!(router_loop);
-
-    tokio::select! {
-        result = &mut router_loop => {
-            result?;
-        }
-        _ = shutdown_signal() => {}
-    }
-    Ok(())
+    router.run_until_shutdown(shutdown_signal()).await
 }
 
 fn init_tracing() {

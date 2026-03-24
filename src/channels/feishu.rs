@@ -156,6 +156,11 @@ impl FeishuChannel {
                             continue;
                         }
 
+                        info!(
+                            raw_payload = %line,
+                            "received raw feishu long-connection payload"
+                        );
+
                         match serde_json::from_str::<FeishuLongConnectionPayload>(&line) {
                             Ok(payload) => {
                                 if payload.sender_type != "user" {

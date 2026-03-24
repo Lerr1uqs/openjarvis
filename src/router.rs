@@ -6,12 +6,14 @@ use crate::agent::{
 };
 use crate::channels::feishu::FeishuChannel;
 use crate::channels::{Channel, ChannelRegistration};
+use crate::command::{CommandRegistry, CommandReply};
 use crate::config::ChannelConfig;
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::{Future, pending};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, StreamMap, wrappers::ReceiverStream};
@@ -24,6 +26,8 @@ pub struct ChannelRouter {
     channel_incoming_streams: StreamMap<String, ReceiverStream<IncomingMessage>>,
     channels: HashMap<String, mpsc::Sender<OutgoingMessage>>,
     sessions: SessionManager,
+    commands: CommandRegistry,
+    message_dedup_enabled: bool,
     seen_messages: Mutex<HashSet<String>>,
     pending_threads: Mutex<HashSet<ThreadLocator>>,
     queued_messages: Mutex<HashMap<ThreadLocator, VecDeque<IncomingMessage>>>,
@@ -78,6 +82,8 @@ impl ChannelRouter {
             channel_incoming_streams: StreamMap::new(),
             channels: HashMap::new(),
             sessions,
+            commands: CommandRegistry::default(),
+            message_dedup_enabled: false,
             seen_messages: Mutex::new(HashSet::new()),
             pending_threads: Mutex::new(HashSet::new()),
             queued_messages: Mutex::new(HashMap::new()),
@@ -87,6 +93,44 @@ impl ChannelRouter {
     /// Return the session manager owned by the router.
     pub fn sessions(&self) -> &SessionManager {
         &self.sessions
+    }
+
+    /// Replace the router's command registry.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use openjarvis::{
+    ///     agent::AgentWorker,
+    ///     command::CommandRegistry,
+    ///     llm::MockLLMProvider,
+    ///     router::ChannelRouter,
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let _router = ChannelRouter::new(agent).with_command_registry(CommandRegistry::default());
+    /// ```
+    pub fn with_command_registry(mut self, commands: CommandRegistry) -> Self {
+        self.commands = commands;
+        self
+    }
+
+    /// Enable or disable external-message deduplication.
+    ///
+    /// Deduplication is currently disabled by default so command framework work can proceed
+    /// without the old router-level filtering semantics.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
+    /// use std::sync::Arc;
+    ///
+    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let _router = ChannelRouter::new(agent).with_message_dedup_enabled(true);
+    /// ```
+    pub fn with_message_dedup_enabled(mut self, enabled: bool) -> Self {
+        self.message_dedup_enabled = enabled;
+        self
     }
 
     /// Build and register all configured channels.
@@ -121,34 +165,94 @@ impl ChannelRouter {
         health_channel.check_health().await
     }
 
-    /// Run the main router loop and multiplex channel and agent traffic with `tokio::select!`.
+    /// Run the router as a long-lived service loop.
+    ///
+    /// This variant keeps waiting for new external inputs until the router encounters an error.
+    /// Process-level shutdown should use [`Self::run_until_shutdown`] instead of relying on this
+    /// loop to finish on its own.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
+    /// use std::sync::Arc;
+    ///
+    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let mut router = ChannelRouter::new(agent);
+    /// tokio::spawn(async move {
+    ///     let _ = router.run().await;
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn run(&mut self) -> Result<()> {
+        self.run_until_shutdown(pending::<()>()).await
+    }
+
+    /// Run the router until a caller-provided shutdown signal resolves.
+    ///
+    /// This is intended for process lifecycle control and tests. The router still exits early
+    /// when its downstream agent worker channel disconnects.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
+    /// use std::sync::Arc;
+    /// use tokio::sync::oneshot;
+    ///
+    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let mut router = ChannelRouter::new(agent);
+    /// let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    /// router
+    ///     .run_until_shutdown(async move {
+    ///         let _ = shutdown_rx.await;
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_until_shutdown<F>(&mut self, shutdown: F) -> Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
+
         loop {
             let channel_incoming_streams = &mut self.channel_incoming_streams;
             let agent_event_rx = &mut self.agent_event_rx;
 
             tokio::select! {
-                Some((_channel_name, message)) = channel_incoming_streams.next(), if !channel_incoming_streams.is_empty() => {
-                    if let Err(error) = self.handle_incoming(message).await {
-                        warn!(error = %error, "router failed to process incoming message");
-                    };
+                _ = &mut shutdown => return Ok(()),
+                incoming = channel_incoming_streams.next(), if !channel_incoming_streams.is_empty() => {
+                    if let Some((_channel_name, message)) = incoming {
+                        if let Err(error) = self.handle_incoming(message).await {
+                            warn!(error = %error, "router failed to process incoming message");
+                        };
+                    }
                 }
-                Some(agent_event) = agent_event_rx.recv() => {
-                    if let Err(error) = self.handle_agent_event(agent_event).await {
-                        warn!(error = %error, "router failed to process agent event");
-                    };
+                agent_event = agent_event_rx.recv() => {
+                    // TODO: 用match会不会更好?
+                    if let Some(agent_event) = agent_event {
+                        if let Err(error) = self.handle_agent_event(agent_event).await {
+                            warn!(error = %error, "router failed to process agent event");
+                        };
+                    } else {
+                        // TODO: if the downstream agent worker crashes, router should rebuild or
+                        // restart the worker instead of exiting the service loop.
+                        bail!("agent worker event channel closed")
+                    }
                 }
-                else => break, // TODO: add signal ctrl-c?
+                else => return Ok(()),
             }
         }
-
-        Ok(())
     }
 
     async fn handle_incoming(&self, message: IncomingMessage) -> Result<()> {
-        if !self
-            .mark_message_seen(message.external_message_id.as_deref())
-            .await
+        if self.message_dedup_enabled
+            && !self
+                .mark_message_seen(message.external_message_id.as_deref())
+                .await
         {
             info!(
                 external_message_id = ?message.external_message_id,
@@ -162,6 +266,11 @@ impl ChannelRouter {
             user_id = message.user_id,
             "router accepted incoming message"
         );
+
+        if let Some(reply) = self.commands.try_execute(&message).await? {
+            self.dispatch_command_reply(&message, reply).await?;
+            return Ok(());
+        }
 
         let locator = self.sessions.load_or_create_thread(&message).await;
         if self.try_mark_thread_pending(&locator).await {
@@ -205,6 +314,27 @@ impl ChannelRouter {
             target: event.target,
         };
         self.dispatch_outgoing(outgoing).await
+    }
+
+    async fn dispatch_command_reply(
+        &self,
+        incoming: &IncomingMessage,
+        reply: CommandReply,
+    ) -> Result<()> {
+        self.dispatch_outgoing(OutgoingMessage {
+            id: Uuid::new_v4(),
+            channel: incoming.channel.clone(),
+            content: reply.formatted_content(),
+            thread_id: incoming.thread_id.clone(),
+            metadata: serde_json::json!({
+                "event_kind": "Command",
+                "command_name": reply.name(),
+                "command_status": if reply.is_success() { "SUCCESS" } else { "FAILED" },
+            }),
+            reply_to_message_id: incoming.external_message_id.clone(),
+            target: incoming.reply_target.clone(),
+        })
+        .await
     }
 
     /// Dispatch one outbound message to the matching registered channel.

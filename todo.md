@@ -6,3 +6,5 @@
 - [ ] 外部user传入消息 通过名字对content序列化一下
 - [ ] session/turn/thread移动到一个模块中
 - [ ] 目前turn是全量的 后续需要改成增量吗？
+- [ ] 全面异步落盘的日志库
+- [ ] /? 列出全部Commands

@@ -16,7 +16,7 @@ use openjarvis::{
 use serde_json::json;
 use std::sync::Arc;
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
     time::{Duration, timeout},
 };
@@ -26,6 +26,11 @@ struct RecordingChannel {
     name: &'static str,
     sent: Arc<Mutex<Vec<OutgoingMessage>>>,
     incoming_tx: Arc<Mutex<Option<mpsc::Sender<IncomingMessage>>>>,
+}
+
+struct MockAgentHarness {
+    handle: AgentWorkerHandle,
+    event_keepalive_tx: mpsc::Sender<AgentWorkerEvent>, // test-only: keeps the downstream event channel alive until shutdown.
 }
 
 #[async_trait]
@@ -46,12 +51,17 @@ impl Channel for RecordingChannel {
     }
 }
 
+async fn wait_for_test_shutdown(shutdown_rx: oneshot::Receiver<()>) {
+    let _ = shutdown_rx.await;
+}
+
 #[tokio::test]
 async fn router_ignores_duplicate_messages() {
     let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("reply")), "system");
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
-    let mut router = ChannelRouter::new(agent);
+    let mut router = ChannelRouter::new(agent).with_message_dedup_enabled(true);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
         .register_channel(Box::new(RecordingChannel {
@@ -67,30 +77,40 @@ async fn router_ignores_duplicate_messages() {
         .await
         .clone()
         .expect("channel sender should be captured");
-    let router_task = tokio::spawn(async move { router.run().await });
     let incoming = build_incoming();
 
-    channel_tx
-        .send(incoming.clone())
-        .await
-        .expect("first message should be sent");
-    channel_tx
-        .send(incoming)
-        .await
-        .expect("duplicate message should be sent");
+    let driver = async {
+        channel_tx
+            .send(incoming.clone())
+            .await
+            .expect("first message should be sent");
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("duplicate message should be sent");
 
-    timeout(Duration::from_millis(500), async {
-        loop {
-            if sent.lock().await.len() == 1 {
-                break;
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("outgoing message should be recorded");
+        })
+        .await
+        .expect("outgoing message should be recorded");
 
-    router_task.abort();
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
 
     let recorded = sent.lock().await;
     assert_eq!(recorded.len(), 1);
@@ -110,9 +130,12 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
     let observed_requests = Arc::new(Mutex::new(Vec::new()));
-    let agent_handle = build_mock_agent_handle(Arc::clone(&observed_requests));
+    let agent_harness = build_mock_agent_handle(Arc::clone(&observed_requests));
+    let event_keepalive_tx = agent_harness.event_keepalive_tx; // test-only: prevents the mock downstream channel from looking crashed.
     let sessions = SessionManager::new();
-    let mut router = ChannelRouter::with_session_manager_and_agent_handle(agent_handle, sessions);
+    let mut router =
+        ChannelRouter::with_session_manager_and_agent_handle(agent_harness.handle, sessions);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
         .register_channel(Box::new(RecordingChannel {
@@ -152,19 +175,31 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
             .expect("second message should be sent");
     });
 
-    router.run().await.expect("router loop should exit cleanly");
-    send_task.await.expect("sender task should complete");
-
-    timeout(Duration::from_millis(500), async {
-        loop {
-            if sent.lock().await.len() == 4 {
-                break;
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 4 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("all outgoing messages should be recorded");
+        })
+        .await
+        .expect("all outgoing messages should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_keepalive_tx);
 
     let observed_requests = observed_requests.lock().await.clone();
     let locator = observed_requests[0].locator.clone();
@@ -235,11 +270,14 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
     let observed_requests = Arc::new(Mutex::new(Vec::new()));
-    let agent_handle = build_truncation_mock_agent_handle(Arc::clone(&observed_requests));
+    let agent_harness = build_truncation_mock_agent_handle(Arc::clone(&observed_requests));
+    let event_keepalive_tx = agent_harness.event_keepalive_tx; // test-only: prevents the mock downstream channel from looking crashed.
     let sessions = SessionManager::with_strategy(SessionStrategy {
         max_messages_per_thread: 5,
     });
-    let mut router = ChannelRouter::with_session_manager_and_agent_handle(agent_handle, sessions);
+    let mut router =
+        ChannelRouter::with_session_manager_and_agent_handle(agent_harness.handle, sessions);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
         .register_channel(Box::new(RecordingChannel {
@@ -279,19 +317,31 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
             .expect("second truncation message should be sent");
     });
 
-    router.run().await.expect("router loop should exit cleanly");
-    send_task.await.expect("sender task should complete");
-
-    timeout(Duration::from_millis(500), async {
-        loop {
-            if sent.lock().await.len() == 7 {
-                break;
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 7 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("all truncation outgoing messages should be recorded");
+        })
+        .await
+        .expect("all truncation outgoing messages should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_keepalive_tx);
 
     let observed_requests = observed_requests.lock().await.clone();
     let locator = observed_requests[0].locator.clone();
@@ -367,29 +417,361 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     assert_eq!(recorded[6].content, "final-after-truncation");
 }
 
-fn build_mock_agent_handle(observed_requests: Arc<Mutex<Vec<AgentRequest>>>) -> AgentWorkerHandle {
+#[tokio::test]
+async fn router_short_circuits_registered_command_without_session_or_agent() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, mut request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
+    let sessions = SessionManager::new();
+    let mut router = ChannelRouter::with_session_manager_and_agent_handle(
+        AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        sessions,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_command_echo",
+        "ou_command",
+        Some("thread_command"),
+        "/echo keep everything",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("command message should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("command reply should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_tx);
+
+    let recorded = sent.lock().await.clone();
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_command".to_string(),
+        })
+        .await;
+
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].content,
+        "[Command][echo][SUCCESS]: keep everything"
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "Command");
+    assert_eq!(recorded[0].metadata["command_name"], "echo");
+    assert_eq!(recorded[0].metadata["command_status"], "SUCCESS");
+    assert!(request_rx.try_recv().is_err());
+    assert!(session.is_none());
+}
+
+#[tokio::test]
+async fn router_returns_failed_reply_for_unknown_command_without_session_or_agent() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, mut request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
+    let sessions = SessionManager::new();
+    let mut router = ChannelRouter::with_session_manager_and_agent_handle(
+        AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        sessions,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_command_unknown",
+        "ou_unknown",
+        Some("thread_unknown"),
+        "/missing payload",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("unknown command should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unknown command reply should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_tx);
+
+    let recorded = sent.lock().await.clone();
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_unknown".to_string(),
+        })
+        .await;
+
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].content,
+        "[Command][missing][FAILED]: unknown command"
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "Command");
+    assert_eq!(recorded[0].metadata["command_name"], "missing");
+    assert_eq!(recorded[0].metadata["command_status"], "FAILED");
+    assert!(request_rx.try_recv().is_err());
+    assert!(session.is_none());
+}
+
+#[tokio::test]
+async fn router_command_message_does_not_enter_existing_session() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let observed_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_harness = build_single_turn_mock_agent_handle(Arc::clone(&observed_requests));
+    let event_keepalive_tx = agent_harness.event_keepalive_tx; // test-only: prevents the mock downstream channel from looking crashed.
+    let sessions = SessionManager::new();
+    let mut router =
+        ChannelRouter::with_session_manager_and_agent_handle(agent_harness.handle, sessions);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let first_incoming = build_incoming_with(
+        "msg_normal_before_command",
+        "ou_mix",
+        Some("thread_mix"),
+        "normal question",
+    );
+    let second_incoming = build_incoming_with(
+        "msg_command_after_normal",
+        "ou_mix",
+        Some("thread_mix"),
+        "/echo keep out of session",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(first_incoming)
+            .await
+            .expect("normal message should be sent");
+        channel_tx
+            .send(second_incoming)
+            .await
+            .expect("command message should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mixed outgoing messages should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_keepalive_tx);
+
+    let observed_requests = observed_requests.lock().await.clone();
+    let locator = observed_requests[0].locator.clone();
+    let history = router.sessions().load_turn(&locator).await;
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_mix".to_string(),
+        })
+        .await
+        .expect("session should exist");
+    let thread = session
+        .threads
+        .get(&locator.thread_id)
+        .expect("thread should exist");
+    let recorded = sent.lock().await.clone();
+
+    assert_eq!(observed_requests.len(), 1);
+    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.turns[0].messages.len(), 2);
+    assert_eq!(
+        thread.turns[0]
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec!["normal question".to_string(), "reply-single".to_string()]
+    );
+    assert_eq!(
+        history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec!["normal question".to_string(), "reply-single".to_string()]
+    );
+    assert_eq!(recorded.len(), 2);
+    assert!(
+        recorded
+            .iter()
+            .any(|message| message.content == "reply-single")
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|message| { message.content == "[Command][echo][SUCCESS]: keep out of session" })
+    );
+}
+
+fn build_mock_agent_handle(observed_requests: Arc<Mutex<Vec<AgentRequest>>>) -> MockAgentHarness {
     let (request_tx, request_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(32);
+    let event_keepalive_tx = event_tx.clone(); // test-only: keeps the downstream event channel open until explicit shutdown.
 
     spawn_mock_agent_loop(observed_requests, event_tx, request_rx);
 
-    AgentWorkerHandle {
-        request_tx,
-        event_rx,
+    MockAgentHarness {
+        handle: AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        event_keepalive_tx,
+    }
+}
+
+fn build_single_turn_mock_agent_handle(
+    observed_requests: Arc<Mutex<Vec<AgentRequest>>>,
+) -> MockAgentHarness {
+    let (request_tx, request_rx) = mpsc::channel(32);
+    let (event_tx, event_rx) = mpsc::channel(32);
+    let event_keepalive_tx = event_tx.clone(); // test-only: keeps the downstream event channel open until explicit shutdown.
+
+    spawn_single_turn_mock_agent_loop(observed_requests, event_tx, request_rx);
+
+    MockAgentHarness {
+        handle: AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        event_keepalive_tx,
     }
 }
 
 fn build_truncation_mock_agent_handle(
     observed_requests: Arc<Mutex<Vec<AgentRequest>>>,
-) -> AgentWorkerHandle {
+) -> MockAgentHarness {
     let (request_tx, request_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(32);
+    let event_keepalive_tx = event_tx.clone(); // test-only: keeps the downstream event channel open until explicit shutdown.
 
     spawn_truncation_mock_agent_loop(observed_requests, event_tx, request_rx);
 
-    AgentWorkerHandle {
-        request_tx,
-        event_rx,
+    MockAgentHarness {
+        handle: AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        event_keepalive_tx,
     }
 }
 
@@ -586,6 +968,47 @@ fn spawn_truncation_mock_agent_loop(
                 _ => unreachable!("truncation mock agent only scripts two requests"),
             }
         }
+    })
+}
+
+fn spawn_single_turn_mock_agent_loop(
+    observed_requests: Arc<Mutex<Vec<AgentRequest>>>,
+    event_tx: mpsc::Sender<AgentWorkerEvent>,
+    mut request_rx: mpsc::Receiver<AgentRequest>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let request = request_rx
+            .recv()
+            .await
+            .expect("single-turn mock agent should receive one request");
+        observed_requests.lock().await.push(request.clone());
+
+        event_tx
+            .send(AgentWorkerEvent::Dispatch(build_dispatch_event(
+                &request,
+                AgentLoopEventKind::TextOutput,
+                "reply-single",
+                json!({
+                    "source": "single_turn_mock_agent",
+                    "is_final": true,
+                }),
+                true,
+            )))
+            .await
+            .expect("single-turn dispatch should be sent");
+        event_tx
+            .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                locator: request.locator,
+                incoming: request.incoming,
+                messages: vec![ChatMessage::new(
+                    ChatMessageRole::Assistant,
+                    "reply-single",
+                    Utc::now(),
+                )],
+                completed_at: Utc::now(),
+            }))
+            .await
+            .expect("single-turn completed turn should be sent");
     })
 }
 

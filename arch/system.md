@@ -88,6 +88,8 @@ MessageContext = order{
 
 ## Command
 用户传入的消息会先被Command组件截取 如果发现是注册的Command比如 /approve 开头 就会执行对应的命令而不需要执行相关上下文 Command的使用方式也能转换为docs暴露给agent 从而让agent 通过 openjarvis命令行去执行比如 openjarvis command approve --channel feishu --username sakiko 但是要通过某种方式确认当前cli是哪个agent执行的 agent有当前用户交互的userid来判断有没有权限
+- CommandMessage不会进入Session
+- Command返回消息 `[Command][${name}][SUCCESS/FAILED]: ${对应的执行结果}`
 
 ## Cron: 定时器
 
@@ -132,6 +134,11 @@ type Tool = {
 
 ### MCP
 工具中心可以通过配置文件配置mcp协议 从而让模型有调用mcp的能力
+
+## skill
+- 支持用户配置skill 选择skill 下载skill
+
+## memory
 
 # TODO
 记忆
