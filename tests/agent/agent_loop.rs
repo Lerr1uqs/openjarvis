@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime,
-        HookEvent, HookEventKind, HookHandler, HookRegistry, InfoContext,
+        HookEvent, HookEventKind, HookHandler, HookRegistry, InfoContext, ToolRegistry,
     },
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use super::tool::mcp::demo_stdio_config;
+use super::tool::skill::SkillFixture;
 
 struct RecordingHook {
     kinds: Arc<Mutex<Vec<HookEventKind>>>,
@@ -50,7 +51,7 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
 
     let runtime = AgentRuntime::with_parts(
         Arc::clone(&hooks),
-        Arc::new(openjarvis::agent::ToolRegistry::new()),
+        Arc::new(openjarvis::agent::ToolRegistry::with_skill_roots(Vec::new())),
     );
     let loop_runner = AgentLoop::new(Arc::new(MockLLMProvider::new("loop-reply")), runtime);
     let (input, outgoing_rx) = build_input();
@@ -91,9 +92,23 @@ impl LLMProvider for SequenceProvider {
     }
 }
 
+struct RecordingSequenceProvider {
+    requests: Arc<Mutex<Vec<LLMRequest>>>,
+    responses: Arc<Mutex<Vec<LLMResponse>>>,
+}
+
+#[async_trait]
+impl LLMProvider for RecordingSequenceProvider {
+    async fn generate(&self, request: LLMRequest) -> Result<LLMResponse> {
+        self.requests.lock().await.push(request);
+        let mut responses = self.responses.lock().await;
+        Ok(responses.remove(0))
+    }
+}
+
 #[tokio::test]
 async fn agent_loop_runs_single_tool_round_and_returns_final_answer() {
-    let runtime = AgentRuntime::new();
+    let runtime = runtime_without_skills();
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
@@ -143,7 +158,7 @@ async fn agent_loop_can_be_driven_by_mock_provider_to_verify_tool_hooks() {
 
     let runtime = AgentRuntime::with_parts(
         Arc::clone(&hooks),
-        Arc::new(openjarvis::agent::ToolRegistry::new()),
+        Arc::new(openjarvis::agent::ToolRegistry::with_skill_roots(Vec::new())),
     );
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
@@ -195,7 +210,7 @@ async fn agent_loop_emits_post_tool_use_failure_when_mock_provider_requests_unkn
 
     let runtime = AgentRuntime::with_parts(
         Arc::clone(&hooks),
-        Arc::new(openjarvis::agent::ToolRegistry::new()),
+        Arc::new(openjarvis::agent::ToolRegistry::with_skill_roots(Vec::new())),
     );
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
@@ -238,7 +253,7 @@ async fn agent_loop_emits_post_tool_use_failure_when_mock_provider_requests_unkn
 
 #[tokio::test]
 async fn agent_loop_accepts_protocol_prefix_with_colon() {
-    let runtime = AgentRuntime::new();
+    let runtime = runtime_without_skills();
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
@@ -261,7 +276,7 @@ async fn agent_loop_accepts_protocol_prefix_with_colon() {
 
 #[tokio::test]
 async fn agent_loop_emits_response_before_tool_call_when_both_exist() {
-    let runtime = AgentRuntime::new();
+    let runtime = runtime_without_skills();
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
@@ -297,7 +312,7 @@ async fn agent_loop_emits_response_before_tool_call_when_both_exist() {
 
 #[tokio::test]
 async fn agent_loop_executes_all_tool_calls_in_one_response() {
-    let runtime = AgentRuntime::new();
+    let runtime = runtime_without_skills();
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
@@ -345,7 +360,7 @@ async fn agent_loop_executes_all_tool_calls_in_one_response() {
 #[tokio::test]
 async fn agent_loop_executes_namespaced_mcp_tool_calls() {
     let config = demo_stdio_config(true);
-    let runtime = AgentRuntime::from_config(config.agent_config())
+    let runtime = AgentRuntime::from_config_with_skill_roots(config.agent_config(), Vec::new())
         .await
         .expect("runtime should build with demo stdio MCP");
     let loop_runner = AgentLoop::new(
@@ -384,6 +399,132 @@ async fn agent_loop_executes_namespaced_mcp_tool_calls() {
     );
 }
 
+#[tokio::test]
+async fn agent_loop_does_not_inject_skill_prompt_or_tool_when_no_local_skills_exist() {
+    let fixture = SkillFixture::new("openjarvis-agent-loop-no-skills");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let runtime = AgentRuntime::with_parts(
+        Arc::new(HookRegistry::new()),
+        Arc::new(ToolRegistry::with_skill_roots(vec![
+            fixture.skills_root().to_path_buf(),
+        ])),
+    );
+    let loop_runner = AgentLoop::new(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![text_response("无技能回复")])),
+        }),
+        runtime,
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "普通问题"))
+        .await
+        .expect("loop should succeed");
+
+    let captured_requests = requests.lock().await;
+    let first_request = &captured_requests[0];
+    let tool_names = first_request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let serialized_messages = first_request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(output.reply, "无技能回复");
+    assert!(!tool_names.contains(&"load_skill"));
+    assert!(
+        !serialized_messages
+            .iter()
+            .any(|content| content.contains("You have access to local skills")),
+        "unexpected skill prompt leaked into request: {serialized_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_loop_injects_skill_prompt_and_progressively_loads_skill_content() {
+    let fixture = SkillFixture::new("openjarvis-agent-loop-with-skills");
+    fixture.write_skill(
+        "demo_skill",
+        r#"---
+name: demo_skill
+description: help with demo workflows
+---
+Read `guide.md` before replying.
+"#,
+    );
+    fixture.write_skill_file("demo_skill", "guide.md", "guide content");
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let runtime = AgentRuntime::with_parts(
+        Arc::new(HookRegistry::new()),
+        Arc::new(ToolRegistry::with_skill_roots(vec![
+            fixture.skills_root().to_path_buf(),
+        ])),
+    );
+    let loop_runner = AgentLoop::new(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response("load_skill", serde_json::json!({ "name": "demo_skill" })),
+                text_response("技能加载完成"),
+            ])),
+        }),
+        runtime,
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "请处理 demo 工作流"))
+        .await
+        .expect("loop should succeed");
+
+    let captured_requests = requests.lock().await;
+    let first_request = &captured_requests[0];
+    let second_request = &captured_requests[1];
+    let first_tool_names = first_request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let first_messages = first_request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    let second_messages = second_request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(output.reply, "技能加载完成");
+    assert_eq!(output.metadata["used_tool_name"], "load_skill");
+    assert!(first_tool_names.contains(&"load_skill"));
+    assert!(
+        first_messages.iter().any(|content| content
+            .contains("Available local skills:\n- demo_skill: help with demo workflows")),
+        "skill catalog prompt was not injected: {first_messages:?}"
+    );
+    assert!(
+        second_messages
+            .iter()
+            .any(|content| content.contains("Loaded local skill `demo_skill`.")),
+        "loaded skill prompt was not appended to the next request: {second_messages:?}"
+    );
+    assert!(
+        second_messages
+            .iter()
+            .any(|content| content.contains("guide content")),
+        "referenced skill file content was not propagated: {second_messages:?}"
+    );
+}
+
 fn build_context(system_prompt: &str, user_message: &str) -> MessageContext {
     // 作用: 为 agent loop 测试构造一个最小上下文，模拟 worker 从 session 中拼好的 MessageContext。
     // 参数: system_prompt 为系统提示词，user_message 为用户输入文本。
@@ -394,6 +535,13 @@ fn build_context(system_prompt: &str, user_message: &str) -> MessageContext {
         chrono::Utc::now(),
     ));
     context
+}
+
+fn runtime_without_skills() -> AgentRuntime {
+    AgentRuntime::with_parts(
+        Arc::new(HookRegistry::new()),
+        Arc::new(ToolRegistry::with_skill_roots(Vec::new())),
+    )
 }
 
 fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {

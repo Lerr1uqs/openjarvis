@@ -4,6 +4,7 @@ pub mod edit;
 pub mod mcp;
 pub mod read;
 pub mod shell;
+pub mod skill;
 pub mod write;
 
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
@@ -13,7 +14,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 
 pub use edit::EditTool;
@@ -22,6 +23,7 @@ pub use mcp::{
 };
 pub use read::ReadTool;
 pub use shell::ShellTool;
+pub use skill::{LoadSkillTool, LoadedSkill, LoadedSkillFile, SkillManifest, SkillRegistry};
 pub use write::WriteTool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +131,7 @@ pub struct ToolRegistry {
     // AGENT-TODO: 对String起别名
     handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
     mcp: Arc<mcp::McpManager>,
+    skills: Arc<skill::SkillRegistry>,
 }
 
 pub fn tool_definition_from_args<T>(
@@ -160,6 +163,28 @@ impl ToolRegistry {
         Self {
             handlers: RwLock::new(HashMap::new()),
             mcp: Arc::new(mcp::McpManager::new()),
+            skills: Arc::new(skill::SkillRegistry::new()),
+        }
+    }
+
+    /// Create an empty tool registry with explicit local skill roots.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::agent::ToolRegistry;
+    /// use std::path::PathBuf;
+    ///
+    /// let registry = ToolRegistry::with_skill_roots(vec![PathBuf::from(".skills")]);
+    /// assert!(registry.list().await.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_skill_roots(skill_roots: Vec<PathBuf>) -> Self {
+        Self {
+            handlers: RwLock::new(HashMap::new()),
+            mcp: Arc::new(mcp::McpManager::new()),
+            skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
         }
     }
 
@@ -177,7 +202,18 @@ impl ToolRegistry {
     /// # }
     /// ```
     pub async fn from_config(config: &AgentToolConfig) -> Result<Self> {
-        let registry = Self::new();
+        Self::from_config_with_skill_roots(config, vec![PathBuf::from(".skills")]).await
+    }
+
+    /// Create a tool registry from config with explicit local skill roots.
+    ///
+    /// This exists mainly so tests can opt into deterministic roots instead of using the
+    /// workspace `.skills` directory.
+    pub async fn from_config_with_skill_roots(
+        config: &AgentToolConfig,
+        skill_roots: Vec<PathBuf>,
+    ) -> Result<Self> {
+        let registry = Self::with_skill_roots(skill_roots);
         let definitions = build_mcp_server_definitions(config)?;
         registry.mcp.load_definitions(definitions).await?;
         registry.sync_mcp_handlers().await;
@@ -202,6 +238,8 @@ impl ToolRegistry {
         self.register_if_missing(Arc::new(WriteTool::new())).await;
         self.register_if_missing(Arc::new(EditTool::new())).await;
         self.register_if_missing(Arc::new(ShellTool::new())).await;
+        self.skills.reload().await?;
+        self.sync_skill_handlers().await;
         Ok(())
     }
 
@@ -234,6 +272,11 @@ impl ToolRegistry {
         ToolRegistryMcpApi { registry: self }
     }
 
+    /// Return the local skill management API exposed by this tool registry.
+    pub fn skills(&self) -> ToolRegistrySkillApi<'_> {
+        ToolRegistrySkillApi { registry: self }
+    }
+
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
         // Register the handler only when the name is not present yet.
         let definition = handler.definition();
@@ -254,6 +297,18 @@ impl ToolRegistry {
                     visible_tool,
                 )),
             );
+        }
+    }
+
+    async fn sync_skill_handlers(&self) {
+        let mut handlers = self.handlers.write().await;
+        if self.skills.has_enabled_skills().await {
+            handlers.insert(
+                "load_skill".to_string(),
+                Arc::new(skill::LoadSkillTool::new(Arc::clone(&self.skills))),
+            );
+        } else {
+            handlers.remove("load_skill");
         }
     }
 }
@@ -309,6 +364,60 @@ impl<'a> ToolRegistryMcpApi<'a> {
         let snapshot = self.registry.mcp.refresh_server(name).await?;
         self.registry.sync_mcp_handlers().await;
         Ok(snapshot)
+    }
+}
+
+pub struct ToolRegistrySkillApi<'a> {
+    registry: &'a ToolRegistry,
+}
+
+impl<'a> ToolRegistrySkillApi<'a> {
+    /// Reload local skills from disk and sync the `load_skill` tool exposure.
+    pub async fn reload(&self) -> Result<Vec<SkillManifest>> {
+        let manifests = self.registry.skills.reload().await?;
+        self.registry.sync_skill_handlers().await;
+        Ok(manifests)
+    }
+
+    /// List all discovered local skills, including disabled entries.
+    pub async fn list(&self) -> Vec<SkillManifest> {
+        self.registry.skills.list().await
+    }
+
+    /// List all enabled local skills.
+    pub async fn list_enabled(&self) -> Vec<SkillManifest> {
+        self.registry.skills.list_enabled().await
+    }
+
+    /// Disable one local skill in memory and sync the `load_skill` tool exposure.
+    pub async fn disable(&self, name: &str) -> Result<SkillManifest> {
+        let manifest = self.registry.skills.disable(name).await?;
+        self.registry.sync_skill_handlers().await;
+        Ok(manifest)
+    }
+
+    /// Enable one local skill in memory and sync the `load_skill` tool exposure.
+    pub async fn enable(&self, name: &str) -> Result<SkillManifest> {
+        let manifest = self.registry.skills.enable(name).await?;
+        self.registry.sync_skill_handlers().await;
+        Ok(manifest)
+    }
+
+    /// Build the catalog prompt injected into the agent loop when skills are available.
+    pub async fn catalog_prompt(&self) -> Option<String> {
+        self.registry.skills.catalog_prompt().await
+    }
+
+    /// Enable only the selected local skills and disable every other discovered skill.
+    pub async fn restrict_to(&self, names: &[String]) -> Result<Vec<SkillManifest>> {
+        let manifests = self.registry.skills.restrict_to(names).await?;
+        self.registry.sync_skill_handlers().await;
+        Ok(manifests)
+    }
+
+    /// Load one enabled local skill by exact name.
+    pub async fn load(&self, name: &str) -> Result<LoadedSkill> {
+        self.registry.skills.load(name).await
     }
 }
 

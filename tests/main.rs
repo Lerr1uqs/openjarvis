@@ -83,3 +83,18 @@ llm:
     assert!(stderr.contains("failed to parse mcp config file"));
     assert!(stderr.contains("config/openjarvis/mcp.json"));
 }
+
+#[test]
+fn startup_exits_when_test_only_load_skill_target_is_missing() {
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("--load-skill")
+        .arg("missing_local_skill")
+        .env("RUST_LOG", "info")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("local skill `missing_local_skill` does not exist"));
+}

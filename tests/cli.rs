@@ -9,6 +9,22 @@ fn cli_parses_builtin_mcp_flag() {
     let cli = OpenJarvisCli::parse_from(["openjarvis", "--builtin-mcp"]);
 
     assert!(cli.builtin_mcp);
+    assert!(cli.load_skills.is_empty());
+    assert!(cli.internal_mcp_command().is_none());
+}
+
+#[test]
+fn cli_parses_repeated_load_skill_flags() {
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "--load-skill",
+        "local_smoke_test",
+        "--load-skill",
+        "local_prompt_probe",
+    ]);
+
+    assert_eq!(cli.load_skills, ["local_smoke_test", "local_prompt_probe"]);
+    assert!(!cli.builtin_mcp);
     assert!(cli.internal_mcp_command().is_none());
 }
 

@@ -3,9 +3,10 @@
 use anyhow::Result;
 use clap::Parser;
 use openjarvis::{
-    agent::{AgentWorker, tool::mcp::demo},
+    agent::{AgentRuntime, AgentWorker, tool::mcp::demo},
     cli::OpenJarvisCli,
-    config::AppConfig,
+    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
+    llm::build_provider,
     router::ChannelRouter,
 };
 use tracing::{info, warn};
@@ -30,7 +31,27 @@ async fn main() -> Result<()> {
         warn!("feishu.dry_run=true, outgoing messages will be logged instead of delivered");
     }
 
-    let agent = AgentWorker::from_config(&config).await?;
+    let runtime = AgentRuntime::from_config(config.agent_config()).await?;
+    if !cli.load_skills.is_empty() {
+        // Test-only startup path: enable only the explicitly requested local skills for this
+        // process so external manual verification can exercise skill loading deterministically.
+        let enabled_skills = runtime
+            .tools()
+            .skills()
+            .restrict_to(&cli.load_skills)
+            .await?;
+        let enabled_skill_names = enabled_skills
+            .iter()
+            .map(|manifest| manifest.name.as_str())
+            .collect::<Vec<_>>();
+        info!(skills = ?enabled_skill_names, "loaded local skills from startup flags");
+    }
+
+    let agent = AgentWorker::with_runtime(
+        build_provider(config.llm_config())?,
+        DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+        runtime,
+    );
     let mut router = ChannelRouter::new(agent);
 
     router.register_channels(config.channel_config()).await?;

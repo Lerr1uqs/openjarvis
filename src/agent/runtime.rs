@@ -3,7 +3,7 @@
 use super::{hook::HookRegistry, tool::ToolRegistry};
 use crate::config::AgentConfig;
 use anyhow::Result;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 pub struct AgentRuntime {
@@ -34,9 +34,23 @@ impl AgentRuntime {
     /// # }
     /// ```
     pub async fn from_config(config: &AgentConfig) -> Result<Self> {
+        Self::from_config_with_skill_roots(config, vec![PathBuf::from(".skills")]).await
+    }
+
+    /// Create a runtime from config with explicit local skill roots.
+    ///
+    /// This exists mainly so tests can opt into deterministic roots instead of using the
+    /// workspace `.skills` directory.
+    pub async fn from_config_with_skill_roots(
+        config: &AgentConfig,
+        skill_roots: Vec<PathBuf>,
+    ) -> Result<Self> {
         Ok(Self {
             hooks: Arc::new(HookRegistry::from_config(config.hook_config()).await?),
-            tools: Arc::new(ToolRegistry::from_config(config.tool_config()).await?),
+            tools: Arc::new(
+                ToolRegistry::from_config_with_skill_roots(config.tool_config(), skill_roots)
+                    .await?,
+            ),
         })
     }
 

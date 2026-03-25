@@ -23,7 +23,7 @@ llm:
 "#,
     )
     .expect("config should parse");
-    let runtime = AgentRuntime::from_config(config.agent_config())
+    let runtime = AgentRuntime::from_config_with_skill_roots(config.agent_config(), Vec::new())
         .await
         .expect("runtime should build");
 
@@ -35,7 +35,7 @@ llm:
 #[tokio::test]
 async fn runtime_from_config_loads_tool_managed_mcp_servers() {
     let config = demo_stdio_config(false);
-    let runtime = AgentRuntime::from_config(config.agent_config())
+    let runtime = AgentRuntime::from_config_with_skill_roots(config.agent_config(), Vec::new())
         .await
         .expect("runtime should build");
 

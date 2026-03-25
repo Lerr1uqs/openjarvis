@@ -2,7 +2,7 @@ use openjarvis::agent::ToolRegistry;
 
 #[tokio::test]
 async fn builtin_tools_can_be_registered_together() {
-    let registry = ToolRegistry::new();
+    let registry = ToolRegistry::with_skill_roots(Vec::new());
     registry
         .register_builtin_tools()
         .await

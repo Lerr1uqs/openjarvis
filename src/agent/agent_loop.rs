@@ -161,6 +161,7 @@ impl AgentLoop {
         context: &ContextMessage,
     ) -> Result<AgentLoopOutput> {
         self.runtime.tools().register_builtin_tools().await?;
+        let skill_catalog_prompt = self.runtime.tools().skills().catalog_prompt().await;
         let hooks = self.runtime.hooks();
         hooks
             .emit(HookEvent {
@@ -174,7 +175,7 @@ impl AgentLoop {
             .await?;
 
         let tools = self.runtime.tools().list().await;
-        let mut messages = build_react_messages(context);
+        let mut messages = build_react_messages(context, skill_catalog_prompt.as_deref());
         let mut events = Vec::new(); // events有无必要？
         let mut turn_messages = Vec::new();
         let mut used_tool_names = Vec::new();
@@ -372,7 +373,7 @@ fn format_tool_result_content(content: &str, is_error: bool) -> String {
     content.to_string()
 }
 // TODO: 这里直接用Vec<ChatMessage>就行了
-fn build_react_messages(context: &ContextMessage) -> Messages {
+fn build_react_messages(context: &ContextMessage, skill_catalog_prompt: Option<&str>) -> Messages {
     // Inject a tool-usage instruction into the first request assembled from the current context.
     let mut messages = context.as_messages();
     let insert_at = context.system.len() + context.memory.len();
@@ -384,5 +385,11 @@ fn build_react_messages(context: &ContextMessage) -> Messages {
             Utc::now(),
         ),
     );
+    if let Some(skill_catalog_prompt) = skill_catalog_prompt {
+        messages.insert(
+            insert_at + 1,
+            ChatMessage::new(ChatMessageRole::System, skill_catalog_prompt, Utc::now()),
+        );
+    }
     messages
 }

@@ -9,6 +9,14 @@ pub struct OpenJarvisCli {
     /// Load demo-only builtin MCP servers for local verification.
     #[arg(long, global = true)]
     pub builtin_mcp: bool,
+    /// Test-only: preload one or more local skills from `.skills` into this process so the
+    /// running agent can use them.
+    ///
+    /// This flag is intended for local verification and smoke tests. It does not print the skill
+    /// body; it starts the normal runtime and restricts the enabled local skills to the selected
+    /// names for the current process.
+    #[arg(long = "load-skill", global = true, value_name = "NAME", hide = true)]
+    pub load_skills: Vec<String>,
     /// Optional internal subcommands reserved for local protocol helpers.
     #[command(subcommand)]
     pub command: Option<OpenJarvisCommand>,
