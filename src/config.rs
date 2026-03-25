@@ -1,13 +1,17 @@
 //! Configuration loading and default values for the application, channels, and LLM provider.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
 };
+use tracing::info;
 
 pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。";
+pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
+const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -32,22 +36,48 @@ impl Default for AppConfig {
 
 impl AppConfig {
     /// Load configuration from `OPENJARVIS_CONFIG` or `config.yaml`.
+    ///
+    /// When `config/openjarvis/mcp.json` exists beside the YAML root, its MCP servers are merged
+    /// into `agent.tool.mcp.servers`.
+    ///
+    /// # 示例
+    /// ```no_run
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::load().expect("config should load");
+    /// assert!(!config.llm_config().provider.trim().is_empty());
+    /// ```
     pub fn load() -> Result<Self> {
         let path = env::var("OPENJARVIS_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
         Self::from_path(path)
     }
 
-    /// Load configuration from a specific YAML path, falling back to defaults when the file is missing.
+    /// Load configuration from a specific YAML path, falling back to defaults when the file is
+    /// missing.
+    ///
+    /// When `config/openjarvis/mcp.json` exists beside the YAML root, its MCP servers are merged
+    /// into `agent.tool.mcp.servers`.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config =
+    ///     AppConfig::from_path("missing-config.yaml").expect("missing config should use defaults");
+    /// assert_eq!(config.llm_config().provider, "mock");
+    /// ```
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
+        let mut config = if path.exists() {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config file {}", path.display()))?;
+            serde_yaml::from_str::<Self>(&raw)
+                .with_context(|| format!("failed to parse config file {}", path.display()))?
+        } else {
+            Self::default()
+        };
 
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let config = serde_yaml::from_str::<Self>(&raw)
-            .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        config.load_external_mcp_sidecar(path)?;
         config
             .validate()
             .with_context(|| format!("failed to validate config file {}", path.display()))?;
@@ -77,8 +107,82 @@ impl AppConfig {
         &self.llm
     }
 
+    /// Enable the demo-only builtin MCP server for local verification.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::{AppConfig, BUILTIN_MCP_SERVER_NAME};
+    ///
+    /// let mut config = AppConfig::default();
+    /// config
+    ///     .enable_builtin_mcp("openjarvis")
+    ///     .expect("builtin mcp should be inserted");
+    ///
+    /// assert!(config.agent_config().tool_config().mcp_config().servers().contains_key(BUILTIN_MCP_SERVER_NAME));
+    /// ```
+    pub fn enable_builtin_mcp(&mut self, executable: impl Into<String>) -> Result<()> {
+        self.agent.tool.mcp.upsert_server(
+            BUILTIN_MCP_SERVER_NAME,
+            AgentMcpServerConfig::stdio(
+                true,
+                executable,
+                vec!["internal-mcp".to_string(), "demo-stdio".to_string()],
+                HashMap::new(),
+            ),
+        );
+        self.validate()
+    }
+
     fn validate(&self) -> Result<()> {
         self.agent.validate()
+    }
+
+    fn load_external_mcp_sidecar(&mut self, config_path: &Path) -> Result<()> {
+        let mcp_config_path = resolve_external_mcp_config_path(config_path);
+        if !mcp_config_path.exists() {
+            // Requirement: a missing sidecar should only emit a note and continue with no MCP
+            // servers loaded from the external file.
+            info!(
+                mcp_config_path = %mcp_config_path.display(),
+                "mcp sidecar config not found, continuing without external MCP servers"
+            );
+            return Ok(());
+        }
+
+        let raw = fs::read_to_string(&mcp_config_path).with_context(|| {
+            format!(
+                "failed to read mcp config file {}",
+                mcp_config_path.display()
+            )
+        })?;
+        let external_config =
+            serde_json::from_str::<ExternalMcpJsonConfig>(&raw).with_context(|| {
+                format!(
+                    "failed to parse mcp config file {}",
+                    mcp_config_path.display()
+                )
+            })?;
+        let external_servers = external_config.into_mcp_servers().with_context(|| {
+            format!(
+                "failed to validate mcp config file {}",
+                mcp_config_path.display()
+            )
+        })?;
+
+        for (server_name, server_config) in external_servers {
+            if self.agent.tool.mcp.servers.contains_key(&server_name) {
+                bail!(
+                    "mcp server `{server_name}` is defined in both YAML config and {}",
+                    mcp_config_path.display()
+                );
+            }
+            self.agent
+                .tool
+                .mcp
+                .upsert_server(server_name, server_config);
+        }
+
+        Ok(())
     }
 }
 
@@ -174,6 +278,7 @@ impl FeishuConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     hook: AgentHookConfig,
+    tool: AgentToolConfig,
 }
 
 impl AgentConfig {
@@ -190,9 +295,297 @@ impl AgentConfig {
         &self.hook
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
-        self.hook.validate()
+    /// Return the configured tool runtime section.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.agent_config().tool_config().mcp_config().is_empty());
+    /// ```
+    pub fn tool_config(&self) -> &AgentToolConfig {
+        &self.tool
     }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.hook.validate()?;
+        self.tool.validate()
+    }
+}
+
+/// Tool-level runtime configuration loaded from YAML.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert!(config.agent_config().tool_config().mcp_config().is_empty());
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentToolConfig {
+    mcp: AgentMcpConfig,
+}
+
+impl AgentToolConfig {
+    /// Return the configured MCP subsection.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.agent_config().tool_config().mcp_config().is_empty());
+    /// ```
+    pub fn mcp_config(&self) -> &AgentMcpConfig {
+        &self.mcp
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.mcp.validate()
+    }
+}
+
+/// MCP server configuration keyed by server name under `agent.tool.mcp.servers`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert!(config.agent_config().tool_config().mcp_config().is_empty());
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentMcpConfig {
+    servers: HashMap<String, AgentMcpServerConfig>,
+}
+
+impl AgentMcpConfig {
+    /// Return whether no MCP server is configured.
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// Return the configured MCP server map.
+    pub fn servers(&self) -> &HashMap<String, AgentMcpServerConfig> {
+        &self.servers
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (name, server) in &self.servers {
+            server.validate(name)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_server(&mut self, name: impl Into<String>, server: AgentMcpServerConfig) {
+        self.servers.insert(name.into(), server);
+    }
+}
+
+/// One MCP server config entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentMcpServerConfig {
+    pub enabled: bool,
+    #[serde(flatten)]
+    transport: AgentMcpServerTransportConfig,
+}
+
+impl Default for AgentMcpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            transport: AgentMcpServerTransportConfig::Stdio {
+                command: String::new(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+        }
+    }
+}
+
+impl AgentMcpServerConfig {
+    /// Create one stdio-based MCP server config entry.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AgentMcpServerConfig;
+    ///
+    /// let server = AgentMcpServerConfig::stdio(
+    ///     true,
+    ///     "openjarvis",
+    ///     vec!["internal-mcp".to_string(), "demo-stdio".to_string()],
+    ///     std::collections::HashMap::new(),
+    /// );
+    ///
+    /// assert!(server.enabled);
+    /// ```
+    pub fn stdio(
+        enabled: bool,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            enabled,
+            transport: AgentMcpServerTransportConfig::Stdio {
+                command: command.into(),
+                args,
+                env,
+            },
+        }
+    }
+
+    /// Create one Streamable HTTP MCP server config entry.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AgentMcpServerConfig;
+    ///
+    /// let server = AgentMcpServerConfig::streamable_http(true, "http://127.0.0.1:39090/mcp");
+    /// assert!(server.enabled);
+    /// ```
+    pub fn streamable_http(enabled: bool, url: impl Into<String>) -> Self {
+        Self {
+            enabled,
+            transport: AgentMcpServerTransportConfig::StreamableHttp { url: url.into() },
+        }
+    }
+
+    /// Return the selected transport configuration.
+    pub fn transport_config(&self) -> &AgentMcpServerTransportConfig {
+        &self.transport
+    }
+
+    fn validate(&self, server_name: &str) -> Result<()> {
+        self.transport.validate(server_name)
+    }
+}
+
+/// Transport-specific MCP server configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentMcpServerTransportConfig {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    #[serde(rename = "streamable_http", alias = "http")]
+    StreamableHttp { url: String },
+}
+
+impl AgentMcpServerTransportConfig {
+    fn validate(&self, server_name: &str) -> Result<()> {
+        match self {
+            Self::Stdio { command, .. } => {
+                if command.trim().is_empty() {
+                    anyhow::bail!("mcp server `{server_name}` stdio command must not be blank");
+                }
+            }
+            Self::StreamableHttp { url } => {
+                if url.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp server `{server_name}` streamable_http url must not be blank"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ExternalMcpJsonConfig {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: HashMap<String, ExternalMcpJsonServerConfig>,
+}
+
+impl ExternalMcpJsonConfig {
+    fn into_mcp_servers(self) -> Result<HashMap<String, AgentMcpServerConfig>> {
+        let mut servers = HashMap::with_capacity(self.mcp_servers.len());
+        for (server_name, server_config) in self.mcp_servers {
+            if server_name.trim().is_empty() {
+                bail!("mcp.json server name must not be blank");
+            }
+            servers.insert(
+                server_name.clone(),
+                server_config.into_agent_config(&server_name)?,
+            );
+        }
+        Ok(servers)
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ExternalMcpJsonServerConfig {
+    enabled: Option<bool>,
+    transport: Option<ExternalMcpJsonTransport>,
+    command: Option<String>,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    url: Option<String>,
+}
+
+impl ExternalMcpJsonServerConfig {
+    fn into_agent_config(self, server_name: &str) -> Result<AgentMcpServerConfig> {
+        let Self {
+            enabled,
+            transport,
+            command,
+            args,
+            env,
+            url,
+        } = self;
+        let enabled = enabled.unwrap_or(true);
+
+        match (transport, command, url) {
+            (Some(ExternalMcpJsonTransport::Stdio), Some(command), None) => {
+                Ok(AgentMcpServerConfig::stdio(enabled, command, args, env))
+            }
+            (Some(ExternalMcpJsonTransport::Stdio), None, None) => {
+                bail!("mcp.json server `{server_name}` with transport `stdio` requires `command`")
+            }
+            (Some(ExternalMcpJsonTransport::Stdio), _, Some(_)) => bail!(
+                "mcp.json server `{server_name}` with transport `stdio` must not define `url`"
+            ),
+            (Some(ExternalMcpJsonTransport::StreamableHttp), None, Some(url)) => {
+                Ok(AgentMcpServerConfig::streamable_http(enabled, url))
+            }
+            (Some(ExternalMcpJsonTransport::StreamableHttp), None, None) => bail!(
+                "mcp.json server `{server_name}` with transport `streamable_http` requires `url`"
+            ),
+            (Some(ExternalMcpJsonTransport::StreamableHttp), Some(_), _) => bail!(
+                "mcp.json server `{server_name}` with transport `streamable_http` must not define `command`"
+            ),
+            (None, Some(command), None) => {
+                Ok(AgentMcpServerConfig::stdio(enabled, command, args, env))
+            }
+            (None, None, Some(url)) => Ok(AgentMcpServerConfig::streamable_http(enabled, url)),
+            (None, Some(_), Some(_)) => bail!(
+                "mcp.json server `{server_name}` must define either `command` or `url`, not both"
+            ),
+            (None, None, None) => {
+                bail!("mcp.json server `{server_name}` must define either `command` or `url`")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalMcpJsonTransport {
+    Stdio,
+    #[serde(rename = "streamable_http", alias = "http")]
+    StreamableHttp,
 }
 
 /// Hook script configuration keyed by hook event name.
@@ -351,6 +744,11 @@ fn push_command<'a>(
     if let Some(command) = command {
         commands.push((event_name, command));
     }
+}
+
+fn resolve_external_mcp_config_path(config_path: &Path) -> PathBuf {
+    let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+    config_root.join(EXTERNAL_MCP_CONFIG_RELATIVE_PATH)
 }
 
 #[derive(Debug, Clone, Deserialize)]

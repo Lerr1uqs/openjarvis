@@ -133,7 +133,14 @@ type Tool = {
 ```
 
 ### MCP
-工具中心可以通过配置文件配置mcp协议 从而让模型有调用mcp的能力
+MCP 归属在 ToolRegistry 内部统一管理 配置入口是 `agent.tool.mcp.servers`
+
+- 当前只支持 `stdio` 和 `streamable_http`
+- MCP tool 会以 `mcp__<server>__<tool>` 的形式暴露给模型
+- 只有 healthy + enabled 的 MCP server 才会把 tools 挂进 ToolRegistry
+- 运行时启停/刷新/查询通过 `runtime.tools().mcp()` 暴露给其他组件
+- demo-only MCP server 也放在 tool 模块下 通过内部子命令启动用于测试
+- ./config/openjarvis/mcp.json 作为目前默认的配置文件
 
 ## skill
 - 支持用户配置skill 选择skill 下载skill

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "demo_stdio": {
+      "enabled": false,
+      "command": "openjarvis",
+      "args": ["internal-mcp", "demo-stdio"]
+    },
+    "demo_http": {
+      "enabled": false,
+      "transport": "http",
+      "url": "http://127.0.0.1:39090/mcp"
+    }
+  }
+}

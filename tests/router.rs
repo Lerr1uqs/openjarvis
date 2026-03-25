@@ -1,20 +1,28 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+use clap::Parser;
 use openjarvis::{
     agent::{
-        AgentDispatchEvent, AgentLoopEventKind, AgentRequest, AgentWorker, AgentWorkerEvent,
-        AgentWorkerHandle, CompletedAgentTurn,
+        AgentDispatchEvent, AgentLoopEventKind, AgentRequest, AgentRuntime, AgentWorker,
+        AgentWorkerEvent, AgentWorkerHandle, CompletedAgentTurn,
     },
     channels::{Channel, ChannelRegistration},
+    cli::OpenJarvisCli,
+    config::{AppConfig, BUILTIN_MCP_SERVER_NAME, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
-    llm::MockLLMProvider,
+    llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, OutgoingMessage, ReplyTarget},
     router::ChannelRouter,
     session::{SessionKey, SessionManager, SessionStrategy},
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    env::temp_dir,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
@@ -31,6 +39,17 @@ struct RecordingChannel {
 struct MockAgentHarness {
     handle: AgentWorkerHandle,
     event_keepalive_tx: mpsc::Sender<AgentWorkerEvent>, // test-only: keeps the downstream event channel alive until shutdown.
+}
+
+struct SequenceProvider {
+    responses: Arc<Mutex<Vec<LLMResponse>>>,
+}
+
+#[async_trait]
+impl LLMProvider for SequenceProvider {
+    async fn generate(&self, _request: LLMRequest) -> Result<LLMResponse> {
+        Ok(self.responses.lock().await.remove(0))
+    }
 }
 
 #[async_trait]
@@ -53,6 +72,45 @@ impl Channel for RecordingChannel {
 
 async fn wait_for_test_shutdown(shutdown_rx: oneshot::Receiver<()>) {
     let _ = shutdown_rx.await;
+}
+
+struct ExternalMcpConfigFixture {
+    root: PathBuf,
+    config_path: PathBuf,
+}
+
+impl ExternalMcpConfigFixture {
+    fn new(prefix: &str) -> Self {
+        let root = temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("fixture root should be created");
+        let config_path = root.join("config.yaml");
+        Self { root, config_path }
+    }
+
+    fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    fn write_mcp_json(&self, value: serde_json::Value) {
+        let mcp_json_path = self.root.join("config/openjarvis/mcp.json");
+        fs::create_dir_all(
+            mcp_json_path
+                .parent()
+                .expect("mcp json parent path should exist"),
+        )
+        .expect("mcp json directory should be created");
+        fs::write(
+            &mcp_json_path,
+            serde_json::to_string_pretty(&value).expect("mcp json should serialize"),
+        )
+        .expect("mcp json should be written");
+    }
+}
+
+impl Drop for ExternalMcpConfigFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 #[tokio::test]
@@ -123,6 +181,216 @@ async fn router_ignores_duplicate_messages() {
         "default"
     );
     assert_eq!(recorded[0].reply_to_message_id.as_deref(), Some("msg_1"));
+}
+
+#[tokio::test]
+async fn router_external_channel_message_can_trigger_builtin_mcp_when_flag_enabled() {
+    let cli = OpenJarvisCli::parse_from(["openjarvis", "--builtin-mcp"]);
+    let mut config = AppConfig::default();
+    if cli.builtin_mcp {
+        config
+            .enable_builtin_mcp(openjarvis_bin())
+            .expect("builtin mcp should be enabled");
+    }
+
+    let runtime = AgentRuntime::from_config(config.agent_config())
+        .await
+        .expect("runtime should build with builtin MCP");
+    let servers = runtime.tools().mcp().list_servers().await;
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, BUILTIN_MCP_SERVER_NAME);
+    assert_eq!(servers[0].tool_count, 3);
+
+    let agent = AgentWorker::with_runtime(
+        Arc::new(SequenceProvider {
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response(
+                    "mcp__builtin_demo_stdio__echo",
+                    json!({ "text": "channel hello" }),
+                ),
+                text_response("builtin mcp finished"),
+            ])),
+        }),
+        DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+        runtime,
+    );
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let mut router = ChannelRouter::new(agent);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_builtin_mcp",
+        "ou_builtin_mcp",
+        Some("thread_builtin_mcp"),
+        "请调用内置 MCP",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("external channel message should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(1500), async {
+            loop {
+                if sent.lock().await.len() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("builtin MCP outgoing messages should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+
+    let recorded = sent.lock().await.clone();
+    assert_eq!(recorded.len(), 3);
+    assert!(
+        recorded[0]
+            .content
+            .contains("[openjarvis][tool_call] mcp__builtin_demo_stdio__echo")
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "ToolCall");
+    assert!(recorded[1].content.contains("[demo:stdio] channel hello"));
+    assert_eq!(recorded[1].metadata["event_kind"], "ToolResult");
+    assert_eq!(recorded[2].content, "builtin mcp finished");
+    assert_eq!(recorded[2].metadata["event_kind"], "TextOutput");
+}
+
+#[tokio::test]
+async fn router_external_channel_message_can_trigger_mcp_loaded_from_external_json_file() {
+    let fixture = ExternalMcpConfigFixture::new("openjarvis-router-mcp-json");
+    fixture.write_mcp_json(json!({
+        "mcpServers": {
+            "file_demo_stdio": {
+                "command": openjarvis_bin(),
+                "args": ["internal-mcp", "demo-stdio"]
+            }
+        }
+    }));
+
+    let config =
+        AppConfig::from_path(fixture.config_path()).expect("external mcp json should load");
+    let runtime = AgentRuntime::from_config(config.agent_config())
+        .await
+        .expect("runtime should build with file-loaded MCP");
+    let servers = runtime.tools().mcp().list_servers().await;
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "file_demo_stdio");
+    assert_eq!(servers[0].tool_count, 3);
+
+    let agent = AgentWorker::with_runtime(
+        Arc::new(SequenceProvider {
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response(
+                    "mcp__file_demo_stdio__echo",
+                    json!({ "text": "config hello" }),
+                ),
+                text_response("config mcp finished"),
+            ])),
+        }),
+        DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+        runtime,
+    );
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let mut router = ChannelRouter::new(agent);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_config_mcp",
+        "ou_config_mcp",
+        Some("thread_config_mcp"),
+        "请调用配置文件里的 MCP",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("external channel message should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(1500), async {
+            loop {
+                if sent.lock().await.len() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("file-loaded MCP outgoing messages should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+
+    let recorded = sent.lock().await.clone();
+    assert_eq!(recorded.len(), 3);
+    assert!(
+        recorded[0]
+            .content
+            .contains("[openjarvis][tool_call] mcp__file_demo_stdio__echo")
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "ToolCall");
+    assert!(recorded[1].content.contains("[demo:stdio] config hello"));
+    assert_eq!(recorded[1].metadata["event_kind"], "ToolResult");
+    assert_eq!(recorded[2].content, "config mcp finished");
+    assert_eq!(recorded[2].metadata["event_kind"], "TextOutput");
 }
 
 #[tokio::test]
@@ -244,12 +512,14 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
 
     assert_eq!(thread.turns.len(), 2);
     assert_eq!(thread.external_thread_id, "thread_shared");
-    assert_eq!(history.len(), 5);
-    assert_eq!(history[0].content, "reply-first");
-    assert_eq!(history[4].content, "reply-second");
-    assert_eq!(thread.turns[0].messages.len(), 1);
+    assert_eq!(history.len(), 6);
+    assert_eq!(history[0].content, "first question");
+    assert_eq!(history[1].content, "reply-first");
+    assert_eq!(history[5].content, "reply-second");
+    assert_eq!(thread.turns[0].messages.len(), 2);
     assert_eq!(thread.turns[1].messages.len(), 4);
-    assert_eq!(thread.turns[0].messages[0].content, "reply-first");
+    assert_eq!(thread.turns[0].messages[0].content, "first question");
+    assert_eq!(thread.turns[0].messages[1].content, "reply-first");
     assert_eq!(thread.turns[1].messages[0].content, "second question");
     assert_eq!(thread.turns[1].messages[1].tool_calls[0].id, "call_mock_1");
     assert_eq!(
@@ -1033,6 +1303,32 @@ fn build_dispatch_event(
         session_external_thread_id: request.locator.external_thread_id.clone(),
         session_thread_id: request.locator.thread_id.to_string(),
         reply_to_source,
+    }
+}
+
+fn openjarvis_bin() -> String {
+    env!("CARGO_BIN_EXE_openjarvis").to_string()
+}
+
+fn text_response(content: &str) -> LLMResponse {
+    LLMResponse {
+        message: Some(ChatMessage::new(
+            ChatMessageRole::Assistant,
+            content,
+            Utc::now(),
+        )),
+        tool_calls: Vec::new(),
+    }
+}
+
+fn tool_only_response(name: &str, arguments: serde_json::Value) -> LLMResponse {
+    LLMResponse {
+        message: None,
+        tool_calls: vec![ChatToolCall {
+            id: "call_builtin_mcp".to_string(),
+            name: name.to_string(),
+            arguments,
+        }],
     }
 }
 

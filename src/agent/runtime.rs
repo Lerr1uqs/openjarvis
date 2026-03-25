@@ -1,6 +1,6 @@
 //! Shared runtime container that holds hooks, tools, and MCP registries for one agent.
 
-use super::{hook::HookRegistry, mcp::McpRegistry, tool::ToolRegistry};
+use super::{hook::HookRegistry, tool::ToolRegistry};
 use crate::config::AgentConfig;
 use anyhow::Result;
 use std::sync::Arc;
@@ -9,7 +9,6 @@ use std::sync::Arc;
 pub struct AgentRuntime {
     hooks: Arc<HookRegistry>,
     tools: Arc<ToolRegistry>,
-    mcp: Arc<McpRegistry>,
 }
 
 impl AgentRuntime {
@@ -18,7 +17,6 @@ impl AgentRuntime {
         Self {
             hooks: Arc::new(HookRegistry::new()),
             tools: Arc::new(ToolRegistry::new()),
-            mcp: Arc::new(McpRegistry::new()),
         }
     }
 
@@ -38,17 +36,12 @@ impl AgentRuntime {
     pub async fn from_config(config: &AgentConfig) -> Result<Self> {
         Ok(Self {
             hooks: Arc::new(HookRegistry::from_config(config.hook_config()).await?),
-            tools: Arc::new(ToolRegistry::new()),
-            mcp: Arc::new(McpRegistry::new()),
+            tools: Arc::new(ToolRegistry::from_config(config.tool_config()).await?),
         })
     }
 
-    pub fn with_parts(
-        hooks: Arc<HookRegistry>,
-        tools: Arc<ToolRegistry>,
-        mcp: Arc<McpRegistry>,
-    ) -> Self {
-        Self { hooks, tools, mcp }
+    pub fn with_parts(hooks: Arc<HookRegistry>, tools: Arc<ToolRegistry>) -> Self {
+        Self { hooks, tools }
     }
 
     /// Return the shared hook registry.
@@ -59,11 +52,6 @@ impl AgentRuntime {
     /// Return the shared tool registry.
     pub fn tools(&self) -> Arc<ToolRegistry> {
         Arc::clone(&self.tools)
-    }
-
-    /// Return the shared MCP registry.
-    pub fn mcp(&self) -> Arc<McpRegistry> {
-        Arc::clone(&self.mcp)
     }
 }
 

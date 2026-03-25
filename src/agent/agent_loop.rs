@@ -317,7 +317,7 @@ impl AgentLoop {
         };
 
         let tool_count = self.runtime.tools().list().await.len();
-        let mcp_server_count = self.runtime.mcp().list().await.len();
+        let mcp_server_count = self.runtime.tools().mcp().list_servers().await.len();
         let hook_handler_count = hooks.len().await;
         let metadata = json!({
             "tool_count": tool_count,

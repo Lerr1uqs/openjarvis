@@ -176,7 +176,7 @@ pub struct SessionStrategy {
 impl Default for SessionStrategy {
     fn default() -> Self {
         Self {
-            max_messages_per_thread: 5,
+            max_messages_per_thread: 10,
         }
     }
 }
@@ -229,7 +229,7 @@ impl SessionManager {
     /// use openjarvis::session::SessionManager;
     ///
     /// let manager = SessionManager::new();
-    /// assert_eq!(manager.strategy().max_messages_per_thread, 5);
+    /// assert_eq!(manager.strategy().max_messages_per_thread, 10);
     /// ```
     pub fn new() -> Self {
         Self::with_strategy(SessionStrategy::default())

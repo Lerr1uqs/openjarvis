@@ -16,6 +16,8 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+use super::tool::mcp::demo_stdio_config;
+
 struct RecordingHook {
     kinds: Arc<Mutex<Vec<HookEventKind>>>,
     payloads: Arc<Mutex<Vec<Value>>>,
@@ -49,7 +51,6 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
     let runtime = AgentRuntime::with_parts(
         Arc::clone(&hooks),
         Arc::new(openjarvis::agent::ToolRegistry::new()),
-        Arc::new(openjarvis::agent::McpRegistry::new()),
     );
     let loop_runner = AgentLoop::new(Arc::new(MockLLMProvider::new("loop-reply")), runtime);
     let (input, outgoing_rx) = build_input();
@@ -143,7 +144,6 @@ async fn agent_loop_can_be_driven_by_mock_provider_to_verify_tool_hooks() {
     let runtime = AgentRuntime::with_parts(
         Arc::clone(&hooks),
         Arc::new(openjarvis::agent::ToolRegistry::new()),
-        Arc::new(openjarvis::agent::McpRegistry::new()),
     );
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
@@ -196,7 +196,6 @@ async fn agent_loop_emits_post_tool_use_failure_when_mock_provider_requests_unkn
     let runtime = AgentRuntime::with_parts(
         Arc::clone(&hooks),
         Arc::new(openjarvis::agent::ToolRegistry::new()),
-        Arc::new(openjarvis::agent::McpRegistry::new()),
     );
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
@@ -340,6 +339,48 @@ async fn agent_loop_executes_all_tool_calls_in_one_response() {
     assert_eq!(
         outgoing.last().map(|message| message.content.as_str()),
         Some("全部读取完成")
+    );
+}
+
+#[tokio::test]
+async fn agent_loop_executes_namespaced_mcp_tool_calls() {
+    let config = demo_stdio_config(true);
+    let runtime = AgentRuntime::from_config(config.agent_config())
+        .await
+        .expect("runtime should build with demo stdio MCP");
+    let loop_runner = AgentLoop::new(
+        Arc::new(SequenceProvider {
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response(
+                    "mcp__demo_stdio__echo",
+                    serde_json::json!({ "text": "来自 agent loop" }),
+                ),
+                text_response("MCP 调用完成"),
+            ])),
+        }),
+        runtime,
+    );
+    let (input, outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "调用 demo MCP"))
+        .await
+        .expect("loop should succeed");
+    let outgoing = collect_outgoing(outgoing_rx, 3).await;
+
+    assert_eq!(output.reply, "MCP 调用完成");
+    assert_eq!(output.metadata["used_tool_name"], "mcp__demo_stdio__echo");
+    assert_eq!(output.metadata["tool_count"], 7);
+    assert_eq!(output.metadata["mcp_server_count"], 1);
+    assert_eq!(output.events[0].kind, AgentLoopEventKind::ToolCall);
+    assert_eq!(output.events[1].kind, AgentLoopEventKind::ToolResult);
+    assert_eq!(output.events[2].kind, AgentLoopEventKind::TextOutput);
+    assert!(outgoing[0].content.contains("mcp__demo_stdio__echo"));
+    assert!(outgoing[1].content.contains("[demo:stdio] 来自 agent loop"));
+    assert_eq!(outgoing[2].content, "MCP 调用完成");
+    assert_eq!(
+        output.turn_messages[1].content,
+        "[demo:stdio] 来自 agent loop"
     );
 }
 
