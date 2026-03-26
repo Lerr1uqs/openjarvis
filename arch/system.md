@@ -159,8 +159,6 @@ MCP 归属在 ToolRegistry 内部统一管理 配置入口是 `agent.tool.mcp.se
 ## skill
 - 支持用户配置skill 选择skill 下载skill
 
-## compact
-
 ## memory
 
 除非用户说主动记忆 否则都强制是被动记忆 这个写入记忆调用的prompt
@@ -189,6 +187,92 @@ remove_active_memory 这个是写入 ~/.openjarvis/memory/active/memory.json 中
 - memory_get("daily/2025-12-01.md") # 返回文档内容
 
 memory后端搜索有两种 一种是关键词匹配 + 基于词频的搜索 另外一种是qmd 需要有qmd支持(未来)
+
+
+## agent context容量
+对最终送给 LLM 的完整请求做容量估算，而不是只看 chat。  
+容量估算至少拆成下面几部分：
+
+- `system_tokens`
+- `memory_tokens`
+- `chat_tokens`
+- `visible_tool_tokens`
+- `reserved_output_tokens`
+- `total_estimated_tokens`
+- `context_window_tokens`
+- `utilization_ratio`
+
+这里的 `visible_tool_tokens` 只统计当前线程当前时刻真正对模型可见的工具，不统计已经注册但当前不可见的工具。
+
+对外可以提供当前线程的 context budget 查询接口，用于：
+
+- runtime 判断是否需要 compact
+- `auto_compact` 开启后给模型注入容量信息
+- 后续给用户或管理端展示当前线程的上下文占用情况
+
+
+## compact
+`Compact` 本身是线程级上下文管理器，不是天然的 tool。  
+它的职责是在每次真正请求 LLM 之前，先根据当前线程的上下文预算判断是否要压缩 `chat`。
+
+几个边界先明确：
+
+- compact 只作用于 `chat`
+- `system` 和 `memory` 不参与 compact
+- `chat` 本身天然包含 user / assistant / tool_call / tool_result
+- compact 结果必须写回 message 历史，而不是放进 memory
+
+压缩流程：
+
+1. runtime 在发送下一次 LLM 请求前估算完整请求 token。
+2. 如果达到 compact 阈值，则触发线程级 compact。
+3. compact provider 基于当前线程全部历史 `chat` 生成一个 synthetic turn。
+4. 这个 synthetic turn 由两条 message 组成：
+   - synthetic `user` message：记录任务目标、用户约束、当前请求背景
+   - synthetic `assistant` message：记录当前规划、已完成、未完成、关键事实
+5. 首版直接把被 compact 的旧 `chat` 从 active history 中移除，并用这个新的 synthetic turn 替换。
+6. 这个 synthetic turn 后续仍然作为普通 chat history 参与继续对话，也会参与下一次 compact。
+
+Compact 的核心不是“少一段文本”，而是“把当前任务恢复所需的最小上下文重新写回对话”。
+
+首版策略：
+
+- 使用 `CompactStrategy` 抽象统一管理压缩策略
+- 默认策略先用 `CompactAllChatStrategy`
+- 也就是到阈值后直接把当前线程全部历史 `chat` 压成一个 synthetic turn
+
+历史存储首版先采用直接替换：
+
+- active history 中不保留被替换的旧 chat
+- 但 compact 逻辑需要预留未来扩展点，后面可以切成：
+  - archive source
+  - keep shadow copy
+  - keep recent turns 等其他策略
+
+也就是说 V1 先做“替换”，但接口和策略层不要把“只能替换”写死。
+
+### auto-compact
+`AutoCompact` 是基于 `Compact` 的可选增强能力。  
+不开启 `AutoCompact` 时，runtime 仍然会在需要时自动 compact，只是模型本身无感知。
+
+开启 `AutoCompact` 后才做两件事：
+
+1. 给模型注入当前线程的上下文容量信息
+2. 暴露 compact tool，让模型自己决定是否提前 compact
+
+所以这里要区分两层：
+
+- `Compact`: runtime-managed，上下文过大时系统自己压
+- `AutoCompact`: model-assisted，让模型提早决定压缩时机
+
+compact tool 不应该默认始终可见，而是按线程运行时状态动态显隐：
+
+- `auto_compact = false` 时，对模型不可见
+- `auto_compact = true` 但预算还很低时，也可以先不可见
+- 到达可提前压缩的阈值后，再把 compact tool 对当前线程设为 visible
+- 如果已经达到硬阈值，则 runtime 直接先 compact，tool 是否可见已经不重要
+
+为了支持这件事，ToolRegistry 里的工具除了“注册”之外，还需要有“当前线程当前状态是否 visible”的投影能力。这样 compact tool 才能做成按需动态激活，而不是永久暴露。
 
 # TODO
 记忆
