@@ -7,7 +7,7 @@
 
 use crate::context::ChatMessage;
 use crate::model::IncomingMessage;
-use crate::thread::ConversationThread;
+use crate::thread::{ConversationThread, ThreadToolEvent};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -173,6 +173,13 @@ pub struct SessionStrategy {
     pub max_messages_per_thread: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StoredThreadState {
+    pub messages: Vec<ChatMessage>,
+    pub loaded_toolsets: Vec<String>,
+    pub tool_events: Vec<ThreadToolEvent>,
+}
+
 impl Default for SessionStrategy {
     fn default() -> Self {
         Self {
@@ -318,11 +325,20 @@ impl SessionManager {
     /// let _future = manager.load_turn(&locator);
     /// ```
     pub async fn load_turn(&self, locator: &ThreadLocator) -> Vec<ChatMessage> {
+        self.load_thread_state(locator).await.messages
+    }
+
+    /// Load the current thread state snapshot, including persisted toolset metadata.
+    pub async fn load_thread_state(&self, locator: &ThreadLocator) -> StoredThreadState {
         let sessions = self.sessions.read().await;
         sessions
             .get(&locator.session_key())
             .and_then(|session| session.threads.get(&locator.thread_id))
-            .map(ConversationThread::load_messages)
+            .map(|thread| StoredThreadState {
+                messages: thread.load_messages(),
+                loaded_toolsets: thread.load_toolsets(),
+                tool_events: thread.load_tool_events(),
+            })
             .unwrap_or_default()
     }
 
@@ -359,6 +375,29 @@ impl SessionManager {
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     ) -> Uuid {
+        self.store_turn_with_state(
+            locator,
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Store one completed turn together with persisted thread tool runtime metadata.
+    pub async fn store_turn_with_state(
+        &self,
+        locator: &ThreadLocator,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        loaded_toolsets: Vec<String>,
+        tool_events: Vec<ThreadToolEvent>,
+    ) -> Uuid {
         let session_key = locator.session_key();
         let mut sessions = self.sessions.write().await;
         let session = sessions
@@ -369,7 +408,14 @@ impl SessionManager {
             locator.thread_id,
             completed_at,
         );
-        let turn_id = thread.store_turn(external_message_id, messages, started_at, completed_at);
+        let turn_id = thread.store_turn_state(
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+            loaded_toolsets,
+            tool_events,
+        );
         self.strategy.retain_thread_messages(thread);
         session.updated_at = completed_at;
         turn_id

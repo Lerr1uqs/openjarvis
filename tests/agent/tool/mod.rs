@@ -5,4 +5,5 @@ mod registry;
 mod schema;
 mod shell;
 pub(crate) mod skill;
+mod toolset;
 mod write;

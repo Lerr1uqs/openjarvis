@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
@@ -33,6 +33,7 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
             locator: locator.clone(),
             incoming: incoming.clone(),
             history: Vec::new(),
+            loaded_toolsets: Vec::new(),
         })
         .await
         .expect("request should be accepted");
@@ -91,6 +92,17 @@ impl LLMProvider for RecordingProvider {
     }
 }
 
+struct FailingProvider;
+
+#[async_trait]
+impl LLMProvider for FailingProvider {
+    async fn generate(&self, _request: LLMRequest) -> Result<LLMResponse> {
+        Err(anyhow::anyhow!("provider said 429: rate limit exceeded")).context(
+            "failed to call llm provider `openai_compatible` model `demo-model` at `https://provider.test/v1`",
+        )
+    }
+}
+
 #[tokio::test]
 async fn worker_builds_context_from_history_and_current_user_message() {
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -114,6 +126,7 @@ async fn worker_builds_context_from_history_and_current_user_message() {
                 "previous reply",
                 Utc::now(),
             )],
+            loaded_toolsets: Vec::new(),
         })
         .await
         .expect("request should be accepted");
@@ -152,6 +165,39 @@ llm:
 
     assert_eq!(worker.runtime().hooks().len().await, 1);
     assert!(worker.sandbox().is_placeholder());
+}
+
+#[tokio::test]
+async fn worker_failed_turn_preserves_provider_error_chain() {
+    let worker = AgentWorker::new(Arc::new(FailingProvider), "system prompt");
+    let handle = worker.spawn();
+    let incoming = build_incoming("hello");
+    let locator = SessionManager::new().load_or_create_thread(&incoming).await;
+
+    handle
+        .request_tx
+        .send(AgentRequest {
+            locator,
+            incoming,
+            history: Vec::new(),
+            loaded_toolsets: Vec::new(),
+        })
+        .await
+        .expect("request should be accepted");
+
+    let events = collect_events(handle.event_rx, 1).await;
+
+    match &events[0] {
+        AgentWorkerEvent::TurnFailed(turn) => {
+            assert!(turn.error.contains("failed to call llm provider"));
+            assert!(turn.error.contains("demo-model"));
+            assert!(
+                turn.error
+                    .contains("provider said 429: rate limit exceeded")
+            );
+        }
+        other => panic!("unexpected first event: {other:?}"),
+    }
 }
 
 async fn collect_events(

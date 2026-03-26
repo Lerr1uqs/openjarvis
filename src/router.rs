@@ -362,12 +362,14 @@ impl ChannelRouter {
         )];
         messages.extend(turn.messages);
         self.sessions
-            .store_turn(
+            .store_turn_with_state(
                 &turn.locator,
                 turn.incoming.external_message_id.clone(),
                 messages,
                 turn.incoming.received_at,
                 turn.completed_at,
+                turn.loaded_toolsets,
+                turn.tool_events,
             )
             .await;
         self.release_or_dispatch_next(&turn.locator).await?;
@@ -396,7 +398,7 @@ impl ChannelRouter {
         .await?;
 
         self.sessions
-            .store_turn(
+            .store_turn_with_state(
                 &turn.locator,
                 turn.incoming.external_message_id.clone(),
                 vec![
@@ -409,6 +411,8 @@ impl ChannelRouter {
                 ],
                 turn.incoming.received_at,
                 turn.completed_at,
+                turn.loaded_toolsets,
+                Vec::new(),
             )
             .await;
         self.release_or_dispatch_next(&turn.locator).await?;
@@ -442,13 +446,14 @@ impl ChannelRouter {
         locator: ThreadLocator,
         message: IncomingMessage,
     ) -> Result<()> {
-        let history = self.sessions.load_turn(&locator).await;
+        let thread_state = self.sessions.load_thread_state(&locator).await;
         if let Err(error) = self
             .agent_tx
             .send(AgentRequest {
                 locator: locator.clone(),
                 incoming: message.clone(),
-                history,
+                history: thread_state.messages,
+                loaded_toolsets: thread_state.loaded_toolsets,
             })
             .await
         {

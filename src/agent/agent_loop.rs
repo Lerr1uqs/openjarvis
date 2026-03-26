@@ -9,6 +9,7 @@ use crate::{
     context::{ChatMessage, ChatMessageRole, ContextMessage, Messages},
     llm::{LLMProvider, LLMRequest},
     model::ReplyTarget,
+    thread::{ThreadToolEvent, ThreadToolEventKind},
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -131,6 +132,8 @@ pub struct AgentLoopOutput {
     pub metadata: Value,
     pub events: Vec<AgentLoopEvent>,
     pub turn_messages: Vec<ChatMessage>,
+    pub loaded_toolsets: Vec<String>,
+    pub tool_events: Vec<ThreadToolEvent>,
 }
 
 pub struct AgentLoop {
@@ -161,6 +164,7 @@ impl AgentLoop {
         context: &ContextMessage,
     ) -> Result<AgentLoopOutput> {
         self.runtime.tools().register_builtin_tools().await?;
+        let toolset_catalog_prompt = self.runtime.tools().catalog_prompt(&input.thread_id).await;
         let skill_catalog_prompt = self.runtime.tools().skills().catalog_prompt().await;
         let hooks = self.runtime.hooks();
         hooks
@@ -174,13 +178,22 @@ impl AgentLoop {
             })
             .await?;
 
-        let tools = self.runtime.tools().list().await;
-        let mut messages = build_react_messages(context, skill_catalog_prompt.as_deref());
+        let mut messages = build_react_messages(
+            context,
+            toolset_catalog_prompt.as_deref(),
+            skill_catalog_prompt.as_deref(),
+        ); // TODO: 可以不用messages.append 而是直接用messages + turn_messages
         let mut events = Vec::new(); // events有无必要？
         let mut turn_messages = Vec::new();
         let mut used_tool_names = Vec::new();
+        let mut tool_events = Vec::new();
 
         let reply = loop {
+            let tools = self
+                .runtime
+                .tools()
+                .list_for_thread(&input.thread_id)
+                .await?;
             let response = self
                 .llm
                 .generate(LLMRequest {
@@ -259,7 +272,11 @@ impl AgentLoop {
                     .await?;
 
                 used_tool_names.push(tool_call.name.clone());
-                let tool_result = self.runtime.tools().call(tool_call.clone()).await;
+                let tool_result = self
+                    .runtime
+                    .tools()
+                    .call_for_thread(&input.thread_id, tool_call.clone())
+                    .await;
                 let tool_result = match tool_result {
                     Ok(result) => {
                         let result_metadata = result.metadata.clone();
@@ -293,6 +310,11 @@ impl AgentLoop {
                         }
                     }
                 };
+                tool_events.push(build_thread_tool_event(
+                    &tool_call,
+                    &provider_tool_call.id,
+                    &tool_result,
+                ));
 
                 let tool_result_content =
                     format_tool_result_content(&tool_result.content, tool_result.is_error);
@@ -317,7 +339,17 @@ impl AgentLoop {
             }
         };
 
-        let tool_count = self.runtime.tools().list().await.len();
+        let loaded_toolsets = self
+            .runtime
+            .tools()
+            .loaded_toolsets_for_thread(&input.thread_id)
+            .await;
+        let tool_count = self
+            .runtime
+            .tools()
+            .list_for_thread(&input.thread_id)
+            .await?
+            .len();
         let mcp_server_count = self.runtime.tools().mcp().list_servers().await.len();
         let hook_handler_count = hooks.len().await;
         let metadata = json!({
@@ -326,6 +358,7 @@ impl AgentLoop {
             "hook_handler_count": hook_handler_count,
             "used_tool_name": used_tool_names.first().cloned(),
             "used_tool_names": used_tool_names,
+            "loaded_toolsets": loaded_toolsets,
             "event_count": events.len(),
         });
 
@@ -344,6 +377,12 @@ impl AgentLoop {
             metadata,
             events,
             turn_messages,
+            loaded_toolsets: self
+                .runtime
+                .tools()
+                .loaded_toolsets_for_thread(&input.thread_id)
+                .await,
+            tool_events,
         })
     }
 }
@@ -373,7 +412,11 @@ fn format_tool_result_content(content: &str, is_error: bool) -> String {
     content.to_string()
 }
 // TODO: 这里直接用Vec<ChatMessage>就行了
-fn build_react_messages(context: &ContextMessage, skill_catalog_prompt: Option<&str>) -> Messages {
+fn build_react_messages(
+    context: &ContextMessage,
+    toolset_catalog_prompt: Option<&str>,
+    skill_catalog_prompt: Option<&str>,
+) -> Messages {
     // Inject a tool-usage instruction into the first request assembled from the current context.
     let mut messages = context.as_messages();
     let insert_at = context.system.len() + context.memory.len();
@@ -385,11 +428,44 @@ fn build_react_messages(context: &ContextMessage, skill_catalog_prompt: Option<&
             Utc::now(),
         ),
     );
-    if let Some(skill_catalog_prompt) = skill_catalog_prompt {
+    if let Some(toolset_catalog_prompt) = toolset_catalog_prompt {
         messages.insert(
             insert_at + 1,
+            ChatMessage::new(ChatMessageRole::System, toolset_catalog_prompt, Utc::now()),
+        );
+    }
+    if let Some(skill_catalog_prompt) = skill_catalog_prompt {
+        messages.insert(
+            insert_at
+                + if toolset_catalog_prompt.is_some() {
+                    2
+                } else {
+                    1
+                },
             ChatMessage::new(ChatMessageRole::System, skill_catalog_prompt, Utc::now()),
         );
     }
     messages
+}
+
+fn build_thread_tool_event(
+    tool_call: &ToolCallRequest,
+    tool_call_id: &str,
+    tool_result: &super::ToolCallResult,
+) -> ThreadToolEvent {
+    let event_kind = match tool_result.metadata["event_kind"].as_str() {
+        Some("load_toolset") => ThreadToolEventKind::LoadToolset,
+        Some("unload_toolset") => ThreadToolEventKind::UnloadToolset,
+        _ => ThreadToolEventKind::ExecuteTool,
+    };
+    let mut event = ThreadToolEvent::new(event_kind, Utc::now());
+    event.toolset_name = tool_result.metadata["toolset"]
+        .as_str()
+        .map(|name| name.to_string());
+    event.tool_name = Some(tool_call.name.clone());
+    event.tool_call_id = Some(tool_call_id.to_string());
+    event.arguments = Some(tool_call.arguments.clone());
+    event.metadata = tool_result.metadata.clone();
+    event.is_error = tool_result.is_error;
+    event
 }

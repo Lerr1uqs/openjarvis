@@ -108,6 +108,20 @@ MessageContext = order{
 ## ToolRegistry
 基本工具的使用 bash memory等等
 
+目前是tool提供了thread级别的工具集加载 (后面可能会改？)
+
+### load_toolset/mcp
+我想设计一个渐进式加载的 tool set（或者是MCP，它本质也是一个工具集）。
+
+采取这种方式的原因是，如果一次性把所有工具（非基本工具）都加进去，会导致上下文膨胀。所以我想采用这种渐进式加载和下放的机制：用完就去掉，不占位。
+
+具体实现思路如下：
+1. 先提供一个 prompt，告知其中包含哪些工具集以及相关的基本描述。
+2. 将这些描述放在里面，并提供一个 loader 工具。
+3. 如果需要使用，就通过该 loader 工具进行加载。
+4. 用完了unload
+
+
 ### builtin tools
 遵循pi-agent的四个工具调用 read/write/edit/bash
 
@@ -145,7 +159,36 @@ MCP 归属在 ToolRegistry 内部统一管理 配置入口是 `agent.tool.mcp.se
 ## skill
 - 支持用户配置skill 选择skill 下载skill
 
+## compact
+
 ## memory
+
+除非用户说主动记忆 否则都强制是被动记忆 这个写入记忆调用的prompt
+### active
+当用户输入里出现keyword的时候自动注入记忆
+add_active_memory("keyword", "memory....") 注意一个messages中只能有一个对应记忆(不需要多次注入 这个需要ut 确保多次注入不会多次出现在messages中)
+如何防止多次注入？
+
+我觉得可能就是遍历这个 messages，然后看它匹配前几个。如果说要简单的话，你就直接开一个这种遍历，或者说多线程去直接匹配前面的那个字符串是否相等。
+
+只要第一个字符不相等，那其实就不是了。然后如果前面那个字符串匹配相等，且它整个长度也相等，那就是对的。
+
+不知道有没有这样现成的库或者 API？
+
+remove_active_memory 这个是写入 ~/.openjarvis/memory/active/memory.json 中的
+另外可能还得记录一下时间什么的
+
+### passive
+~/.openjarvis/memory/passive/{daily,history,perference}
+- daily是每日总结
+- history是用户要求agent记住的内容
+- preference是任务结束后提炼出来的用户偏好 
+这三种记忆都是可开关的 也可以使用格外的provider来做 
+下面api都是对: ~/.openjarvis/memory/passive/里面的查询
+- search_memory("kw1,kw2,kw3") 
+- memory_get("daily/2025-12-01.md") # 返回文档内容
+
+memory后端搜索有两种 一种是关键词匹配 + 基于词频的搜索 另外一种是qmd 需要有qmd支持(未来)
 
 # TODO
 记忆

@@ -19,5 +19,8 @@ openjarvis是一个工具使用agent 能够使用浏览器 cli等工具完成主
 # 外部支持
 飞书机器人
 
+# 专题文档
+- Chrome 浏览器自动化调研: `arch/chrome-browser-automation.md`
+
 # 根目录
 ~/.openjarvis/workspace

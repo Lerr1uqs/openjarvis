@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime,
-        HookEvent, HookEventKind, HookHandler, HookRegistry, InfoContext, ToolRegistry,
+        HookEvent, HookEventKind, HookHandler, HookRegistry, InfoContext, ToolCallRequest,
+        ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry, ToolsetCatalogEntry,
+        empty_tool_input_schema,
     },
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
@@ -66,7 +68,7 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
     let emitted_payloads = payloads.lock().await.clone();
 
     assert_eq!(output.reply, "loop-reply");
-    assert_eq!(output.metadata["tool_count"], 4);
+    assert_eq!(output.metadata["tool_count"], 6);
     assert_eq!(output.events.len(), 1);
     assert_eq!(output.turn_messages.len(), 1);
     assert_eq!(output.turn_messages[0].content, "loop-reply");
@@ -103,6 +105,28 @@ impl LLMProvider for RecordingSequenceProvider {
         self.requests.lock().await.push(request);
         let mut responses = self.responses.lock().await;
         Ok(responses.remove(0))
+    }
+}
+
+struct DemoLoopTool;
+
+#[async_trait]
+impl ToolHandler for DemoLoopTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__echo".to_string(),
+            description: "Echo from the demo loop toolset".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "demo tool ok".to_string(),
+            metadata: serde_json::json!({ "toolset": "demo" }),
+            is_error: false,
+        })
     }
 }
 
@@ -366,6 +390,7 @@ async fn agent_loop_executes_namespaced_mcp_tool_calls() {
     let loop_runner = AgentLoop::new(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
+                tool_only_response("load_toolset", serde_json::json!({ "name": "demo_stdio" })),
                 tool_only_response(
                     "mcp__demo_stdio__echo",
                     serde_json::json!({ "text": "来自 agent loop" }),
@@ -381,22 +406,102 @@ async fn agent_loop_executes_namespaced_mcp_tool_calls() {
         .run(input, &build_context("system", "调用 demo MCP"))
         .await
         .expect("loop should succeed");
-    let outgoing = collect_outgoing(outgoing_rx, 3).await;
+    let outgoing = collect_outgoing(outgoing_rx, 5).await;
 
     assert_eq!(output.reply, "MCP 调用完成");
-    assert_eq!(output.metadata["used_tool_name"], "mcp__demo_stdio__echo");
-    assert_eq!(output.metadata["tool_count"], 7);
+    assert_eq!(output.metadata["used_tool_name"], "load_toolset");
+    assert_eq!(
+        output.metadata["used_tool_names"],
+        serde_json::json!(["load_toolset", "mcp__demo_stdio__echo"])
+    );
+    assert_eq!(output.metadata["tool_count"], 9);
     assert_eq!(output.metadata["mcp_server_count"], 1);
     assert_eq!(output.events[0].kind, AgentLoopEventKind::ToolCall);
     assert_eq!(output.events[1].kind, AgentLoopEventKind::ToolResult);
-    assert_eq!(output.events[2].kind, AgentLoopEventKind::TextOutput);
-    assert!(outgoing[0].content.contains("mcp__demo_stdio__echo"));
-    assert!(outgoing[1].content.contains("[demo:stdio] 来自 agent loop"));
-    assert_eq!(outgoing[2].content, "MCP 调用完成");
+    assert_eq!(output.events[2].kind, AgentLoopEventKind::ToolCall);
+    assert_eq!(output.events[3].kind, AgentLoopEventKind::ToolResult);
+    assert_eq!(output.events[4].kind, AgentLoopEventKind::TextOutput);
+    assert!(outgoing[0].content.contains("load_toolset"));
+    assert!(outgoing[2].content.contains("mcp__demo_stdio__echo"));
+    assert!(outgoing[3].content.contains("[demo:stdio] 来自 agent loop"));
+    assert_eq!(outgoing[4].content, "MCP 调用完成");
+    assert_eq!(output.loaded_toolsets, vec!["demo_stdio".to_string()]);
+    assert_eq!(output.tool_events.len(), 2);
     assert_eq!(
-        output.turn_messages[1].content,
+        output.turn_messages[3].content,
         "[demo:stdio] 来自 agent loop"
     );
+}
+
+#[tokio::test]
+async fn agent_loop_refreshes_tools_after_load_and_hides_them_after_unload_in_same_turn() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo toolset for loop refresh"),
+            vec![Arc::new(DemoLoopTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+    let runtime = AgentRuntime::with_parts(Arc::new(HookRegistry::new()), registry);
+    let loop_runner = AgentLoop::new(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response("load_toolset", serde_json::json!({ "name": "demo" })),
+                tool_only_response("demo__echo", serde_json::json!({})),
+                tool_only_response("unload_toolset", serde_json::json!({ "name": "demo" })),
+                text_response("done"),
+            ])),
+        }),
+        runtime,
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(
+            input,
+            &build_context("system", "load demo toolset, use it, then unload it"),
+        )
+        .await
+        .expect("loop should succeed");
+
+    let captured_requests = requests.lock().await;
+    let first_tools = captured_requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let second_tools = captured_requests[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let fourth_tools = captured_requests[3]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let first_messages = captured_requests[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(output.reply, "done");
+    assert!(first_tools.contains(&"load_toolset"));
+    assert!(!first_tools.contains(&"demo__echo"));
+    assert!(second_tools.contains(&"demo__echo"));
+    assert!(!fourth_tools.contains(&"demo__echo"));
+    assert!(
+        first_messages.iter().any(|content| content
+            .contains("Available toolsets:\n- demo: Demo toolset for loop refresh")),
+        "toolset catalog prompt was not injected: {first_messages:?}"
+    );
+    assert!(output.loaded_toolsets.is_empty());
+    assert_eq!(output.tool_events.len(), 3);
+    assert_eq!(output.tool_events[0].toolset_name.as_deref(), Some("demo"));
 }
 
 #[tokio::test]

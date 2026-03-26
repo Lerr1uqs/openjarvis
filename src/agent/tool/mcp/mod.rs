@@ -206,6 +206,7 @@ pub struct McpToolSnapshot {
 struct ManagedMcpServer {
     definition: McpServerDefinition,
     enabled: bool,
+    allow_thread_load: bool,
     state: McpServerState,
     last_error: Option<String>,
     last_checked_at: Option<DateTime<Utc>>,
@@ -261,6 +262,7 @@ impl McpManager {
             ManagedMcpServer {
                 definition,
                 enabled: false,
+                allow_thread_load: true,
                 state: McpServerState::Disabled,
                 last_error: None,
                 last_checked_at: None,
@@ -327,6 +329,35 @@ impl McpManager {
         tools
     }
 
+    /// Ensure one server is enabled and return its currently routed visible tools.
+    pub(crate) async fn ensure_server_tools(&self, name: &str) -> Result<Vec<McpVisibleTool>> {
+        let should_probe = {
+            let servers = self.servers.read().await;
+            let server = servers
+                .get(name)
+                .with_context(|| format!("mcp server `{name}` is not registered"))?;
+            if !server.allow_thread_load {
+                bail!("mcp server `{name}` is disabled");
+            }
+            !server.enabled || server.state != McpServerState::Healthy
+        };
+
+        if should_probe {
+            self.enable_server(name).await?;
+        }
+
+        self.visible_tools_for_server(name).await
+    }
+
+    /// Return the currently routed tools for one MCP server.
+    pub(crate) async fn visible_tools_for_server(&self, name: &str) -> Result<Vec<McpVisibleTool>> {
+        let servers = self.servers.read().await;
+        let server = servers
+            .get(name)
+            .with_context(|| format!("mcp server `{name}` is not registered"))?;
+        Ok(server.discovered_tools.clone())
+    }
+
     /// Enable a server, probe it, and expose its tools if the probe succeeds.
     pub(crate) async fn enable_server(&self, name: &str) -> Result<McpServerSnapshot> {
         let definition = self.server_definition(name).await?;
@@ -342,6 +373,7 @@ impl McpManager {
                         .with_context(|| format!("mcp server `{name}` is not registered"))?;
                     let replaced_client = server.client.take();
                     server.enabled = true;
+                    server.allow_thread_load = true;
                     server.state = McpServerState::Healthy;
                     server.last_error = None;
                     server.last_checked_at = Some(checked_at);
@@ -361,6 +393,7 @@ impl McpManager {
                         .with_context(|| format!("mcp server `{name}` is not registered"))?;
                     let replaced_client = server.client.take();
                     server.enabled = true;
+                    server.allow_thread_load = true;
                     server.state = McpServerState::Unhealthy;
                     server.last_error = Some(error_text.clone());
                     server.last_checked_at = Some(checked_at);
@@ -382,6 +415,7 @@ impl McpManager {
                 .with_context(|| format!("mcp server `{name}` is not registered"))?;
             let replaced_client = server.client.take();
             server.enabled = false;
+            server.allow_thread_load = false;
             server.state = McpServerState::Disabled;
             server.discovered_tools.clear();
             server.last_checked_at = Some(Utc::now());

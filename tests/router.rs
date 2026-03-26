@@ -5,7 +5,7 @@ use clap::Parser;
 use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentLoopEventKind, AgentRequest, AgentRuntime, AgentWorker,
-        AgentWorkerEvent, AgentWorkerHandle, CompletedAgentTurn,
+        AgentWorkerEvent, AgentWorkerHandle, CompletedAgentTurn, FailedAgentTurn,
     },
     channels::{Channel, ChannelRegistration},
     cli::OpenJarvisCli,
@@ -204,6 +204,7 @@ async fn router_external_channel_message_can_trigger_builtin_mcp_when_flag_enabl
     let agent = AgentWorker::with_runtime(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
+                tool_only_response("load_toolset", json!({ "name": BUILTIN_MCP_SERVER_NAME })),
                 tool_only_response(
                     "mcp__builtin_demo_stdio__echo",
                     json!({ "text": "channel hello" }),
@@ -250,7 +251,7 @@ async fn router_external_channel_message_can_trigger_builtin_mcp_when_flag_enabl
     let driver = async {
         timeout(Duration::from_millis(1500), async {
             loop {
-                if sent.lock().await.len() == 3 {
+                if sent.lock().await.len() == 5 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -273,17 +274,23 @@ async fn router_external_channel_message_can_trigger_builtin_mcp_when_flag_enabl
     router_result.expect("router loop should exit cleanly");
 
     let recorded = sent.lock().await.clone();
-    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded.len(), 5);
     assert!(
         recorded[0]
             .content
-            .contains("[openjarvis][tool_call] mcp__builtin_demo_stdio__echo")
+            .contains("[openjarvis][tool_call] load_toolset")
     );
     assert_eq!(recorded[0].metadata["event_kind"], "ToolCall");
-    assert!(recorded[1].content.contains("[demo:stdio] channel hello"));
-    assert_eq!(recorded[1].metadata["event_kind"], "ToolResult");
-    assert_eq!(recorded[2].content, "builtin mcp finished");
-    assert_eq!(recorded[2].metadata["event_kind"], "TextOutput");
+    assert!(
+        recorded[2]
+            .content
+            .contains("[openjarvis][tool_call] mcp__builtin_demo_stdio__echo")
+    );
+    assert_eq!(recorded[2].metadata["event_kind"], "ToolCall");
+    assert!(recorded[3].content.contains("[demo:stdio] channel hello"));
+    assert_eq!(recorded[3].metadata["event_kind"], "ToolResult");
+    assert_eq!(recorded[4].content, "builtin mcp finished");
+    assert_eq!(recorded[4].metadata["event_kind"], "TextOutput");
 }
 
 #[tokio::test]
@@ -311,6 +318,7 @@ async fn router_external_channel_message_can_trigger_mcp_loaded_from_external_js
     let agent = AgentWorker::with_runtime(
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
+                tool_only_response("load_toolset", json!({ "name": "file_demo_stdio" })),
                 tool_only_response(
                     "mcp__file_demo_stdio__echo",
                     json!({ "text": "config hello" }),
@@ -357,7 +365,7 @@ async fn router_external_channel_message_can_trigger_mcp_loaded_from_external_js
     let driver = async {
         timeout(Duration::from_millis(1500), async {
             loop {
-                if sent.lock().await.len() == 3 {
+                if sent.lock().await.len() == 5 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -380,17 +388,23 @@ async fn router_external_channel_message_can_trigger_mcp_loaded_from_external_js
     router_result.expect("router loop should exit cleanly");
 
     let recorded = sent.lock().await.clone();
-    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded.len(), 5);
     assert!(
         recorded[0]
             .content
-            .contains("[openjarvis][tool_call] mcp__file_demo_stdio__echo")
+            .contains("[openjarvis][tool_call] load_toolset")
     );
     assert_eq!(recorded[0].metadata["event_kind"], "ToolCall");
-    assert!(recorded[1].content.contains("[demo:stdio] config hello"));
-    assert_eq!(recorded[1].metadata["event_kind"], "ToolResult");
-    assert_eq!(recorded[2].content, "config mcp finished");
-    assert_eq!(recorded[2].metadata["event_kind"], "TextOutput");
+    assert!(
+        recorded[2]
+            .content
+            .contains("[openjarvis][tool_call] mcp__file_demo_stdio__echo")
+    );
+    assert_eq!(recorded[2].metadata["event_kind"], "ToolCall");
+    assert!(recorded[3].content.contains("[demo:stdio] config hello"));
+    assert_eq!(recorded[3].metadata["event_kind"], "ToolResult");
+    assert_eq!(recorded[4].content, "config mcp finished");
+    assert_eq!(recorded[4].metadata["event_kind"], "TextOutput");
 }
 
 #[tokio::test]
@@ -870,6 +884,117 @@ async fn router_returns_failed_reply_for_unknown_command_without_session_or_agen
 }
 
 #[tokio::test]
+async fn router_failed_turn_replies_with_full_error_chain() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, _request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8);
+    let event_keepalive_tx = event_tx.clone(); // test-only: keeps the downstream event channel alive until explicit shutdown.
+    let sessions = SessionManager::new();
+    let mut router = ChannelRouter::with_session_manager_and_agent_handle(
+        AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        sessions,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let incoming = build_incoming_with(
+        "msg_agent_error",
+        "ou_agent_error",
+        Some("thread_agent_error"),
+        "why did provider fail",
+    );
+    let locator = router.sessions().load_or_create_thread(&incoming).await;
+
+    let send_task = tokio::spawn(async move {
+        event_tx
+            .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
+                locator,
+                incoming,
+                error: "failed to call llm provider `openai_compatible` model `demo-model` at `https://provider.test/v1`: provider said 429: rate limit exceeded".to_string(),
+                loaded_toolsets: Vec::new(),
+                completed_at: Utc::now(),
+            }))
+            .await
+            .expect("failed turn should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("agent error reply should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_keepalive_tx);
+
+    let recorded = sent.lock().await.clone();
+    let history = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_agent_error".to_string(),
+        })
+        .await
+        .expect("session should exist");
+
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].content.contains("[openjarvis][agent_error]"));
+    assert!(
+        recorded[0]
+            .content
+            .contains("provider said 429: rate limit exceeded")
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "AgentError");
+    assert!(
+        recorded[0].metadata["error"]
+            .as_str()
+            .expect("router should preserve failure metadata")
+            .contains("provider said 429: rate limit exceeded")
+    );
+    assert_eq!(history.threads.len(), 1);
+    let thread = history
+        .threads
+        .values()
+        .next()
+        .expect("thread should exist after failed turn");
+    assert_eq!(thread.turns.len(), 1);
+    assert!(
+        thread.turns[0].messages[1]
+            .content
+            .contains("provider said 429: rate limit exceeded")
+    );
+}
+
+#[tokio::test]
 async fn router_command_message_does_not_enter_existing_session() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
@@ -1082,6 +1207,8 @@ fn spawn_mock_agent_loop(
                                 "reply-first",
                                 Utc::now(),
                             )],
+                            loaded_toolsets: Vec::new(),
+                            tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
@@ -1149,6 +1276,8 @@ fn spawn_mock_agent_loop(
                                     Utc::now(),
                                 ),
                             ],
+                            loaded_toolsets: Vec::new(),
+                            tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
@@ -1202,6 +1331,8 @@ fn spawn_truncation_mock_agent_loop(
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: turn_messages,
+                            loaded_toolsets: Vec::new(),
+                            tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
@@ -1230,6 +1361,8 @@ fn spawn_truncation_mock_agent_loop(
                                 "final-after-truncation",
                                 Utc::now(),
                             )],
+                            loaded_toolsets: Vec::new(),
+                            tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
@@ -1275,6 +1408,8 @@ fn spawn_single_turn_mock_agent_loop(
                     "reply-single",
                     Utc::now(),
                 )],
+                loaded_toolsets: Vec::new(),
+                tool_events: Vec::new(),
                 completed_at: Utc::now(),
             }))
             .await

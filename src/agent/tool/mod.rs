@@ -5,6 +5,7 @@ pub mod mcp;
 pub mod read;
 pub mod shell;
 pub mod skill;
+pub mod toolset;
 pub mod write;
 
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
@@ -24,6 +25,7 @@ pub use mcp::{
 pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use skill::{LoadSkillTool, LoadedSkill, LoadedSkillFile, SkillManifest, SkillRegistry};
+pub use toolset::{ThreadToolRuntimeManager, ThreadToolRuntimeSnapshot, ToolsetCatalogEntry};
 pub use write::WriteTool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,9 +129,26 @@ pub trait ToolHandler: Send + Sync {
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult>;
 }
 
+#[derive(Clone)]
+struct StaticToolsetDefinition {
+    entry: ToolsetCatalogEntry,
+    handlers: HashMap<String, Arc<dyn ToolHandler>>,
+}
+
+#[derive(Clone)]
+enum RegisteredToolset {
+    Static(StaticToolsetDefinition),
+    McpServer {
+        entry: ToolsetCatalogEntry,
+        server_name: String,
+    },
+}
+
 pub struct ToolRegistry {
     // AGENT-TODO: 对String起别名
-    handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
+    always_visible_handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
+    toolsets: RwLock<HashMap<String, RegisteredToolset>>,
+    thread_runtimes: Arc<toolset::ThreadToolRuntimeManager>,
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
 }
@@ -157,11 +176,22 @@ where
         .with_context(|| format!("invalid `{tool_name}` tool arguments"))
 }
 
+impl RegisteredToolset {
+    fn entry(&self) -> ToolsetCatalogEntry {
+        match self {
+            Self::Static(definition) => definition.entry.clone(),
+            Self::McpServer { entry, .. } => entry.clone(),
+        }
+    }
+}
+
 impl ToolRegistry {
     /// Create an empty tool registry.
     pub fn new() -> Self {
         Self {
-            handlers: RwLock::new(HashMap::new()),
+            always_visible_handlers: RwLock::new(HashMap::new()),
+            toolsets: RwLock::new(HashMap::new()),
+            thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::new()),
         }
@@ -182,7 +212,9 @@ impl ToolRegistry {
     /// ```
     pub fn with_skill_roots(skill_roots: Vec<PathBuf>) -> Self {
         Self {
-            handlers: RwLock::new(HashMap::new()),
+            always_visible_handlers: RwLock::new(HashMap::new()),
+            toolsets: RwLock::new(HashMap::new()),
+            thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
         }
@@ -216,19 +248,73 @@ impl ToolRegistry {
         let registry = Self::with_skill_roots(skill_roots);
         let definitions = build_mcp_server_definitions(config)?;
         registry.mcp.load_definitions(definitions).await?;
-        registry.sync_mcp_handlers().await;
+        registry.sync_mcp_toolsets().await?;
         Ok(registry)
     }
 
     /// Register one tool handler by its unique tool name.
     pub async fn register(&self, handler: Arc<dyn ToolHandler>) -> Result<()> {
         let definition = handler.definition();
-        let mut handlers = self.handlers.write().await;
+        self.ensure_tool_name_available(&definition.name).await?;
+        let mut handlers = self.always_visible_handlers.write().await;
         if handlers.contains_key(&definition.name) {
             bail!("tool `{}` is already registered", definition.name);
         }
 
         handlers.insert(definition.name, handler);
+        Ok(())
+    }
+
+    /// Register one program-defined static toolset backed by concrete tool handlers.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::agent::{ReadTool, ToolRegistry, ToolsetCatalogEntry};
+    /// use std::sync::Arc;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// registry
+    ///     .register_toolset(
+    ///         ToolsetCatalogEntry::new("files", "Extra file helpers"),
+    ///         vec![Arc::new(ReadTool::new())],
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn register_toolset(
+        &self,
+        entry: ToolsetCatalogEntry,
+        handlers: Vec<Arc<dyn ToolHandler>>,
+    ) -> Result<()> {
+        validate_toolset_name(&entry.name)?;
+
+        let mut routed_handlers = HashMap::new();
+        for handler in handlers {
+            let definition = handler.definition();
+            if routed_handlers.contains_key(&definition.name) {
+                bail!(
+                    "toolset `{}` contains duplicate tool `{}`",
+                    entry.name,
+                    definition.name
+                );
+            }
+            self.ensure_tool_name_available(&definition.name).await?;
+            routed_handlers.insert(definition.name, handler);
+        }
+
+        let mut toolsets = self.toolsets.write().await;
+        if toolsets.contains_key(&entry.name) {
+            bail!("toolset `{}` is already registered", entry.name);
+        }
+        toolsets.insert(
+            entry.name.clone(),
+            RegisteredToolset::Static(StaticToolsetDefinition {
+                entry,
+                handlers: routed_handlers,
+            }),
+        );
         Ok(())
     }
 
@@ -245,7 +331,12 @@ impl ToolRegistry {
 
     /// Look up a registered tool and execute the request.
     pub async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
-        let handler = self.handlers.read().await.get(&request.name).cloned();
+        let handler = self
+            .always_visible_handlers
+            .read()
+            .await
+            .get(&request.name)
+            .cloned();
 
         let Some(handler) = handler else {
             bail!("tool `{}` is not registered", request.name);
@@ -257,7 +348,7 @@ impl ToolRegistry {
     /// Return all registered tool definitions.
     pub async fn list(&self) -> Vec<ToolDefinition> {
         let mut definitions = self
-            .handlers
+            .always_visible_handlers
             .read()
             .await
             .values()
@@ -265,6 +356,116 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
         definitions
+    }
+
+    /// Return the thread-scoped visible tool definitions for one internal thread id.
+    pub async fn list_for_thread(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
+        let mut definitions = self.list().await;
+        definitions.push(load_toolset_definition());
+        definitions.push(unload_toolset_definition());
+
+        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+        for toolset_name in loaded_toolsets {
+            definitions.extend(
+                self.resolve_toolset_handlers(&toolset_name)
+                    .await?
+                    .into_values()
+                    .map(|handler| handler.definition()),
+            );
+        }
+
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(definitions)
+    }
+
+    /// Execute one tool request within the current internal thread runtime.
+    pub async fn call_for_thread(
+        &self,
+        thread_id: &str,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        match request.name.as_str() {
+            "load_toolset" => self.load_toolset(thread_id, request).await,
+            "unload_toolset" => self.unload_toolset(thread_id, request).await,
+            _ => {
+                if let Some(handler) = self
+                    .always_visible_handlers
+                    .read()
+                    .await
+                    .get(&request.name)
+                    .cloned()
+                {
+                    return handler.call(request).await;
+                }
+
+                let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+                for toolset_name in loaded_toolsets {
+                    let handlers = self.resolve_toolset_handlers(&toolset_name).await?;
+                    if let Some(handler) = handlers.get(&request.name).cloned() {
+                        return handler.call(request).await;
+                    }
+                }
+
+                bail!(
+                    "tool `{}` is not registered for thread `{}`",
+                    request.name,
+                    thread_id
+                )
+            }
+        }
+    }
+
+    /// Return the compact toolset catalog prompt for one internal thread.
+    pub async fn catalog_prompt(&self, thread_id: &str) -> Option<String> {
+        let entries = self.list_toolsets().await;
+        if entries.is_empty() {
+            return None;
+        }
+
+        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+        let loaded_summary = if loaded_toolsets.is_empty() {
+            "none".to_string()
+        } else {
+            loaded_toolsets.join(", ")
+        };
+        let catalog = entries
+            .into_iter()
+            .map(|entry| format!("- {}: {}", entry.name, entry.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Some(format!(
+            "You can progressively load optional toolsets with `load_toolset` and remove them with `unload_toolset`.\nAvailable toolsets:\n{catalog}\nCurrently loaded toolsets for this thread: {loaded_summary}"
+        ))
+    }
+
+    /// Return the program-defined toolset catalog entries.
+    pub async fn list_toolsets(&self) -> Vec<ToolsetCatalogEntry> {
+        let mut entries = self
+            .toolsets
+            .read()
+            .await
+            .values()
+            .map(RegisteredToolset::entry)
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
+    }
+
+    /// Replace one thread runtime from persisted thread metadata.
+    pub async fn rehydrate_thread(
+        &self,
+        thread_id: &str,
+        loaded_toolsets: &[String],
+    ) -> ThreadToolRuntimeSnapshot {
+        self.thread_runtimes
+            .replace_loaded_toolsets(thread_id, loaded_toolsets)
+            .await
+    }
+
+    /// Return the loaded toolset names for one internal thread.
+    pub async fn loaded_toolsets_for_thread(&self, thread_id: &str) -> Vec<String> {
+        self.thread_runtimes.loaded_toolsets(thread_id).await
     }
 
     /// Return the MCP management API exposed by this tool registry.
@@ -280,29 +481,102 @@ impl ToolRegistry {
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
         // Register the handler only when the name is not present yet.
         let definition = handler.definition();
-        let mut handlers = self.handlers.write().await;
+        let mut handlers = self.always_visible_handlers.write().await;
         handlers.entry(definition.name).or_insert(handler);
     }
 
-    async fn sync_mcp_handlers(&self) {
-        let visible_tools = self.mcp.visible_tools().await;
-        let mut handlers = self.handlers.write().await;
-        handlers.retain(|_, handler| !matches!(handler.definition().source, ToolSource::Mcp(_)));
+    async fn ensure_tool_name_available(&self, tool_name: &str) -> Result<()> {
+        if self
+            .always_visible_handlers
+            .read()
+            .await
+            .contains_key(tool_name)
+        {
+            bail!("tool `{tool_name}` is already registered");
+        }
 
-        for visible_tool in visible_tools {
-            handlers.insert(
-                visible_tool.definition.name.clone(),
-                Arc::new(mcp::McpToolHandler::new(
-                    Arc::clone(&self.mcp),
-                    visible_tool,
-                )),
-            );
+        let toolsets = self.toolsets.read().await;
+        for toolset in toolsets.values() {
+            if let RegisteredToolset::Static(definition) = toolset
+                && definition.handlers.contains_key(tool_name)
+            {
+                bail!("tool `{tool_name}` is already owned by another toolset");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_toolset_handlers(
+        &self,
+        toolset_name: &str,
+    ) -> Result<HashMap<String, Arc<dyn ToolHandler>>> {
+        let toolset = self.toolsets.read().await.get(toolset_name).cloned();
+        let Some(toolset) = toolset else {
+            bail!("toolset `{toolset_name}` is not registered");
+        };
+
+        match toolset {
+            RegisteredToolset::Static(definition) => Ok(definition.handlers),
+            RegisteredToolset::McpServer { server_name, .. } => {
+                let visible_tools = self.mcp.ensure_server_tools(&server_name).await?;
+                Ok(visible_tools
+                    .into_iter()
+                    .map(|visible_tool| {
+                        let tool_name = visible_tool.definition.name.clone();
+                        (
+                            tool_name,
+                            Arc::new(mcp::McpToolHandler::new(
+                                Arc::clone(&self.mcp),
+                                visible_tool,
+                            )) as Arc<dyn ToolHandler>,
+                        )
+                    })
+                    .collect())
+            }
         }
     }
 
+    async fn sync_mcp_toolsets(&self) -> Result<()> {
+        let servers = self.mcp.list_servers().await;
+        let always_visible_handlers = self.always_visible_handlers.read().await;
+        let mut toolsets = self.toolsets.write().await;
+
+        toolsets.retain(|_, toolset| !matches!(toolset, RegisteredToolset::McpServer { .. }));
+        for server in servers {
+            if always_visible_handlers.contains_key(&server.name) {
+                bail!(
+                    "toolset `{}` conflicts with an always-visible tool name",
+                    server.name
+                );
+            }
+            if toolsets.contains_key(&server.name) {
+                bail!("toolset `{}` is already registered", server.name);
+            }
+
+            toolsets.insert(
+                server.name.clone(),
+                RegisteredToolset::McpServer {
+                    entry: ToolsetCatalogEntry::new(
+                        server.name.clone(),
+                        format!(
+                            "Curated MCP toolset from server `{}` over `{}`.",
+                            server.name,
+                            server.transport.as_str()
+                        ),
+                    ),
+                    server_name: server.name,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
     async fn sync_skill_handlers(&self) {
-        let mut handlers = self.handlers.write().await;
-        if self.skills.has_enabled_skills().await {
+        let has_enabled_skills = self.skills.has_enabled_skills().await;
+        let mut handlers = self.always_visible_handlers.write().await;
+        if has_enabled_skills {
             handlers.insert(
                 "load_skill".to_string(),
                 Arc::new(skill::LoadSkillTool::new(Arc::clone(&self.skills))),
@@ -310,6 +584,77 @@ impl ToolRegistry {
         } else {
             handlers.remove("load_skill");
         }
+    }
+
+    async fn load_toolset(
+        &self,
+        thread_id: &str,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        let args: ManageToolsetArguments = parse_tool_arguments(request, "load_toolset")?;
+        let toolset_name = args.name.trim();
+        if toolset_name.is_empty() {
+            bail!("load_toolset requires a non-empty `name`");
+        }
+
+        self.resolve_toolset_handlers(toolset_name).await?;
+        let inserted = self
+            .thread_runtimes
+            .load_toolset(thread_id, toolset_name)
+            .await;
+        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+
+        Ok(ToolCallResult {
+            content: if inserted {
+                format!("Toolset `{toolset_name}` loaded for the current thread.")
+            } else {
+                format!("Toolset `{toolset_name}` was already loaded for the current thread.")
+            },
+            metadata: json!({
+                "event_kind": "load_toolset",
+                "toolset": toolset_name,
+                "loaded_toolsets": loaded_toolsets,
+                "already_loaded": !inserted,
+                "approval_required": false,
+                "policy_extension_point": true,
+            }),
+            is_error: false,
+        })
+    }
+
+    async fn unload_toolset(
+        &self,
+        thread_id: &str,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        let args: ManageToolsetArguments = parse_tool_arguments(request, "unload_toolset")?;
+        let toolset_name = args.name.trim();
+        if toolset_name.is_empty() {
+            bail!("unload_toolset requires a non-empty `name`");
+        }
+
+        let removed = self
+            .thread_runtimes
+            .unload_toolset(thread_id, toolset_name)
+            .await;
+        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+
+        Ok(ToolCallResult {
+            content: if removed {
+                format!("Toolset `{toolset_name}` unloaded for the current thread.")
+            } else {
+                format!("Toolset `{toolset_name}` was not loaded for the current thread.")
+            },
+            metadata: json!({
+                "event_kind": "unload_toolset",
+                "toolset": toolset_name,
+                "loaded_toolsets": loaded_toolsets,
+                "was_loaded": removed,
+                "approval_required": false,
+                "policy_extension_point": true,
+            }),
+            is_error: false,
+        })
     }
 }
 
@@ -348,21 +693,21 @@ impl<'a> ToolRegistryMcpApi<'a> {
     /// Enable one managed MCP server and sync its tools into the registry.
     pub async fn enable_server(&self, name: &str) -> Result<McpServerSnapshot> {
         let snapshot = self.registry.mcp.enable_server(name).await?;
-        self.registry.sync_mcp_handlers().await;
+        self.registry.sync_mcp_toolsets().await?;
         Ok(snapshot)
     }
 
     /// Disable one managed MCP server and remove its tools from the registry.
     pub async fn disable_server(&self, name: &str) -> Result<McpServerSnapshot> {
         let snapshot = self.registry.mcp.disable_server(name).await?;
-        self.registry.sync_mcp_handlers().await;
+        self.registry.sync_mcp_toolsets().await?;
         Ok(snapshot)
     }
 
     /// Refresh one managed MCP server and sync any tool changes.
     pub async fn refresh_server(&self, name: &str) -> Result<McpServerSnapshot> {
         let snapshot = self.registry.mcp.refresh_server(name).await?;
-        self.registry.sync_mcp_handlers().await;
+        self.registry.sync_mcp_toolsets().await?;
         Ok(snapshot)
     }
 }
@@ -419,6 +764,27 @@ impl<'a> ToolRegistrySkillApi<'a> {
     pub async fn load(&self, name: &str) -> Result<LoadedSkill> {
         self.registry.skills.load(name).await
     }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ManageToolsetArguments {
+    /// Exact program-defined toolset name to load or unload.
+    name: String,
+}
+
+fn load_toolset_definition() -> ToolDefinition {
+    tool_definition_from_args::<ManageToolsetArguments>(
+        "load_toolset",
+        "Load one program-defined toolset into the current internal thread so its tools become visible in later model steps.",
+    )
+}
+
+fn unload_toolset_definition() -> ToolDefinition {
+    tool_definition_from_args::<ManageToolsetArguments>(
+        "unload_toolset",
+        "Unload one program-defined toolset from the current internal thread so its tools disappear from later model steps.",
+    )
 }
 
 /// Return an empty object schema for tools that currently do not accept any arguments.
@@ -478,4 +844,11 @@ fn build_mcp_server_definition(
             url: Some(url.clone()),
         }),
     }
+}
+
+fn validate_toolset_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("toolset name must not be blank");
+    }
+    Ok(())
 }

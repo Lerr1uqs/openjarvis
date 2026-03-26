@@ -1,11 +1,41 @@
+use anyhow::Result;
+use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
+    agent::{
+        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
+        ToolsetCatalogEntry, empty_tool_input_schema,
+    },
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     model::{IncomingMessage, ReplyTarget},
     session::{SessionKey, SessionManager, SessionStrategy},
+    thread::{ThreadToolEvent, ThreadToolEventKind},
 };
 use serde_json::json;
+use std::sync::Arc;
 use uuid::Uuid;
+
+struct DemoSessionTool;
+
+#[async_trait]
+impl ToolHandler for DemoSessionTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__echo".to_string(),
+            description: "Echo from the demo session toolset".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "session-demo".to_string(),
+            metadata: json!({ "toolset": "demo" }),
+            is_error: false,
+        })
+    }
+}
 
 #[tokio::test]
 async fn store_and_load_turn_creates_session_state() {
@@ -176,6 +206,137 @@ async fn load_or_create_thread_reuses_internal_uuid_for_same_external_thread() {
     assert_eq!(first_locator.external_thread_id, "ext_thread_1");
     assert_eq!(second_locator.external_thread_id, "ext_thread_1");
     assert_eq!(first_locator.thread_id, second_locator.thread_id);
+}
+
+#[tokio::test]
+async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
+    let manager = SessionManager::new();
+    let incoming = build_incoming("msg_tool_state", "hello tool state");
+    let locator = manager.load_or_create_thread(&incoming).await;
+    let tool_event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, Utc::now());
+        event.toolset_name = Some("demo".to_string());
+        event.tool_name = Some("load_toolset".to_string());
+        event
+    };
+
+    manager
+        .store_turn_with_state(
+            &locator,
+            incoming.external_message_id.clone(),
+            vec![ChatMessage::new(
+                ChatMessageRole::User,
+                "hello tool state",
+                incoming.received_at,
+            )],
+            incoming.received_at,
+            Utc::now(),
+            vec!["demo".to_string()],
+            vec![tool_event],
+        )
+        .await;
+
+    let thread_state = manager.load_thread_state(&locator).await;
+
+    assert_eq!(thread_state.loaded_toolsets, vec!["demo".to_string()]);
+    assert_eq!(thread_state.tool_events.len(), 1);
+    assert_eq!(
+        thread_state.tool_events[0].toolset_name.as_deref(),
+        Some("demo")
+    );
+    assert!(thread_state.tool_events[0].turn_id.is_some());
+}
+
+#[tokio::test]
+async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
+    let manager = SessionManager::new();
+    let incoming = build_incoming("msg_rehydrate", "rehydrate demo");
+    let locator = manager.load_or_create_thread(&incoming).await;
+
+    manager
+        .store_turn_with_state(
+            &locator,
+            incoming.external_message_id.clone(),
+            vec![ChatMessage::new(
+                ChatMessageRole::User,
+                "rehydrate demo",
+                incoming.received_at,
+            )],
+            incoming.received_at,
+            Utc::now(),
+            vec!["demo".to_string()],
+            Vec::new(),
+        )
+        .await;
+
+    let registry = ToolRegistry::new();
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo runtime reconstruction toolset"),
+            vec![Arc::new(DemoSessionTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+
+    let thread_state = manager.load_thread_state(&locator).await;
+    registry
+        .rehydrate_thread(
+            &locator.thread_id.to_string(),
+            &thread_state.loaded_toolsets,
+        )
+        .await;
+    let visible_tools = registry
+        .list_for_thread(&locator.thread_id.to_string())
+        .await
+        .expect("rehydrated runtime should expose loaded toolset tools");
+
+    assert!(visible_tools.iter().any(|tool| tool.name == "demo__echo"));
+}
+
+#[tokio::test]
+async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user() {
+    let manager = SessionManager::new();
+    let first_incoming = build_incoming_with_thread("msg_a", "hello a", Some("thread_a"));
+    let second_incoming = build_incoming_with_thread("msg_b", "hello b", Some("thread_b"));
+    let first_locator = manager.load_or_create_thread(&first_incoming).await;
+    let second_locator = manager.load_or_create_thread(&second_incoming).await;
+
+    manager
+        .store_turn_with_state(
+            &first_locator,
+            first_incoming.external_message_id.clone(),
+            vec![ChatMessage::new(
+                ChatMessageRole::User,
+                "hello a",
+                first_incoming.received_at,
+            )],
+            first_incoming.received_at,
+            Utc::now(),
+            vec!["demo_a".to_string()],
+            Vec::new(),
+        )
+        .await;
+    manager
+        .store_turn_with_state(
+            &second_locator,
+            second_incoming.external_message_id.clone(),
+            vec![ChatMessage::new(
+                ChatMessageRole::User,
+                "hello b",
+                second_incoming.received_at,
+            )],
+            second_incoming.received_at,
+            Utc::now(),
+            vec!["demo_b".to_string()],
+            Vec::new(),
+        )
+        .await;
+
+    let first_state = manager.load_thread_state(&first_locator).await;
+    let second_state = manager.load_thread_state(&second_locator).await;
+
+    assert_eq!(first_state.loaded_toolsets, vec!["demo_a".to_string()]);
+    assert_eq!(second_state.loaded_toolsets, vec!["demo_b".to_string()]);
 }
 
 fn build_incoming(message_id: &str, content: &str) -> IncomingMessage {

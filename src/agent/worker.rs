@@ -10,6 +10,7 @@ use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::llm::{LLMProvider, build_provider};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
+use crate::thread::ThreadToolEvent;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub struct AgentRequest {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub history: Vec<ChatMessage>,
+    pub loaded_toolsets: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,8 @@ pub struct CompletedAgentTurn {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub messages: Vec<ChatMessage>,
+    pub loaded_toolsets: Vec<String>,
+    pub tool_events: Vec<ThreadToolEvent>,
     pub completed_at: DateTime<Utc>,
 }
 
@@ -36,6 +40,7 @@ pub struct FailedAgentTurn {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub error: String,
+    pub loaded_toolsets: Vec<String>,
     pub completed_at: DateTime<Utc>,
 }
 
@@ -155,7 +160,10 @@ impl AgentWorker {
     ) {
         while let Some(request) = request_rx.recv().await {
             if let Err(error) = self.handle_request(request, event_tx.clone()).await {
-                warn!(error = %error, "agent worker failed to handle request");
+                warn!(
+                    error = %format!("{error:#}"),
+                    "agent worker failed to handle request"
+                );
             }
         }
     }
@@ -165,6 +173,12 @@ impl AgentWorker {
         request: AgentRequest,
         event_tx: mpsc::Sender<AgentWorkerEvent>,
     ) -> Result<AgentLoopOutput> {
+        let internal_thread_id = request.locator.thread_id.to_string();
+        self.agent_loop
+            .runtime()
+            .tools()
+            .rehydrate_thread(&internal_thread_id, &request.loaded_toolsets)
+            .await;
         let context = build_context(&self.system_prompt, &request.history, &request.incoming);
         let (dispatch_tx, mut dispatch_rx) = mpsc::channel(128);
         let forward_event_tx = event_tx.clone();
@@ -186,7 +200,7 @@ impl AgentWorker {
                 InfoContext {
                     channel: request.incoming.channel.clone(),
                     user_id: request.incoming.user_id.clone(),
-                    thread_id: request.locator.external_thread_id.clone(),
+                    thread_id: internal_thread_id.clone(),
                     event_tx: AgentEventSender::new(
                         dispatch_tx,
                         request.incoming.channel.clone(),
@@ -215,6 +229,8 @@ impl AgentWorker {
                         locator: request.locator,
                         incoming: request.incoming,
                         messages: loop_output.turn_messages.clone(),
+                        loaded_toolsets: loop_output.loaded_toolsets.clone(),
+                        tool_events: loop_output.tool_events.clone(),
                         completed_at,
                     }))
                     .await
@@ -223,19 +239,26 @@ impl AgentWorker {
             }
             Err(error) => {
                 let completed_at = Utc::now();
-                let error_message = error.to_string();
+                let error_message = format!("{error:#}");
+                let loaded_toolsets = self
+                    .agent_loop
+                    .runtime()
+                    .tools()
+                    .loaded_toolsets_for_thread(&internal_thread_id)
+                    .await;
                 event_tx
                     .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
                         locator: request.locator,
                         incoming: request.incoming,
                         error: error_message.clone(),
+                        loaded_toolsets,
                         completed_at,
                     }))
                     .await
                     .map_err(|send_error| {
                         anyhow::anyhow!("failed to report failed turn: {send_error}")
                     })?;
-                Err(anyhow::anyhow!(error_message))
+                Err(error)
             }
         }
     }

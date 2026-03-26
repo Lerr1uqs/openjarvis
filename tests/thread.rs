@@ -1,7 +1,7 @@
 use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
-    thread::ConversationThread,
+    thread::{ConversationThread, ThreadToolEvent, ThreadToolEventKind},
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -151,4 +151,33 @@ fn retain_latest_messages_with_zero_clears_all_turns() {
 
     assert!(thread.turns.is_empty());
     assert!(thread.load_messages().is_empty());
+}
+
+#[test]
+fn store_turn_state_persists_loaded_toolsets_and_tool_events() {
+    let now = Utc::now();
+    let mut thread = ConversationThread::new("default", now);
+    let event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
+        event.toolset_name = Some("browser".to_string());
+        event.tool_name = Some("load_toolset".to_string());
+        event
+    };
+
+    let turn_id = thread.store_turn_state(
+        Some("msg_1".to_string()),
+        vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+        now,
+        now,
+        vec!["browser".to_string()],
+        vec![event],
+    );
+
+    assert_eq!(thread.load_toolsets(), vec!["browser".to_string()]);
+    assert_eq!(thread.load_tool_events().len(), 1);
+    assert_eq!(
+        thread.load_tool_events()[0].toolset_name.as_deref(),
+        Some("browser")
+    );
+    assert_eq!(thread.load_tool_events()[0].turn_id, Some(turn_id));
 }

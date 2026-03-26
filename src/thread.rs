@@ -3,6 +3,7 @@
 use crate::context::{ChatMessage, ChatMessageRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,11 +57,76 @@ impl ConversationTurn {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ThreadToolEventKind {
+    LoadToolset,
+    UnloadToolset,
+    ExecuteTool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadToolEvent {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<Uuid>,
+    pub kind: ThreadToolEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+    #[serde(default = "default_tool_event_metadata")]
+    pub metadata: Value,
+    #[serde(default)]
+    pub is_error: bool,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl ThreadToolEvent {
+    /// Create one structured thread tool event without a bound turn id.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{ThreadToolEvent, ThreadToolEventKind};
+    ///
+    /// let event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, Utc::now());
+    /// assert!(event.turn_id.is_none());
+    /// ```
+    pub fn new(kind: ThreadToolEventKind, recorded_at: DateTime<Utc>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            turn_id: None,
+            kind,
+            toolset_name: None,
+            tool_name: None,
+            tool_call_id: None,
+            arguments: None,
+            metadata: default_tool_event_metadata(),
+            is_error: false,
+            recorded_at,
+        }
+    }
+
+    /// Attach the stored turn id after the owning turn has been created.
+    pub fn with_turn_id(mut self, turn_id: Uuid) -> Self {
+        self.turn_id = Some(turn_id);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationThread {
     pub id: Uuid,
     pub external_thread_id: String,
     pub turns: Vec<ConversationTurn>,
+    #[serde(default)]
+    pub loaded_toolsets: Vec<String>,
+    #[serde(default)]
+    pub tool_events: Vec<ThreadToolEvent>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -97,6 +163,8 @@ impl ConversationThread {
             id,
             external_thread_id: external_thread_id.into(),
             turns: Vec::new(),
+            loaded_toolsets: Vec::new(),
+            tool_events: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -182,6 +250,47 @@ impl ConversationThread {
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     ) -> Uuid {
+        self.store_turn_state(
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Store one normalized turn payload together with persisted tool runtime state.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::context::{ChatMessage, ChatMessageRole};
+    /// use openjarvis::thread::ConversationThread;
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = ConversationThread::new("default", now);
+    /// let turn_id = thread.store_turn_state(
+    ///     Some("msg_1".to_string()),
+    ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+    ///     now,
+    ///     now,
+    ///     vec!["browser".to_string()],
+    ///     Vec::new(),
+    /// );
+    ///
+    /// assert_eq!(thread.turns[0].id, turn_id);
+    /// assert_eq!(thread.loaded_toolsets, vec!["browser".to_string()]);
+    /// ```
+    pub fn store_turn_state(
+        &mut self,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        loaded_toolsets: Vec<String>,
+        tool_events: Vec<ThreadToolEvent>,
+    ) -> Uuid {
         let turn_id = {
             let turn = self.load_or_create_turn(
                 external_message_id,
@@ -194,6 +303,12 @@ impl ConversationThread {
             turn.completed_at = completed_at;
             turn.id
         };
+        self.loaded_toolsets = normalize_loaded_toolsets(loaded_toolsets);
+        self.tool_events.extend(
+            tool_events
+                .into_iter()
+                .map(|event| event.with_turn_id(turn_id)),
+        );
         self.updated_at = completed_at;
         turn_id
     }
@@ -272,4 +387,25 @@ impl ConversationThread {
             .flat_map(|turn| turn.messages.iter().cloned())
             .collect()
     }
+
+    /// Return the persisted loaded toolsets for the thread.
+    pub fn load_toolsets(&self) -> Vec<String> {
+        self.loaded_toolsets.clone()
+    }
+
+    /// Return the persisted structured tool event history.
+    pub fn load_tool_events(&self) -> Vec<ThreadToolEvent> {
+        self.tool_events.clone()
+    }
+}
+
+fn normalize_loaded_toolsets(mut loaded_toolsets: Vec<String>) -> Vec<String> {
+    loaded_toolsets.retain(|name| !name.trim().is_empty());
+    loaded_toolsets.sort();
+    loaded_toolsets.dedup();
+    loaded_toolsets
+}
+
+fn default_tool_event_metadata() -> Value {
+    json!({})
 }

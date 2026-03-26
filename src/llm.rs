@@ -159,7 +159,12 @@ impl LLMProvider for OpenaiProvider {
             .chat()
             .create(build_openai_request(&self.config, request)?)
             .await
-            .context("failed to call llm provider")?;
+            .with_context(|| {
+                format!(
+                    "failed to call llm provider `{}` model `{}` at `{}`",
+                    self.config.provider, self.config.model, self.config.base_url
+                )
+            })?;
         let choice = response
             .choices
             .into_iter()

@@ -149,8 +149,25 @@ async fn tool_registry_manages_stdio_mcp_server_lifecycle() {
         ]
     );
 
-    let definitions = registry.list().await;
-    assert_eq!(definitions.len(), 3);
+    let toolsets = registry.list_toolsets().await;
+    assert_eq!(toolsets.len(), 1);
+    assert_eq!(toolsets[0].name, "demo_stdio");
+    let thread_id = "thread_demo_stdio";
+    registry
+        .call_for_thread(
+            thread_id,
+            ToolCallRequest {
+                name: "load_toolset".to_string(),
+                arguments: json!({ "name": "demo_stdio" }),
+            },
+        )
+        .await
+        .expect("demo stdio toolset should load");
+    let definitions = registry
+        .list_for_thread(thread_id)
+        .await
+        .expect("thread-scoped definitions should list loaded MCP tools");
+    assert_eq!(definitions.len(), 5);
     let echo_definition = definitions
         .iter()
         .find(|definition| definition.name == "mcp__demo_stdio__echo")
@@ -163,10 +180,13 @@ async fn tool_registry_manages_stdio_mcp_server_lifecycle() {
     ));
 
     let echo_result = registry
-        .call(ToolCallRequest {
-            name: "mcp__demo_stdio__echo".to_string(),
-            arguments: json!({ "text": "ping" }),
-        })
+        .call_for_thread(
+            thread_id,
+            ToolCallRequest {
+                name: "mcp__demo_stdio__echo".to_string(),
+                arguments: json!({ "text": "ping" }),
+            },
+        )
         .await
         .expect("echo tool should succeed");
     assert_eq!(echo_result.content, "[demo:stdio] ping");
@@ -198,13 +218,16 @@ async fn tool_registry_manages_stdio_mcp_server_lifecycle() {
     assert_eq!(refreshed_disabled_snapshot.state, McpServerState::Disabled);
 
     let error = registry
-        .call(ToolCallRequest {
-            name: "mcp__demo_stdio__echo".to_string(),
-            arguments: json!({ "text": "ping" }),
-        })
+        .call_for_thread(
+            thread_id,
+            ToolCallRequest {
+                name: "mcp__demo_stdio__echo".to_string(),
+                arguments: json!({ "text": "ping" }),
+            },
+        )
         .await
         .expect_err("disabled MCP tool should be removed from registry");
-    assert!(error.to_string().contains("not registered"));
+    assert!(error.to_string().contains("disabled"));
 }
 
 #[tokio::test]
