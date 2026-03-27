@@ -1,6 +1,6 @@
 - [ ] Session的postgralsql落盘
 - [ ] agent的Outgoing返回
-- [ ] 飞书发送的限流阀（延时
+- [ ] 飞书发送的限流阀（延时 消息缓冲层？
 - [ ] hook改为agenthook 因为可能有其他种hook后面要添加
 - [x] session manager是全局的 
 - [ ] 外部user传入消息 通过名字对content序列化一下
@@ -11,6 +11,7 @@
 - [ ] command 能够解析用户输入转换为格式化的schema从而进行execute
 - [ ] tiktoken + 占用图
 - [ ] llm provider掉线重试方式？
+- [ ] searching tool tavily brave metaso
 
 # clean
 - [ ] sidecar
