@@ -4,6 +4,7 @@ pub mod agent;
 pub mod channels;
 pub mod cli;
 pub mod command;
+pub mod compact;
 pub mod config;
 pub mod context;
 pub mod llm;

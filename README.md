@@ -79,6 +79,16 @@ llm:
   api_key: ""
   api_key_path: ""
   mock_response: "[openjarvis][DEBUG] 测试回复"
+  context_window_tokens: 8192
+  tokenizer: "chars_div4"
+
+agent:
+  compact:
+    enabled: false
+    auto_compact: false
+    runtime_threshold_ratio: 0.85
+    tool_visible_threshold_ratio: 0.70
+    reserved_output_tokens: 1024
 ```
 
 ## Feishu 接入要求
@@ -119,7 +129,17 @@ llm:
 - `llm.base_url`
 - `llm.api_key` 或 `llm.api_key_path`
 - `llm.model`
+- `llm.context_window_tokens`
+- `llm.tokenizer`，当前内置 `chars_div4`
 - agent 的默认 system prompt 当前写死在代码里，不走配置文件
+
+如果你要开启 runtime compact / auto-compact，还需要：
+
+- `agent.compact.enabled: true`
+- `agent.compact.runtime_threshold_ratio`
+- `agent.compact.tool_visible_threshold_ratio`
+- `agent.compact.reserved_output_tokens`
+- `agent.compact.auto_compact: true` 时，模型会收到预算信息，并在软阈值后看到 `compact` 工具
 
 ## 当前限制
 
@@ -128,6 +148,7 @@ llm:
 - 长连接入口当前通过官方 Node SDK sidecar 接入，再转给 Rust router
 - 当前这版运行时未实现 webhook 模式
 - 当前 ReAct loop 只支持一轮工具调用
+- compact 当前只压缩线程 `chat`，不会压缩 `system` 和 `memory`
 - 工具已经注册，但还没有做权限审批和沙箱隔离
 - 不支持 session/memory/thread 持久化
 - 当前虽然走 `register_channels` 批量注册，但实际只内置了 `feishu` 一个 channel

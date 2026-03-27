@@ -1,9 +1,11 @@
 use chrono::Utc;
 use openjarvis::{
-    command::{CommandInvocation, CommandRegistry},
+    command::{CommandInvocation, CommandRegistry, register_runtime_commands},
+    compact::CompactRuntimeManager,
     model::{IncomingMessage, ReplyTarget},
 };
 use serde_json::json;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[test]
@@ -117,6 +119,69 @@ async fn builtin_equal_command_handles_match_and_mismatch() {
     assert_eq!(
         mismatching.formatted_content(),
         "[Command][equal][FAILED]: left != right"
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_command_can_enable_and_report_status_for_current_thread() {
+    // 测试场景: 即使静态 compact 默认关闭，/auto-compact on 也应能在线程级启用并返回确认消息。
+    let compact_runtime = Arc::new(CompactRuntimeManager::new());
+    let mut registry = CommandRegistry::with_builtin_commands();
+    register_runtime_commands(&mut registry, false, false, Arc::clone(&compact_runtime))
+        .expect("runtime command should register");
+
+    let enabled = registry
+        .try_execute(&build_incoming("/auto-compact on"))
+        .await
+        .expect("auto-compact on should execute")
+        .expect("auto-compact on should be handled");
+    let status = registry
+        .try_execute(&build_incoming("/auto-compact status"))
+        .await
+        .expect("auto-compact status should execute")
+        .expect("auto-compact status should be handled");
+
+    assert_eq!(
+        enabled.formatted_content(),
+        "[Command][auto-compact][SUCCESS]: auto-compact enabled for current thread `thread_command`; future turns will expose `compact` and context capacity prompts"
+    );
+    assert_eq!(
+        status.formatted_content(),
+        "[Command][auto-compact][SUCCESS]: auto-compact is enabled for current thread `thread_command`"
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_command_off_restores_disabled_status_for_current_thread() {
+    // 测试场景: /auto-compact off 应关闭当前线程的 runtime override，并让 status 变回 disabled。
+    let mut registry = CommandRegistry::with_builtin_commands();
+    let compact_runtime = Arc::new(CompactRuntimeManager::new());
+    register_runtime_commands(&mut registry, false, false, Arc::clone(&compact_runtime))
+        .expect("runtime command should register");
+
+    let _enabled = registry
+        .try_execute(&build_incoming("/auto-compact on"))
+        .await
+        .expect("auto-compact on should execute")
+        .expect("auto-compact on should be handled");
+    let disabled = registry
+        .try_execute(&build_incoming("/auto-compact off"))
+        .await
+        .expect("auto-compact off should execute")
+        .expect("auto-compact off should be handled");
+    let status = registry
+        .try_execute(&build_incoming("/auto-compact status"))
+        .await
+        .expect("auto-compact status should execute")
+        .expect("auto-compact status should be handled");
+
+    assert_eq!(
+        disabled.formatted_content(),
+        "[Command][auto-compact][SUCCESS]: auto-compact disabled for current thread `thread_command`; future turns will stop exposing `compact` and context capacity prompts"
+    );
+    assert_eq!(
+        status.formatted_content(),
+        "[Command][auto-compact][SUCCESS]: auto-compact is disabled for current thread `thread_command`"
     );
 }
 

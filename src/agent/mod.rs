@@ -15,14 +15,14 @@ pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
 pub use runtime::AgentRuntime;
 pub use sandbox::DummySandboxContainer;
 pub use tool::{
-    EditTool, LoadSkillTool, LoadedSkill, LoadedSkillFile, McpServerDefinition, McpServerSnapshot,
-    McpServerState, McpToolSnapshot, McpTransport, ReadTool, ShellTool, SkillManifest,
-    SkillRegistry, ThreadToolRuntimeManager, ThreadToolRuntimeSnapshot, ToolCallContext,
-    ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolInputSchema, ToolRegistry,
-    ToolSchemaProtocol, ToolSource, ToolSourceMcp, ToolsetCatalogEntry, ToolsetRuntime, WriteTool,
-    empty_tool_input_schema,
+    CompactToolProjection, EditTool, LoadSkillTool, LoadedSkill, LoadedSkillFile,
+    McpServerDefinition, McpServerSnapshot, McpServerState, McpToolSnapshot, McpTransport,
+    ReadTool, ShellTool, SkillManifest, SkillRegistry, ThreadToolRuntimeManager,
+    ThreadToolRuntimeSnapshot, ToolCallContext, ToolCallRequest, ToolCallResult, ToolDefinition,
+    ToolHandler, ToolInputSchema, ToolRegistry, ToolSchemaProtocol, ToolSource, ToolSourceMcp,
+    ToolsetCatalogEntry, ToolsetRuntime, WriteTool, empty_tool_input_schema,
 };
 pub use worker::{
-    AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle, CompletedAgentTurn,
-    FailedAgentTurn,
+    AgentRequest, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent, AgentWorkerHandle,
+    CompletedAgentTurn, FailedAgentTurn,
 };

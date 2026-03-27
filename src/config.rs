@@ -134,6 +134,7 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.llm.validate()?;
         self.agent.validate()
     }
 
@@ -279,6 +280,7 @@ impl FeishuConfig {
 pub struct AgentConfig {
     hook: AgentHookConfig,
     tool: AgentToolConfig,
+    compact: AgentCompactConfig,
 }
 
 impl AgentConfig {
@@ -308,9 +310,110 @@ impl AgentConfig {
         &self.tool
     }
 
+    /// Return the configured compact runtime section.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(!config.agent_config().compact_config().enabled());
+    /// ```
+    pub fn compact_config(&self) -> &AgentCompactConfig {
+        &self.compact
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         self.hook.validate()?;
-        self.tool.validate()
+        self.tool.validate()?;
+        self.compact.validate()
+    }
+}
+
+/// Compact runtime configuration loaded from `agent.compact`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert_eq!(
+///     config.agent_config().compact_config().runtime_threshold_ratio(),
+///     0.85
+/// );
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentCompactConfig {
+    enabled: bool,
+    auto_compact: bool,
+    runtime_threshold_ratio: f64,
+    tool_visible_threshold_ratio: f64,
+    reserved_output_tokens: usize,
+}
+
+impl Default for AgentCompactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_compact: false,
+            runtime_threshold_ratio: 0.85,
+            tool_visible_threshold_ratio: 0.70,
+            reserved_output_tokens: 1024,
+        }
+    }
+}
+
+impl AgentCompactConfig {
+    /// Return whether runtime-managed compact is enabled.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Return whether model-assisted auto-compact is enabled.
+    ///
+    /// 启用后 `compact` 工具会始终暴露给模型，且每次 generate 都会注入当前上下文容量提示。
+    pub fn auto_compact(&self) -> bool {
+        self.auto_compact
+    }
+
+    /// Return the hard runtime compact trigger ratio.
+    pub fn runtime_threshold_ratio(&self) -> f64 {
+        self.runtime_threshold_ratio
+    }
+
+    /// Return the soft threshold used to upgrade the auto-compact prompt into an early-warning hint.
+    ///
+    /// 这个阈值不控制 `compact` 工具是否可见，也不控制是否注入提示；
+    /// 它只控制当前上下文使用率较高时，是否在提示中更明确地建议模型提前调用 `compact`。
+    pub fn tool_visible_threshold_ratio(&self) -> f64 {
+        self.tool_visible_threshold_ratio
+    }
+
+    /// Return the reserved output token budget for one LLM request.
+    pub fn reserved_output_tokens(&self) -> usize {
+        self.reserved_output_tokens
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_ratio(
+            self.runtime_threshold_ratio,
+            "agent.compact.runtime_threshold_ratio",
+        )?;
+        validate_ratio(
+            self.tool_visible_threshold_ratio,
+            "agent.compact.tool_visible_threshold_ratio",
+        )?;
+        if self.tool_visible_threshold_ratio > self.runtime_threshold_ratio {
+            bail!(
+                "agent.compact.tool_visible_threshold_ratio must be less than or equal to agent.compact.runtime_threshold_ratio"
+            );
+        }
+        if self.auto_compact && !self.enabled {
+            bail!("agent.compact.auto_compact requires agent.compact.enabled=true");
+        }
+
+        Ok(())
     }
 }
 
@@ -760,6 +863,8 @@ pub struct LLMConfig {
     pub api_key: String,
     pub api_key_path: PathBuf,
     pub mock_response: String,
+    pub context_window_tokens: usize,
+    pub tokenizer: String,
 }
 
 impl Default for LLMConfig {
@@ -771,6 +876,35 @@ impl Default for LLMConfig {
             api_key: String::new(),
             api_key_path: PathBuf::new(),
             mock_response: "[openjarvis][DEBUG] 测试回复".to_string(),
+            context_window_tokens: 8192,
+            tokenizer: "chars_div4".to_string(),
         }
     }
+}
+
+impl LLMConfig {
+    fn validate(&self) -> Result<()> {
+        if self.context_window_tokens == 0 {
+            bail!("llm.context_window_tokens must be greater than 0");
+        }
+        if self.tokenizer.trim().is_empty() {
+            bail!("llm.tokenizer must not be blank");
+        }
+        if !matches!(self.tokenizer.trim(), "chars_div4") {
+            bail!(
+                "llm.tokenizer `{}` is not supported yet; expected `chars_div4`",
+                self.tokenizer
+            );
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_ratio(value: f64, field_name: &str) -> Result<()> {
+    if !(0.0..=1.0).contains(&value) || value == 0.0 {
+        bail!("{field_name} must be greater than 0 and less than or equal to 1");
+    }
+
+    Ok(())
 }

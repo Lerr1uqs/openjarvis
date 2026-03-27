@@ -9,6 +9,7 @@ pub mod skill;
 pub mod toolset;
 pub mod write;
 
+use crate::compact::ContextBudgetReport;
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -193,10 +194,18 @@ enum RegisteredToolset {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct CompactToolProjection {
+    pub auto_compact: bool,
+    pub visible: bool,
+    pub budget_report: ContextBudgetReport,
+}
+
 pub struct ToolRegistry {
     // AGENT-TODO: 对String起别名
     always_visible_handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
     toolsets: RwLock<HashMap<String, RegisteredToolset>>,
+    compact_tool_projections: RwLock<HashMap<String, CompactToolProjection>>,
     thread_runtimes: Arc<toolset::ThreadToolRuntimeManager>,
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
@@ -240,6 +249,7 @@ impl ToolRegistry {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
+            compact_tool_projections: RwLock::new(HashMap::new()),
             thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::new()),
@@ -263,6 +273,7 @@ impl ToolRegistry {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
+            compact_tool_projections: RwLock::new(HashMap::new()),
             thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
@@ -426,6 +437,22 @@ impl ToolRegistry {
 
     /// Return the thread-scoped visible tool definitions for one internal thread id.
     pub async fn list_for_thread(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
+        let mut definitions = self.list_for_thread_static(thread_id).await?;
+        if self
+            .compact_tool_projections
+            .read()
+            .await
+            .get(thread_id)
+            .is_some_and(|projection| projection.auto_compact && projection.visible)
+        {
+            definitions.push(compact_tool_definition());
+        }
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(definitions)
+    }
+
+    /// Return the thread-scoped visible tool definitions without dynamic compact projection.
+    pub async fn list_for_thread_static(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
         let mut definitions = self.list().await;
         definitions.push(load_toolset_definition());
         definitions.push(unload_toolset_definition());
@@ -452,6 +479,7 @@ impl ToolRegistry {
     ) -> Result<ToolCallResult> {
         let context = ToolCallContext::for_thread(thread_id);
         match request.name.as_str() {
+            "compact" => bail!("tool `compact` must be handled by the agent loop compact runtime"),
             "load_toolset" => self.load_toolset(thread_id, request).await,
             "unload_toolset" => self.unload_toolset(thread_id, request).await,
             _ => {
@@ -533,6 +561,23 @@ impl ToolRegistry {
     /// Return the loaded toolset names for one internal thread.
     pub async fn loaded_toolsets_for_thread(&self, thread_id: &str) -> Vec<String> {
         self.thread_runtimes.loaded_toolsets(thread_id).await
+    }
+
+    /// Update one thread's dynamic compact-tool visibility projection.
+    pub async fn set_compact_tool_projection(
+        &self,
+        thread_id: &str,
+        projection: Option<CompactToolProjection>,
+    ) {
+        let mut projections = self.compact_tool_projections.write().await;
+        match projection {
+            Some(projection) => {
+                projections.insert(thread_id.to_string(), projection);
+            }
+            None => {
+                projections.remove(thread_id);
+            }
+        }
     }
 
     /// Return the MCP management API exposed by this tool registry.
@@ -881,6 +926,15 @@ fn unload_toolset_definition() -> ToolDefinition {
         "unload_toolset",
         "Unload one program-defined toolset from the current internal thread so its tools disappear from later model steps.",
     )
+}
+
+fn compact_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "compact".to_string(),
+        description: "Compact the current thread chat history into one assistant summary plus a follow-up user continue message so the task can keep going with less context.".to_string(),
+        input_schema: empty_tool_input_schema(),
+        source: ToolSource::Builtin,
+    }
 }
 
 /// Return an empty object schema for tools that currently do not accept any arguments.

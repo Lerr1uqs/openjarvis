@@ -8,9 +8,11 @@ use openjarvis::{
         tool::{browser, mcp::demo},
     },
     cli::OpenJarvisCli,
+    command::{CommandRegistry, register_runtime_commands},
     config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     llm::build_provider,
     router::ChannelRouter,
+    session::{SessionManager, SessionStrategy},
 };
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -38,6 +40,7 @@ async fn main() -> Result<()> {
     }
 
     let runtime = AgentRuntime::from_config(config.agent_config()).await?;
+    let compact_runtime = runtime.compact_runtime();
     if !cli.load_skills.is_empty() {
         // Test-only startup path: enable only the explicitly requested local skills for this
         // process so external manual verification can exercise skill loading deterministically.
@@ -52,13 +55,33 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>();
         info!(skills = ?enabled_skill_names, "loaded local skills from startup flags");
     }
-
-    let agent = AgentWorker::with_runtime(
-        build_provider(config.llm_config())?,
-        DEFAULT_ASSISTANT_SYSTEM_PROMPT,
-        runtime,
-    );
-    let mut router = ChannelRouter::new(agent);
+    let mut command_registry = CommandRegistry::with_builtin_commands();
+    register_runtime_commands(
+        &mut command_registry,
+        config.agent_config().compact_config().enabled(),
+        config.agent_config().compact_config().auto_compact(),
+        compact_runtime,
+    )?;
+    // TODO: 修改为链式builder DEFAULT_ASSISTANT_SYSTEM_PROMPT在new中默认 但是提供注入api
+    let agent = AgentWorker::builder()
+        .llm(build_provider(config.llm_config())?)
+        .runtime(runtime)
+        .system_prompt(DEFAULT_ASSISTANT_SYSTEM_PROMPT)
+        .llm_config(config.llm_config().clone())
+        .compact_config(config.agent_config().compact_config().clone())
+        .build()?;
+    let session_strategy = if config.agent_config().compact_config().enabled() {
+        SessionStrategy {
+            max_messages_per_thread: usize::MAX,
+        }
+    } else {
+        SessionStrategy::default()
+    };
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .session_manager(SessionManager::with_strategy(session_strategy))
+        .command_registry(command_registry)
+        .build()?;
 
     router.register_channels(config.channel_config()).await?;
     info!(

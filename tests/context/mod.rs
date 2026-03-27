@@ -1,3 +1,5 @@
+mod token_kind;
+
 use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ChatToolCall, MessageContext},
@@ -7,6 +9,7 @@ use serde_json::json;
 
 #[test]
 fn context_renders_system_memory_and_chat() {
+    // 测试场景: system、memory、chat 三段上下文应被正确拼接进兼容 prompt。
     let now = Utc::now();
     let mut thread = ConversationThread::new("default", now);
     thread.store_turn(
@@ -32,6 +35,7 @@ fn context_renders_system_memory_and_chat() {
 
 #[test]
 fn context_extend_from_thread_preserves_tool_call_metadata() {
+    // 测试场景: 从 thread 回填 chat history 时，tool_call 元数据不能丢失。
     let now = Utc::now();
     let mut thread = ConversationThread::new("default", now);
     thread.store_turn(

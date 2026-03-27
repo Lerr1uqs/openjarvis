@@ -181,3 +181,34 @@ fn store_turn_state_persists_loaded_toolsets_and_tool_events() {
     );
     assert_eq!(thread.load_tool_events()[0].turn_id, Some(turn_id));
 }
+
+#[test]
+fn overwrite_active_history_replaces_old_turns_but_keeps_thread_identity() {
+    // 测试场景: compact 写回 active history 时，应替换 turn 列表，但 thread id 不能漂移。
+    let now = Utc::now();
+    let mut thread = ConversationThread::new("default", now);
+    let original_thread_id = thread.id;
+    thread.store_turn(
+        Some("msg_1".to_string()),
+        vec![ChatMessage::new(ChatMessageRole::User, "old history", now)],
+        now,
+        now,
+    );
+
+    let mut compacted = thread.clone();
+    compacted.turns = vec![openjarvis::thread::ConversationTurn::new(
+        None,
+        vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
+            ChatMessage::new(ChatMessageRole::User, "继续", now),
+        ],
+        now,
+        now,
+    )];
+    thread.overwrite_active_history(&compacted);
+
+    assert_eq!(thread.id, original_thread_id);
+    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.turns[0].messages[0].content, "这是压缩后的上下文");
+    assert_eq!(thread.turns[0].messages[1].content, "继续");
+}

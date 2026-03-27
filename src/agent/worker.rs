@@ -5,13 +5,14 @@ use super::{
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
 };
-use crate::config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT};
+use crate::compact::CompactScopeKey;
+use crate::config::{AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
 use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::llm::{LLMProvider, build_provider};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
-use crate::thread::ThreadToolEvent;
-use anyhow::Result;
+use crate::thread::{ConversationThread, ThreadToolEvent};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ use tracing::warn;
 pub struct AgentRequest {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
+    pub thread: ConversationThread,
     pub history: Vec<ChatMessage>,
     pub loaded_toolsets: Vec<String>,
 }
@@ -29,7 +31,9 @@ pub struct AgentRequest {
 pub struct CompletedAgentTurn {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
+    pub active_thread: ConversationThread,
     pub messages: Vec<ChatMessage>,
+    pub prepend_incoming_user: bool,
     pub loaded_toolsets: Vec<String>,
     pub tool_events: Vec<ThreadToolEvent>,
     pub completed_at: DateTime<Utc>,
@@ -40,6 +44,7 @@ pub struct FailedAgentTurn {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub error: String,
+    pub active_thread: ConversationThread,
     pub loaded_toolsets: Vec<String>,
     pub completed_at: DateTime<Utc>,
 }
@@ -62,7 +67,102 @@ pub struct AgentWorker {
     system_prompt: String,
 }
 
+/// Builder for assembling one [`AgentWorker`] with explicit runtime and compact settings.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
+/// use std::sync::Arc;
+///
+/// let worker = AgentWorker::builder()
+///     .llm(Arc::new(MockLLMProvider::new("pong")))
+///     .system_prompt("system")
+///     .build()
+///     .expect("worker should build");
+///
+/// assert!(worker.sandbox().is_placeholder());
+/// ```
+pub struct AgentWorkerBuilder {
+    llm: Option<Arc<dyn LLMProvider>>,
+    runtime: AgentRuntime,
+    system_prompt: String,
+    llm_config: LLMConfig,
+    compact_config: AgentCompactConfig,
+}
+
+impl Default for AgentWorkerBuilder {
+    fn default() -> Self {
+        Self {
+            llm: None,
+            runtime: AgentRuntime::new(),
+            system_prompt: DEFAULT_ASSISTANT_SYSTEM_PROMPT.to_string(),
+            llm_config: LLMConfig::default(),
+            compact_config: AgentCompactConfig::default(),
+        }
+    }
+}
+
+impl AgentWorkerBuilder {
+    /// Create one empty worker builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the LLM provider used by the worker.
+    pub fn llm(mut self, llm: Arc<dyn LLMProvider>) -> Self {
+        self.llm = Some(llm);
+        self
+    }
+
+    /// Replace the runtime container used by the worker.
+    pub fn runtime(mut self, runtime: AgentRuntime) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Override the system prompt injected into every turn.
+    pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = system_prompt.into();
+        self
+    }
+
+    /// Replace the LLM budget config used by compact estimation.
+    pub fn llm_config(mut self, llm_config: LLMConfig) -> Self {
+        self.llm_config = llm_config;
+        self
+    }
+
+    /// Replace the compact config used by runtime compact and auto-compact.
+    pub fn compact_config(mut self, compact_config: AgentCompactConfig) -> Self {
+        self.compact_config = compact_config;
+        self
+    }
+
+    /// Build the worker from the accumulated fields.
+    pub fn build(self) -> Result<AgentWorker> {
+        let Some(llm) = self.llm else {
+            bail!("agent worker builder requires an llm provider");
+        };
+
+        Ok(AgentWorker {
+            agent_loop: AgentLoop::with_compact_config(
+                llm,
+                self.runtime,
+                self.llm_config,
+                self.compact_config,
+            ),
+            sandbox: DummySandboxContainer::new(),
+            system_prompt: self.system_prompt,
+        })
+    }
+}
+
 impl AgentWorker {
+    /// Create one worker builder.
+    pub fn builder() -> AgentWorkerBuilder {
+        AgentWorkerBuilder::new()
+    }
+
     /// Create a worker with a fresh default runtime.
     ///
     /// # 示例
@@ -70,10 +170,18 @@ impl AgentWorker {
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
     /// use std::sync::Arc;
     ///
-    /// let _worker = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let _worker = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
     /// ```
     pub fn new(llm: Arc<dyn LLMProvider>, system_prompt: impl Into<String>) -> Self {
-        Self::with_runtime(llm, system_prompt, AgentRuntime::new())
+        Self::builder()
+            .llm(llm)
+            .system_prompt(system_prompt)
+            .build()
+            .expect("agent worker new should always have the required llm provider")
     }
 
     /// Create a worker with an explicitly provided runtime.
@@ -82,11 +190,30 @@ impl AgentWorker {
         system_prompt: impl Into<String>,
         runtime: AgentRuntime,
     ) -> Self {
-        Self {
-            agent_loop: AgentLoop::new(llm, runtime),
-            sandbox: DummySandboxContainer::new(),
-            system_prompt: system_prompt.into(),
-        }
+        Self::builder()
+            .llm(llm)
+            .runtime(runtime)
+            .system_prompt(system_prompt)
+            .build()
+            .expect("agent worker with_runtime should always have the required llm provider")
+    }
+
+    /// Create a worker with explicit runtime, LLM budget config, and compact config.
+    pub fn with_runtime_and_compact_config(
+        llm: Arc<dyn LLMProvider>,
+        system_prompt: impl Into<String>,
+        runtime: AgentRuntime,
+        llm_config: LLMConfig,
+        compact_config: AgentCompactConfig,
+    ) -> Self {
+        Self::builder()
+            .llm(llm)
+            .runtime(runtime)
+            .system_prompt(system_prompt)
+            .llm_config(llm_config)
+            .compact_config(compact_config)
+            .build()
+            .expect("agent worker with_runtime_and_compact_config should always have the required llm provider")
     }
 
     /// Build a worker directly from the loaded app configuration.
@@ -102,11 +229,13 @@ impl AgentWorker {
     /// # }
     /// ```
     pub async fn from_config(config: &AppConfig) -> Result<Self> {
-        Ok(Self::with_runtime(
-            build_provider(config.llm_config())?,
-            DEFAULT_ASSISTANT_SYSTEM_PROMPT,
-            AgentRuntime::from_config(config.agent_config()).await?,
-        ))
+        Self::builder()
+            .llm(build_provider(config.llm_config())?)
+            .runtime(AgentRuntime::from_config(config.agent_config()).await?)
+            .system_prompt(DEFAULT_ASSISTANT_SYSTEM_PROMPT)
+            .llm_config(config.llm_config().clone())
+            .compact_config(config.agent_config().compact_config().clone())
+            .build()
     }
 
     /// Return the runtime bound to this worker.
@@ -121,7 +250,11 @@ impl AgentWorker {
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
     /// use std::sync::Arc;
     ///
-    /// let worker = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let worker = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
     /// assert!(worker.sandbox().is_placeholder());
     /// ```
     pub fn sandbox(&self) -> &DummySandboxContainer {
@@ -135,7 +268,11 @@ impl AgentWorker {
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
     /// use std::sync::Arc;
     ///
-    /// let worker = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
+    /// let worker = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
     /// let handle = worker.spawn();
     /// let _ = handle.request_tx.clone();
     /// ```
@@ -196,11 +333,12 @@ impl AgentWorker {
 
         let loop_output = self
             .agent_loop
-            .run(
+            .run_with_thread(
                 InfoContext {
                     channel: request.incoming.channel.clone(),
                     user_id: request.incoming.user_id.clone(),
                     thread_id: internal_thread_id.clone(),
+                    compact_scope_key: CompactScopeKey::from_locator(&request.locator),
                     event_tx: AgentEventSender::new(
                         dispatch_tx,
                         request.incoming.channel.clone(),
@@ -215,6 +353,7 @@ impl AgentWorker {
                     ),
                 },
                 &context,
+                request.thread.clone(),
             )
             .await;
         forward_dispatch_task
@@ -224,11 +363,13 @@ impl AgentWorker {
         match loop_output {
             Ok(loop_output) => {
                 let completed_at = Utc::now();
-                event_tx
+                event_tx // TODO: 需要重构
                     .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                         locator: request.locator,
                         incoming: request.incoming,
+                        active_thread: loop_output.active_thread.clone(),
                         messages: loop_output.turn_messages.clone(),
+                        prepend_incoming_user: loop_output.prepend_incoming_user,
                         loaded_toolsets: loop_output.loaded_toolsets.clone(),
                         tool_events: loop_output.tool_events.clone(),
                         completed_at,
@@ -251,6 +392,7 @@ impl AgentWorker {
                         locator: request.locator,
                         incoming: request.incoming,
                         error: error_message.clone(),
+                        active_thread: request.thread.clone(),
                         loaded_toolsets,
                         completed_at,
                     }))

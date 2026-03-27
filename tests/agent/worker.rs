@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
-    agent::{AgentRequest, AgentWorker, AgentWorkerEvent},
+    agent::{AgentRequest, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent},
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
     session::SessionManager,
+    thread::ConversationThread,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -19,10 +20,11 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn worker_spawn_emits_outgoing_and_completed_turn() {
-    let worker = AgentWorker::new(
-        Arc::new(MockLLMProvider::new("mock-reply")),
-        "system prompt",
-    );
+    let worker = AgentWorker::builder()
+        .llm(Arc::new(MockLLMProvider::new("mock-reply")))
+        .system_prompt("system prompt")
+        .build()
+        .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
     let locator = SessionManager::new().load_or_create_thread(&incoming).await;
@@ -32,6 +34,7 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
         .send(AgentRequest {
             locator: locator.clone(),
             incoming: incoming.clone(),
+            thread: ConversationThread::with_id(locator.thread_id, "default", incoming.received_at),
             history: Vec::new(),
             loaded_toolsets: Vec::new(),
         })
@@ -64,13 +67,26 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
 
 #[test]
 fn worker_holds_dummy_sandbox_container() {
-    let worker = AgentWorker::new(
-        Arc::new(MockLLMProvider::new("mock-reply")),
-        "system prompt",
-    );
+    let worker = AgentWorker::builder()
+        .llm(Arc::new(MockLLMProvider::new("mock-reply")))
+        .system_prompt("system prompt")
+        .build()
+        .expect("worker should build");
 
     assert_eq!(worker.sandbox().kind(), "dummy");
     assert!(worker.sandbox().is_placeholder());
+}
+
+#[test]
+fn worker_builder_requires_llm_provider() {
+    // 测试场景: builder 缺少 LLM provider 时必须报错，避免构造出无效 worker。
+    let error = AgentWorkerBuilder::new()
+        .system_prompt("system prompt")
+        .build()
+        .err()
+        .expect("builder without llm should fail");
+
+    assert!(error.to_string().contains("llm provider"));
 }
 
 struct RecordingProvider {
@@ -106,21 +122,31 @@ impl LLMProvider for FailingProvider {
 #[tokio::test]
 async fn worker_builds_context_from_history_and_current_user_message() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let worker = AgentWorker::new(
-        Arc::new(RecordingProvider {
+    let worker = AgentWorker::builder()
+        .llm(Arc::new(RecordingProvider {
             requests: Arc::clone(&requests),
-        }),
-        "system prompt",
-    );
+        }))
+        .system_prompt("system prompt")
+        .build()
+        .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("what happened");
     let locator = SessionManager::new().load_or_create_thread(&incoming).await;
+    let thread = thread_with_history(
+        locator.thread_id,
+        &[ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "previous reply",
+            Utc::now(),
+        )],
+    );
 
     handle
         .request_tx
         .send(AgentRequest {
             locator,
             incoming,
+            thread,
             history: vec![ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "previous reply",
@@ -169,7 +195,11 @@ llm:
 
 #[tokio::test]
 async fn worker_failed_turn_preserves_provider_error_chain() {
-    let worker = AgentWorker::new(Arc::new(FailingProvider), "system prompt");
+    let worker = AgentWorker::builder()
+        .llm(Arc::new(FailingProvider))
+        .system_prompt("system prompt")
+        .build()
+        .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
     let locator = SessionManager::new().load_or_create_thread(&incoming).await;
@@ -177,8 +207,9 @@ async fn worker_failed_turn_preserves_provider_error_chain() {
     handle
         .request_tx
         .send(AgentRequest {
-            locator,
+            locator: locator.clone(),
             incoming,
+            thread: ConversationThread::with_id(locator.thread_id, "default", Utc::now()),
             history: Vec::new(),
             loaded_toolsets: Vec::new(),
         })
@@ -236,4 +267,13 @@ fn build_incoming(content: &str) -> IncomingMessage {
             receive_id_type: "chat_id".to_string(),
         },
     }
+}
+
+fn thread_with_history(thread_id: uuid::Uuid, history: &[ChatMessage]) -> ConversationThread {
+    let now = Utc::now();
+    let mut thread = ConversationThread::with_id(thread_id, "default", now);
+    if !history.is_empty() {
+        thread.store_turn(None, history.to_vec(), now, now);
+    }
+    thread
 }

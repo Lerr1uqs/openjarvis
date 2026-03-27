@@ -11,6 +11,7 @@ use crate::config::ChannelConfig;
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
+use crate::thread::ConversationThread;
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, pending};
@@ -33,7 +34,106 @@ pub struct ChannelRouter {
     queued_messages: Mutex<HashMap<ThreadLocator, VecDeque<IncomingMessage>>>,
 }
 
+/// Builder for assembling one [`ChannelRouter`] around an agent worker or handle.
+///
+/// # 示例
+/// ```rust,no_run
+/// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
+/// use std::sync::Arc;
+///
+/// let agent = AgentWorker::builder()
+///     .llm(Arc::new(MockLLMProvider::new("pong")))
+///     .system_prompt("system")
+///     .build()
+///     .expect("worker should build");
+/// let router = ChannelRouter::builder()
+///     .agent(agent)
+///     .build()
+///     .expect("router should build");
+///
+/// let _ = router.sessions();
+/// ```
+pub struct ChannelRouterBuilder {
+    agent_handle: Option<AgentWorkerHandle>,
+    sessions: SessionManager,
+    commands: CommandRegistry,
+    message_dedup_enabled: bool,
+}
+
+impl Default for ChannelRouterBuilder {
+    fn default() -> Self {
+        Self {
+            agent_handle: None,
+            sessions: SessionManager::new(),
+            commands: CommandRegistry::default(),
+            message_dedup_enabled: false,
+        }
+    }
+}
+
+impl ChannelRouterBuilder {
+    /// Create one empty router builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach one long-lived agent worker and spawn its runtime handle.
+    pub fn agent(mut self, agent: AgentWorker) -> Self {
+        self.agent_handle = Some(agent.spawn());
+        self
+    }
+
+    /// Attach one already constructed agent handle.
+    pub fn agent_handle(mut self, agent_handle: AgentWorkerHandle) -> Self {
+        self.agent_handle = Some(agent_handle);
+        self
+    }
+
+    /// Replace the session manager used by the router.
+    pub fn session_manager(mut self, sessions: SessionManager) -> Self {
+        self.sessions = sessions;
+        self
+    }
+
+    /// Replace the command registry used by the router.
+    pub fn command_registry(mut self, commands: CommandRegistry) -> Self {
+        self.commands = commands;
+        self
+    }
+
+    /// Enable or disable router-level message deduplication.
+    pub fn message_dedup_enabled(mut self, enabled: bool) -> Self {
+        self.message_dedup_enabled = enabled;
+        self
+    }
+
+    /// Build the router from the accumulated fields.
+    pub fn build(self) -> Result<ChannelRouter> {
+        let Some(agent_handle) = self.agent_handle else {
+            bail!("channel router builder requires an agent worker or agent handle");
+        };
+
+        Ok(ChannelRouter {
+            agent_tx: agent_handle.request_tx,
+            agent_event_rx: agent_handle.event_rx,
+            channel_incoming_streams: StreamMap::new(),
+            channels: HashMap::new(),
+            sessions: self.sessions,
+            commands: self.commands,
+            message_dedup_enabled: self.message_dedup_enabled,
+            seen_messages: Mutex::new(HashSet::new()),
+            pending_threads: Mutex::new(HashSet::new()),
+            queued_messages: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
 impl ChannelRouter {
+    /// Create one router builder.
+    pub fn builder() -> ChannelRouterBuilder {
+        ChannelRouterBuilder::new()
+    }
+
     /// Create a router around one long-lived agent worker.
     ///
     /// # 示例
@@ -41,16 +141,32 @@ impl ChannelRouter {
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
     /// use std::sync::Arc;
     ///
-    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
-    /// let _router = ChannelRouter::new(agent);
+    /// let agent = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
+    /// let _router = ChannelRouter::builder()
+    ///     .agent(agent)
+    ///     .build()
+    ///     .expect("router should build");
     /// ```
     pub fn new(agent: AgentWorker) -> Self {
-        Self::with_session_manager(agent, SessionManager::new())
+        Self::builder()
+            .agent(agent)
+            .build()
+            .expect("channel router new should always have the required agent worker")
     }
 
     /// Create a router with an explicit session manager instance.
     pub fn with_session_manager(agent: AgentWorker, sessions: SessionManager) -> Self {
-        Self::with_session_manager_and_agent_handle(agent.spawn(), sessions)
+        Self::builder()
+            .agent(agent)
+            .session_manager(sessions)
+            .build()
+            .expect(
+                "channel router with_session_manager should always have the required agent worker",
+            )
     }
 
     /// Create a router around an already constructed agent handle.
@@ -67,27 +183,21 @@ impl ChannelRouter {
     /// let (request_tx, _request_rx) = mpsc::channel(8);
     /// let (_event_tx, event_rx) = mpsc::channel(8);
     /// let handle = AgentWorkerHandle { request_tx, event_rx };
-    /// let _router = ChannelRouter::with_session_manager_and_agent_handle(
-    ///     handle,
-    ///     SessionManager::new(),
-    /// );
+    /// let _router = ChannelRouter::builder()
+    ///     .agent_handle(handle)
+    ///     .session_manager(SessionManager::new())
+    ///     .build()
+    ///     .expect("router should build");
     /// ```
     pub fn with_session_manager_and_agent_handle(
         agent_handle: AgentWorkerHandle,
         sessions: SessionManager,
     ) -> Self {
-        Self {
-            agent_tx: agent_handle.request_tx,
-            agent_event_rx: agent_handle.event_rx,
-            channel_incoming_streams: StreamMap::new(),
-            channels: HashMap::new(),
-            sessions,
-            commands: CommandRegistry::default(),
-            message_dedup_enabled: false,
-            seen_messages: Mutex::new(HashSet::new()),
-            pending_threads: Mutex::new(HashSet::new()),
-            queued_messages: Mutex::new(HashMap::new()),
-        }
+        Self::builder()
+            .agent_handle(agent_handle)
+            .session_manager(sessions)
+            .build()
+            .expect("channel router with_session_manager_and_agent_handle should always have the required agent handle")
     }
 
     /// Return the session manager owned by the router.
@@ -107,8 +217,16 @@ impl ChannelRouter {
     /// };
     /// use std::sync::Arc;
     ///
-    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
-    /// let _router = ChannelRouter::new(agent).with_command_registry(CommandRegistry::default());
+    /// let agent = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
+    /// let _router = ChannelRouter::builder()
+    ///     .agent(agent)
+    ///     .command_registry(CommandRegistry::default())
+    ///     .build()
+    ///     .expect("router should build");
     /// ```
     pub fn with_command_registry(mut self, commands: CommandRegistry) -> Self {
         self.commands = commands;
@@ -125,8 +243,16 @@ impl ChannelRouter {
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
     /// use std::sync::Arc;
     ///
-    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
-    /// let _router = ChannelRouter::new(agent).with_message_dedup_enabled(true);
+    /// let agent = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
+    /// let _router = ChannelRouter::builder()
+    ///     .agent(agent)
+    ///     .message_dedup_enabled(true)
+    ///     .build()
+    ///     .expect("router should build");
     /// ```
     pub fn with_message_dedup_enabled(mut self, enabled: bool) -> Self {
         self.message_dedup_enabled = enabled;
@@ -177,8 +303,15 @@ impl ChannelRouter {
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider, router::ChannelRouter};
     /// use std::sync::Arc;
     ///
-    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
-    /// let mut router = ChannelRouter::new(agent);
+    /// let agent = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
+    /// let mut router = ChannelRouter::builder()
+    ///     .agent(agent)
+    ///     .build()
+    ///     .expect("router should build");
     /// tokio::spawn(async move {
     ///     let _ = router.run().await;
     /// });
@@ -201,8 +334,15 @@ impl ChannelRouter {
     /// use std::sync::Arc;
     /// use tokio::sync::oneshot;
     ///
-    /// let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")), "system");
-    /// let mut router = ChannelRouter::new(agent);
+    /// let agent = AgentWorker::builder()
+    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .system_prompt("system")
+    ///     .build()
+    ///     .expect("worker should build");
+    /// let mut router = ChannelRouter::builder()
+    ///     .agent(agent)
+    ///     .build()
+    ///     .expect("router should build");
     /// let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     /// router
     ///     .run_until_shutdown(async move {
@@ -355,15 +495,19 @@ impl ChannelRouter {
     }
 
     async fn store_completed_turn(&self, turn: CompletedAgentTurn) -> Result<()> {
-        let mut messages = vec![ChatMessage::new(
-            ChatMessageRole::User,
-            turn.incoming.content.clone(),
-            turn.incoming.received_at,
-        )];
+        let mut messages = Vec::new();
+        if turn.prepend_incoming_user {
+            messages.push(ChatMessage::new(
+                ChatMessageRole::User,
+                turn.incoming.content.clone(),
+                turn.incoming.received_at,
+            ));
+        }
         messages.extend(turn.messages);
         self.sessions
-            .store_turn_with_state(
+            .store_turn_with_active_thread(
                 &turn.locator,
+                Some(turn.active_thread),
                 turn.incoming.external_message_id.clone(),
                 messages,
                 turn.incoming.received_at,
@@ -398,8 +542,9 @@ impl ChannelRouter {
         .await?;
 
         self.sessions
-            .store_turn_with_state(
+            .store_turn_with_active_thread(
                 &turn.locator,
+                Some(turn.active_thread),
                 turn.incoming.external_message_id.clone(),
                 vec![
                     ChatMessage::new(
@@ -452,6 +597,13 @@ impl ChannelRouter {
             .send(AgentRequest {
                 locator: locator.clone(),
                 incoming: message.clone(),
+                thread: thread_state.thread.unwrap_or_else(|| {
+                    ConversationThread::with_id(
+                        locator.thread_id,
+                        locator.external_thread_id.clone(),
+                        message.received_at,
+                    )
+                }),
                 history: thread_state.messages,
                 loaded_toolsets: thread_state.loaded_toolsets,
             })

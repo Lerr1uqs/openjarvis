@@ -29,6 +29,10 @@ impl ChatMessageRole {
     }
 }
 
+pub mod token_kind;
+
+pub use token_kind::ContextTokenKind;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatToolCall {
     pub id: String,

@@ -83,7 +83,10 @@ async fn run_bilibili_search_dump(cli: &BrowserBilibiliSearchDumpCli) -> Result<
     println!("opened_new_page: {}", typed.opened_new_page);
 
     let results_snapshot = manager
-        .snapshot(thread_id, Some(clamp_snapshot_limit(cli.results_max_elements)))
+        .snapshot(
+            thread_id,
+            Some(clamp_snapshot_limit(cli.results_max_elements)),
+        )
         .await?;
     let first_video = find_first_video_link(&results_snapshot)?;
     println!(
@@ -100,7 +103,10 @@ async fn run_bilibili_search_dump(cli: &BrowserBilibiliSearchDumpCli) -> Result<
     println!("video_opened_new_page: {}", clicked.opened_new_page);
 
     let video_snapshot = manager
-        .snapshot(thread_id, Some(clamp_snapshot_limit(cli.video_max_elements)))
+        .snapshot(
+            thread_id,
+            Some(clamp_snapshot_limit(cli.video_max_elements)),
+        )
         .await?;
     println!("video snapshot:");
     println!("{}", video_snapshot.snapshot_text);

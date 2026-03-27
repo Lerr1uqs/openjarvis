@@ -5,7 +5,11 @@
 //! commands return a formatted failure response without touching `SessionManager` or `AgentWorker`.
 //! Some Feishu channel messages may arrive as `@_user_1 /echo zxf`, so command matching strips
 //! one leading Feishu mention token before checking whether the message starts with `/`.
+//! Runtime-scoped commands such as `/auto-compact on` can still mutate shared live state and
+//! override static YAML defaults even though command messages themselves do not enter the
+//! persisted session history.
 
+use crate::compact::{CompactRuntimeManager, CompactScopeKey};
 use crate::model::IncomingMessage;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -374,6 +378,44 @@ impl Default for CommandRegistry {
     }
 }
 
+/// Register runtime-scoped built-in commands that need live shared state.
+///
+/// # 示例
+/// ```rust,no_run
+/// # async fn demo() -> anyhow::Result<()> {
+/// use openjarvis::{
+///     command::{CommandRegistry, register_runtime_commands},
+///     compact::CompactRuntimeManager,
+/// };
+/// use std::sync::Arc;
+///
+/// let mut registry = CommandRegistry::with_builtin_commands();
+/// register_runtime_commands(
+///     &mut registry,
+///     true,
+///     false,
+///     Arc::new(CompactRuntimeManager::new()),
+/// )?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn register_runtime_commands(
+    registry: &mut CommandRegistry,
+    default_compact_enabled: bool,
+    default_auto_compact: bool,
+    compact_runtime: Arc<CompactRuntimeManager>,
+) -> Result<()> {
+    registry.register(
+        "auto-compact",
+        Arc::new(AutoCompactCommand::new(
+            default_compact_enabled,
+            default_auto_compact,
+            compact_runtime,
+        )),
+    )?;
+    Ok(())
+}
+
 struct TestCommand;
 
 #[async_trait]
@@ -436,6 +478,92 @@ impl CommandHandler for EchoCommand {
             invocation.name(),
             invocation.raw_arguments().to_string(),
         ))
+    }
+}
+
+struct AutoCompactCommand {
+    default_compact_enabled: bool,
+    default_auto_compact: bool,
+    compact_runtime: Arc<CompactRuntimeManager>,
+}
+
+impl AutoCompactCommand {
+    fn new(
+        default_compact_enabled: bool,
+        default_auto_compact: bool,
+        compact_runtime: Arc<CompactRuntimeManager>,
+    ) -> Self {
+        Self {
+            default_compact_enabled,
+            default_auto_compact,
+            compact_runtime,
+        }
+    }
+
+    fn usage(name: &str) -> CommandReply {
+        CommandReply::failed(name, "usage: /auto-compact <on|off|status>")
+    }
+}
+
+#[async_trait]
+impl CommandHandler for AutoCompactCommand {
+    async fn execute(
+        &self,
+        invocation: &CommandInvocation,
+        incoming: &IncomingMessage,
+    ) -> Result<CommandReply> {
+        let Some(action) = invocation.arguments().first().map(|value| value.as_str()) else {
+            return Ok(Self::usage(invocation.name()));
+        };
+        let scope = CompactScopeKey::from_incoming(incoming);
+
+        match action {
+            "on" => {
+                self.compact_runtime
+                    .set_compact_enabled(scope.clone(), true)
+                    .await;
+                self.compact_runtime
+                    .set_auto_compact(scope.clone(), true)
+                    .await;
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format!(
+                        "auto-compact enabled for current thread `{}`; future turns will expose `compact` and context capacity prompts",
+                        scope.external_thread_id
+                    ),
+                ))
+            }
+            "off" => {
+                self.compact_runtime
+                    .set_compact_enabled(scope.clone(), self.default_compact_enabled)
+                    .await;
+                self.compact_runtime
+                    .set_auto_compact(scope.clone(), false)
+                    .await;
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format!(
+                        "auto-compact disabled for current thread `{}`; future turns will stop exposing `compact` and context capacity prompts",
+                        scope.external_thread_id
+                    ),
+                ))
+            }
+            "status" => {
+                let enabled = self
+                    .compact_runtime
+                    .auto_compact_enabled(&scope, self.default_auto_compact)
+                    .await;
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format!(
+                        "auto-compact is {} for current thread `{}`",
+                        if enabled { "enabled" } else { "disabled" },
+                        scope.external_thread_id
+                    ),
+                ))
+            }
+            _ => Ok(Self::usage(invocation.name())),
+        }
     }
 }
 

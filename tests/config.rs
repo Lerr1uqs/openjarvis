@@ -474,3 +474,73 @@ fn malformed_external_mcp_json_with_ambiguous_transport_is_rejected() {
             .contains("mcp.json server `bad_demo` must define either `command` or `url`, not both")
     );
 }
+
+#[test]
+fn compact_and_budget_config_parse_from_yaml() {
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    auto_compact: true
+    runtime_threshold_ratio: 0.9
+    tool_visible_threshold_ratio: 0.75
+    reserved_output_tokens: 512
+llm:
+  provider: "mock"
+  context_window_tokens: 16384
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("compact config should parse");
+
+    assert!(config.agent_config().compact_config().enabled());
+    assert!(config.agent_config().compact_config().auto_compact());
+    assert_eq!(
+        config
+            .agent_config()
+            .compact_config()
+            .runtime_threshold_ratio(),
+        0.9
+    );
+    assert_eq!(
+        config
+            .agent_config()
+            .compact_config()
+            .tool_visible_threshold_ratio(),
+        0.75
+    );
+    assert_eq!(
+        config
+            .agent_config()
+            .compact_config()
+            .reserved_output_tokens(),
+        512
+    );
+    assert_eq!(config.llm_config().context_window_tokens, 16384);
+    assert_eq!(config.llm_config().tokenizer, "chars_div4");
+}
+
+#[test]
+fn malformed_compact_config_with_visible_threshold_above_runtime_is_rejected() {
+    let fixture = ConfigFixture::new("openjarvis-compact-threshold-invalid");
+    fixture.write_yaml(
+        r#"
+agent:
+  compact:
+    enabled: true
+    auto_compact: true
+    runtime_threshold_ratio: 0.7
+    tool_visible_threshold_ratio: 0.8
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let error = AppConfig::from_path(fixture.config_path())
+        .expect_err("invalid compact threshold ordering should be rejected");
+    let error_chain = format!("{error:#}");
+
+    assert!(error_chain.contains("tool_visible_threshold_ratio"));
+    assert!(error_chain.contains("runtime_threshold_ratio"));
+}

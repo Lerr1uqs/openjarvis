@@ -85,7 +85,10 @@ fn cli_parses_internal_browser_script_command() {
             headless,
             ..
         }) => {
-            assert_eq!(steps_file, &std::path::PathBuf::from("tmp/browser-steps.json"));
+            assert_eq!(
+                steps_file,
+                &std::path::PathBuf::from("tmp/browser-steps.json")
+            );
             assert!(*headless);
         }
         other => panic!("unexpected parsed browser command: {other:?}"),

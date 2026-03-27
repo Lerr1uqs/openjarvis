@@ -313,6 +313,47 @@ impl ConversationThread {
         turn_id
     }
 
+    /// Replace the active history view while keeping the current thread identity.
+    ///
+    /// This is used by compact to swap old active chat turns with a compacted turn before the
+    /// next completed turn is appended.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::ConversationThread,
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = ConversationThread::new("default", now);
+    /// thread.store_turn(
+    ///     Some("msg_1".to_string()),
+    ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+    ///     now,
+    ///     now,
+    /// );
+    ///
+    /// let mut compacted = thread.clone();
+    /// compacted.store_turn(
+    ///     None,
+    ///     vec![ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now)],
+    ///     now,
+    ///     now,
+    /// );
+    ///
+    /// thread.overwrite_active_history(&compacted);
+    /// assert_eq!(thread.id, compacted.id);
+    /// assert_eq!(thread.turns.len(), compacted.turns.len());
+    /// ```
+    pub fn overwrite_active_history(&mut self, replacement: &ConversationThread) {
+        self.turns = replacement.turns.clone();
+        self.loaded_toolsets = normalize_loaded_toolsets(replacement.loaded_toolsets.clone());
+        self.tool_events = replacement.tool_events.clone();
+        self.updated_at = replacement.updated_at;
+    }
+
     /// Retain only the latest `max_messages` across the whole thread.
     ///
     /// Empty turns left behind by trimming are removed so the stored thread shape converges with

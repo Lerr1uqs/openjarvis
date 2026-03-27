@@ -14,7 +14,9 @@ use openjarvis::{
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, OutgoingMessage, ReplyTarget},
     router::ChannelRouter,
+    router::ChannelRouterBuilder,
     session::{SessionKey, SessionManager, SessionStrategy},
+    thread::ConversationThread,
 };
 use serde_json::json;
 use std::{
@@ -115,10 +117,18 @@ impl Drop for ExternalMcpConfigFixture {
 
 #[tokio::test]
 async fn router_ignores_duplicate_messages() {
-    let agent = AgentWorker::new(Arc::new(MockLLMProvider::new("reply")), "system");
+    let agent = AgentWorker::builder()
+        .llm(Arc::new(MockLLMProvider::new("reply")))
+        .system_prompt("system")
+        .build()
+        .expect("worker should build");
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
-    let mut router = ChannelRouter::new(agent).with_message_dedup_enabled(true);
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .message_dedup_enabled(true)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
@@ -183,6 +193,17 @@ async fn router_ignores_duplicate_messages() {
     assert_eq!(recorded[0].reply_to_message_id.as_deref(), Some("msg_1"));
 }
 
+#[test]
+fn router_builder_requires_agent_or_handle() {
+    // 测试场景: builder 在缺少 agent/handle 时应拒绝构建，避免 router 处于不可运行状态。
+    let error = ChannelRouterBuilder::new()
+        .build()
+        .err()
+        .expect("router builder without agent should fail");
+
+    assert!(error.to_string().contains("agent worker"));
+}
+
 #[tokio::test]
 async fn router_external_channel_message_can_trigger_builtin_mcp_when_flag_enabled() {
     let cli = OpenJarvisCli::parse_from(["openjarvis", "--builtin-mcp"]);
@@ -217,7 +238,10 @@ async fn router_external_channel_message_can_trigger_builtin_mcp_when_flag_enabl
     );
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
-    let mut router = ChannelRouter::new(agent);
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     router
@@ -331,7 +355,10 @@ async fn router_external_channel_message_can_trigger_mcp_loaded_from_external_js
     );
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
-    let mut router = ChannelRouter::new(agent);
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     router
@@ -415,8 +442,11 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
     let agent_harness = build_mock_agent_handle(Arc::clone(&observed_requests));
     let event_keepalive_tx = agent_harness.event_keepalive_tx; // test-only: prevents the mock downstream channel from looking crashed.
     let sessions = SessionManager::new();
-    let mut router =
-        ChannelRouter::with_session_manager_and_agent_handle(agent_harness.handle, sessions);
+    let mut router = ChannelRouter::builder()
+        .agent_handle(agent_harness.handle)
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
@@ -559,8 +589,11 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
     let sessions = SessionManager::with_strategy(SessionStrategy {
         max_messages_per_thread: 5,
     });
-    let mut router =
-        ChannelRouter::with_session_manager_and_agent_handle(agent_harness.handle, sessions);
+    let mut router = ChannelRouter::builder()
+        .agent_handle(agent_harness.handle)
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
@@ -708,13 +741,14 @@ async fn router_short_circuits_registered_command_without_session_or_agent() {
     let (request_tx, mut request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
     let sessions = SessionManager::new();
-    let mut router = ChannelRouter::with_session_manager_and_agent_handle(
-        AgentWorkerHandle {
+    let mut router = ChannelRouter::builder()
+        .agent_handle(AgentWorkerHandle {
             request_tx,
             event_rx,
-        },
-        sessions,
-    );
+        })
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
@@ -799,13 +833,14 @@ async fn router_returns_failed_reply_for_unknown_command_without_session_or_agen
     let (request_tx, mut request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
     let sessions = SessionManager::new();
-    let mut router = ChannelRouter::with_session_manager_and_agent_handle(
-        AgentWorkerHandle {
+    let mut router = ChannelRouter::builder()
+        .agent_handle(AgentWorkerHandle {
             request_tx,
             event_rx,
-        },
-        sessions,
-    );
+        })
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
@@ -891,13 +926,14 @@ async fn router_failed_turn_replies_with_full_error_chain() {
     let (event_tx, event_rx) = mpsc::channel(8);
     let event_keepalive_tx = event_tx.clone(); // test-only: keeps the downstream event channel alive until explicit shutdown.
     let sessions = SessionManager::new();
-    let mut router = ChannelRouter::with_session_manager_and_agent_handle(
-        AgentWorkerHandle {
+    let mut router = ChannelRouter::builder()
+        .agent_handle(AgentWorkerHandle {
             request_tx,
             event_rx,
-        },
-        sessions,
-    );
+        })
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     router
@@ -920,6 +956,7 @@ async fn router_failed_turn_replies_with_full_error_chain() {
     let send_task = tokio::spawn(async move {
         event_tx
             .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
+                active_thread: empty_thread(locator.thread_id, &locator.external_thread_id),
                 locator,
                 incoming,
                 error: "failed to call llm provider `openai_compatible` model `demo-model` at `https://provider.test/v1`: provider said 429: rate limit exceeded".to_string(),
@@ -1002,8 +1039,11 @@ async fn router_command_message_does_not_enter_existing_session() {
     let agent_harness = build_single_turn_mock_agent_handle(Arc::clone(&observed_requests));
     let event_keepalive_tx = agent_harness.event_keepalive_tx; // test-only: prevents the mock downstream channel from looking crashed.
     let sessions = SessionManager::new();
-    let mut router =
-        ChannelRouter::with_session_manager_and_agent_handle(agent_harness.handle, sessions);
+    let mut router = ChannelRouter::builder()
+        .agent_handle(agent_harness.handle)
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
     let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
 
     router
@@ -1118,6 +1158,106 @@ async fn router_command_message_does_not_enter_existing_session() {
     );
 }
 
+#[tokio::test]
+async fn router_completed_turn_can_skip_prepending_incoming_user_after_compact() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let agent_harness = build_compact_mock_agent_handle();
+    let event_keepalive_tx = agent_harness.event_keepalive_tx;
+    let sessions = SessionManager::new();
+    let mut router = ChannelRouter::builder()
+        .agent_handle(agent_harness.handle)
+        .session_manager(sessions)
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_compact_router",
+        "ou_compact_router",
+        Some("thread_compact_router"),
+        "被 compact 的旧问题",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("compact incoming message should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compact outgoing message should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_keepalive_tx);
+
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_compact_router".to_string(),
+        })
+        .await
+        .expect("session should exist");
+    let thread = session
+        .threads
+        .values()
+        .next()
+        .expect("thread should exist");
+    let history = thread.load_messages();
+
+    assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.turns[0].messages[0].content, "这是压缩后的上下文");
+    assert_eq!(thread.turns[0].messages[1].content, "继续");
+    assert_eq!(thread.turns[1].messages[0].content, "reply-after-compact");
+    assert_eq!(
+        history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "这是压缩后的上下文".to_string(),
+            "继续".to_string(),
+            "reply-after-compact".to_string(),
+        ]
+    );
+}
+
 fn build_mock_agent_handle(observed_requests: Arc<Mutex<Vec<AgentRequest>>>) -> MockAgentHarness {
     let (request_tx, request_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(32);
@@ -1142,6 +1282,22 @@ fn build_single_turn_mock_agent_handle(
     let event_keepalive_tx = event_tx.clone(); // test-only: keeps the downstream event channel open until explicit shutdown.
 
     spawn_single_turn_mock_agent_loop(observed_requests, event_tx, request_rx);
+
+    MockAgentHarness {
+        handle: AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        },
+        event_keepalive_tx,
+    }
+}
+
+fn build_compact_mock_agent_handle() -> MockAgentHarness {
+    let (request_tx, request_rx) = mpsc::channel(32);
+    let (event_tx, event_rx) = mpsc::channel(32);
+    let event_keepalive_tx = event_tx.clone();
+
+    spawn_compact_mock_agent_loop(event_tx, request_rx);
 
     MockAgentHarness {
         handle: AgentWorkerHandle {
@@ -1200,6 +1356,7 @@ fn spawn_mock_agent_loop(
                         .expect("first dispatch should be sent");
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: vec![ChatMessage::new(
@@ -1207,6 +1364,7 @@ fn spawn_mock_agent_loop(
                                 "reply-first",
                                 Utc::now(),
                             )],
+                            prepend_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
@@ -1259,6 +1417,7 @@ fn spawn_mock_agent_loop(
                         .expect("final text dispatch should be sent");
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: vec![
@@ -1276,6 +1435,7 @@ fn spawn_mock_agent_loop(
                                     Utc::now(),
                                 ),
                             ],
+                            prepend_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
@@ -1328,9 +1488,11 @@ fn spawn_truncation_mock_agent_loop(
                     }
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: turn_messages,
+                            prepend_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
@@ -1354,6 +1516,7 @@ fn spawn_truncation_mock_agent_loop(
                         .expect("final truncation dispatch should be sent");
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: vec![ChatMessage::new(
@@ -1361,6 +1524,7 @@ fn spawn_truncation_mock_agent_loop(
                                 "final-after-truncation",
                                 Utc::now(),
                             )],
+                            prepend_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
@@ -1401,6 +1565,7 @@ fn spawn_single_turn_mock_agent_loop(
             .expect("single-turn dispatch should be sent");
         event_tx
             .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                active_thread: request.thread.clone(),
                 locator: request.locator,
                 incoming: request.incoming,
                 messages: vec![ChatMessage::new(
@@ -1408,12 +1573,66 @@ fn spawn_single_turn_mock_agent_loop(
                     "reply-single",
                     Utc::now(),
                 )],
+                prepend_incoming_user: true,
                 loaded_toolsets: Vec::new(),
                 tool_events: Vec::new(),
                 completed_at: Utc::now(),
             }))
             .await
             .expect("single-turn completed turn should be sent");
+    })
+}
+
+fn spawn_compact_mock_agent_loop(
+    event_tx: mpsc::Sender<AgentWorkerEvent>,
+    mut request_rx: mpsc::Receiver<AgentRequest>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let request = request_rx
+            .recv()
+            .await
+            .expect("compact mock agent should receive one request");
+        let mut active_thread = request.thread.clone();
+        active_thread.turns = vec![openjarvis::thread::ConversationTurn::new(
+            None,
+            vec![
+                ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", Utc::now()),
+                ChatMessage::new(ChatMessageRole::User, "继续", Utc::now()),
+            ],
+            Utc::now(),
+            Utc::now(),
+        )];
+
+        event_tx
+            .send(AgentWorkerEvent::Dispatch(build_dispatch_event(
+                &request,
+                AgentLoopEventKind::TextOutput,
+                "reply-after-compact",
+                json!({
+                    "source": "compact_mock_agent",
+                    "is_final": true,
+                }),
+                true,
+            )))
+            .await
+            .expect("compact dispatch should be sent");
+        event_tx
+            .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                active_thread,
+                locator: request.locator,
+                incoming: request.incoming,
+                messages: vec![ChatMessage::new(
+                    ChatMessageRole::Assistant,
+                    "reply-after-compact",
+                    Utc::now(),
+                )],
+                prepend_incoming_user: false,
+                loaded_toolsets: Vec::new(),
+                tool_events: Vec::new(),
+                completed_at: Utc::now(),
+            }))
+            .await
+            .expect("compact completed turn should be sent");
     })
 }
 
@@ -1493,4 +1712,8 @@ fn build_incoming_with(
             receive_id_type: "chat_id".to_string(),
         },
     }
+}
+
+fn empty_thread(thread_id: Uuid, external_thread_id: &str) -> ConversationThread {
+    ConversationThread::with_id(thread_id, external_thread_id.to_string(), Utc::now())
 }

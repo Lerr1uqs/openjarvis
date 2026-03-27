@@ -52,7 +52,10 @@ async fn startup_components_build_from_default_config() {
     let agent = AgentWorker::from_config(&config)
         .await
         .expect("agent should build");
-    let _router = ChannelRouter::new(agent);
+    let _router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
 }
 
 #[test]

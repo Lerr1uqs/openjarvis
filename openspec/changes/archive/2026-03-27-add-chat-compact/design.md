@@ -7,7 +7,7 @@
 - `Compact` 本身是线程级上下文管理器，不天然是 tool。
 - `AutoCompact` 是构建在 `Compact` 之上的可选特性。只有开启 `AutoCompact` 才需要向模型暴露 compact tool 和上下文容量信息。
 - compact 仅作用于 `chat`，不作用于 `system` 和 `memory`。
-- compact 结果必须写回 message 历史，首版压成一个 synthetic turn，两条 message 分别使用 `user` 和 `assistant` 角色。
+- compact 结果必须写回 message 历史，首版压成一个 compacted turn，两条 message 分别使用普通 `assistant` 和 `user` 角色。
 - 首版 compact 完成后，active history 中被压缩的旧 chat 直接被替换掉；但需要为未来改成 archive / shadow copy 留出扩展点。
 - `chat` 范围内天然已经包含用户消息、assistant 消息、tool call 和 tool result，因此 compact 输入实际上是完整 chat history，而不是只处理纯文本对话。
 
@@ -17,7 +17,7 @@
 
 **Goals:**
 - 提供真正的线程级 compact 机制，替代按消息数粗暴裁剪的临时方案。
-- 在触发 compact 时，把当前线程全部历史 `chat` 压缩成一个 synthetic turn，并继续参与后续对话与后续 compact。
+- 在触发 compact 时，把当前线程全部历史 `chat` 压缩成一个 compacted turn，并继续参与后续对话与后续 compact。
 - 提供 token 预算估算能力，覆盖 `system`、`memory`、`chat`、visible tools 和预留输出。
 - 保持 runtime-managed compact 始终存在；在 `auto_compact` 打开时，再为模型增加主动 compact 的能力。
 - 通过 `CompactStrategy` 统一管理不同压缩策略，首版只实现“compact 全量 chat”。
@@ -39,7 +39,7 @@
 - 估算当前线程上下文 token 占用
 - 判断是否触发 runtime compact
 - 调用 `CompactStrategy`
-- 把压缩结果回写为新的 synthetic turn
+- 把压缩结果回写为新的 compacted turn
 - 在 `auto_compact` 开启时，决定是否向模型暴露 compact tool 和上下文预算信息
 
 `auto_compact` 不改变 compact 的本质，它只是给模型一个“提前 compact”的入口。即使 `auto_compact` 关闭，runtime 在硬阈值前也仍然会执行 compact。
@@ -48,20 +48,20 @@ Alternative considered:
 - 把 compact 完全做成普通 tool，只在模型调用时触发。
   Rejected，因为一旦接近硬上限，模型未必还有足够余量做出正确 compact 决策；compact 必须有 runtime 兜底。
 
-### 2. compact 结果写回为一个 synthetic turn，包含两条 message
+### 2. compact 结果写回为一个 compacted turn，包含两条普通 message
 
-首版 compact 结果不是一条 summary message，而是一个 synthetic turn：
+首版 compact 结果不是额外 metadata，也不是 memory，而是一个普通 chat turn：
 
-- synthetic `user` message：提炼任务目标、用户约束、当前请求背景
-- synthetic `assistant` message：提炼当前规划、已完成、未完成、关键事实
+- compacted `assistant` message：明确说明“这是压缩后的上下文”，并提炼任务目标、用户约束、当前背景、当前规划、已完成、未完成和关键事实
+- follow-up `user` message：固定写入“继续”，让后续模型生成自然延续当前任务
 
 这两条 message 仍然属于 `chat`，而不是 `memory`。它们会在后续请求里像正常 chat history 一样参与上下文构造，并且在下一次 compact 时继续被纳入输入。
 
-为了避免和真实历史混淆，compact 产生的两条 message 需要带稳定的 synthetic 标识。实现上优先采用显式 message metadata；如果首版结构还未扩展 metadata，也至少要保留稳定前缀。
+由于 assistant 内容本身已经明确声明“这是压缩后的上下文”，首版不再为 compact 结果新增额外 message metadata 或 turn metadata。
 
 Alternative considered:
 - 只压成一条 summary message。
-  Rejected，因为用户意图/约束和 agent 状态混在一起后，恢复时更容易失真，也不利于后续再次 compact。
+  Rejected，因为需要额外一个 follow-up user message 把对话重新续接回正常节奏。
 
 Alternative considered:
 - 把 compact 结果塞进 `memory`。
@@ -72,9 +72,9 @@ Alternative considered:
 V1 的 active history 处理方式是：
 
 1. 选中当前线程全部历史 chat messages
-2. 调用 compact provider 生成 synthetic turn
+2. 调用 compact provider 生成 compacted turn
 3. 删除被 compact 的旧 chat messages
-4. 插入新的 compacted synthetic turn
+4. 插入新的 compacted turn
 
 也就是 active history 里直接替换，不做 source archive。
 
@@ -149,25 +149,14 @@ Alternative considered:
 - compact tool 始终注册且始终可见。
   Rejected，因为这和 `auto_compact` 的 feature 语义不一致，也会无谓膨胀工具上下文。
 
-### 7. synthetic compact turn 保持 `user/assistant` 角色，但需要在持久化层可识别
+### 7. compacted turn 保持普通 `assistant/user` 角色，不额外引入持久化 metadata
 
-由于用户已经确认 compact 结果可以压成 `user + assistant` 两条 message，因此首版无需引入新的 message role。但持久化层必须能够识别“这两条消息是 compact 产物”，以便：
+由于 compact 结果最终会被重写成：
 
-- UI / 调试区分 synthetic 与真实输入
-- 后续再次 compact 时做更稳定的 prompt 组织
-- 将来切换到 archive / shadow copy 策略时追踪 compact 来源
+- 一条声明“这是压缩后的上下文”的 assistant message
+- 一条固定为“继续”的 user message
 
-因此建议在 `ChatMessage` 或 `ConversationTurn` 上增加最小标记能力，例如：
-
-- `synthetic_kind`
-- `compacted_from_turn_ids`
-- `compacted_at`
-
-如果首版实现不想扩大 message 结构，也至少要给 synthetic 内容保留固定前缀，并在 turn 级别记录 compact 事件。
-
-Alternative considered:
-- 完全不标记 synthetic compact 结果。
-  Rejected，因为后续调试、审计和再次 compact 都会变得脆弱。
+因此首版无需在 `ChatMessage` 或 `ConversationTurn` 上新增额外 metadata。对于 runtime 和调试来说，assistant message 的固定前缀已经足够表达这是 compact 产物；而再次 compact 时，也只需要把它当作普通 chat history 继续压缩即可。
 
 ## Risks / Trade-offs
 
@@ -180,11 +169,11 @@ Alternative considered:
 ## Migration Plan
 
 1. 新增 compact 配置与预算估算模块，保留现有 `max_messages_per_thread` 作为临时兼容路径。
-2. 引入 `CompactManager`、`CompactStrategy` 和 synthetic compact turn 写回逻辑。
+2. 引入 `CompactManager`、`CompactStrategy` 和 compacted turn 写回逻辑。
 3. 将 session/thread 的 chat 裁剪路径替换为 compact 路径，并保留 future source handling 扩展点。
 4. 扩展 ToolRegistry 的线程级工具可见性投影，为 `auto_compact` 控制 compact tool 显隐。
 5. 更新 `arch/system.md` 里的 `agent context容量`、`compact`、`auto-compact` 章节。
-6. 补足预算估算、runtime compact、synthetic turn 持久化和 auto-compact 可见性的测试。
+6. 补足预算估算、runtime compact、compacted turn 写回和 auto-compact 可见性的测试。
 
 Rollback strategy:
 - 可以先关闭 compact 配置，继续沿用现有的按消息数量裁剪逻辑；由于新的 source archive 还未启用，回滚路径相对直接。

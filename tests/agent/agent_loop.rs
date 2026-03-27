@@ -7,9 +7,12 @@ use openjarvis::{
         ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry, ToolsetCatalogEntry,
         empty_tool_input_schema,
     },
+    compact::CompactScopeKey,
+    config::AppConfig,
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
     model::ReplyTarget,
+    thread::ConversationThread,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -631,6 +634,385 @@ Read `guide.md` before replying.
     );
 }
 
+#[tokio::test]
+async fn agent_loop_runtime_compacts_persisted_history_before_final_llm_request() {
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    runtime_threshold_ratio: 0.25
+    tool_visible_threshold_ratio: 0.9
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 1000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("compact config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                text_response(
+                    "{\"compacted_assistant\":\"这是压缩后的上下文，任务目标是继续处理当前问题。\"}",
+                ),
+                text_response("压缩后继续"),
+            ])),
+        }),
+        runtime_without_skills(),
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let active_thread = thread_with_history(vec![
+        ChatMessage::new(
+            ChatMessageRole::User,
+            "这是一段很长的历史问题，需要被压缩。".repeat(40),
+            chrono::Utc::now(),
+        ),
+        ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "这是一段很长的历史回答，也需要被压缩。".repeat(40),
+            chrono::Utc::now(),
+        ),
+    ]);
+
+    let output = loop_runner
+        .run_with_thread(input, &build_context("system", "新的问题"), active_thread)
+        .await
+        .expect("loop should compact history before the final request");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 2);
+    assert!(captured_requests[0].tools.is_empty());
+    assert!(captured_requests[1].messages.iter().any(|message| {
+        message
+            .content
+            .contains("这是压缩后的上下文，请基于这些信息继续当前任务")
+    }));
+    assert!(
+        captured_requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content == "继续")
+    );
+    assert!(
+        !captured_requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content == "新的问题")
+    );
+    assert_eq!(output.reply, "压缩后继续");
+    assert_eq!(output.events[0].kind, AgentLoopEventKind::Compact);
+    assert_eq!(output.events[1].kind, AgentLoopEventKind::TextOutput);
+    assert!(!output.prepend_incoming_user);
+    assert_eq!(output.active_thread.turns.len(), 1);
+}
+
+#[tokio::test]
+async fn agent_loop_auto_compact_injects_status_prompt_before_budget_threshold() {
+    // 测试场景: auto_compact 开启后，每次 generate 都应注入容量提示；
+    // 即使预算远低于阈值，也要暴露 compact 工具，只是不升级为提前告警。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    auto_compact: true
+    runtime_threshold_ratio: 1.0
+    tool_visible_threshold_ratio: 0.95
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 20000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("auto compact config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![text_response("直接继续")])),
+        }),
+        runtime_without_skills(),
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "短消息"))
+        .await
+        .expect("loop should expose compact tool before threshold");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 1);
+    assert!(
+        captured_requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "compact")
+    );
+    assert!(
+        captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<context capacity"))
+    );
+    assert!(
+        captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("`compact` 工具当前可用"))
+    );
+    assert!(
+        !captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("超过 auto_compact 提前提醒阈值"))
+    );
+    assert_eq!(output.reply, "直接继续");
+    assert_eq!(output.events.len(), 1);
+    assert_eq!(output.events[0].kind, AgentLoopEventKind::TextOutput);
+}
+
+#[tokio::test]
+async fn agent_loop_runtime_override_can_enable_auto_compact_for_current_thread() {
+    // 测试场景: 即使静态 compact 默认关闭，命令层写入的线程级 runtime override 也应让后续轮次开启 auto-compact。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: false
+    auto_compact: false
+    runtime_threshold_ratio: 1.0
+    tool_visible_threshold_ratio: 0.95
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 20000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("compact override config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let runtime = runtime_without_skills();
+    runtime
+        .compact_runtime()
+        .set_compact_enabled(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
+        .await;
+    runtime
+        .compact_runtime()
+        .set_auto_compact(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
+        .await;
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![text_response("override 生效")])),
+        }),
+        runtime,
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+
+    let output = loop_runner
+        .run(input, &build_context("system", "普通问题"))
+        .await
+        .expect("loop should honor thread-scoped auto-compact override");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 1);
+    assert!(
+        captured_requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "compact")
+    );
+    assert!(
+        captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<context capacity"))
+    );
+    assert_eq!(output.reply, "override 生效");
+}
+
+#[tokio::test]
+async fn agent_loop_runtime_override_can_execute_compact_tool_when_static_compact_disabled() {
+    // 测试场景: 即使静态 compact 默认关闭，只要线程级 override 开启，模型调用 compact 也应真正成功。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: false
+    auto_compact: false
+    runtime_threshold_ratio: 1.0
+    tool_visible_threshold_ratio: 0.1
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 3000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("compact override config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let runtime = runtime_without_skills();
+    runtime
+        .compact_runtime()
+        .set_compact_enabled(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
+        .await;
+    runtime
+        .compact_runtime()
+        .set_auto_compact(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
+        .await;
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response("compact", serde_json::json!({})),
+                text_response("{\"compacted_assistant\":\"这是 override 触发后的压缩上下文。\"}"),
+                text_response("override compact 完成"),
+            ])),
+        }),
+        runtime,
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let active_thread = thread_with_history(vec![
+        ChatMessage::new(
+            ChatMessageRole::User,
+            "需要被 override compact 的历史问题".repeat(15),
+            chrono::Utc::now(),
+        ),
+        ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "需要被 override compact 的历史回答".repeat(15),
+            chrono::Utc::now(),
+        ),
+    ]);
+
+    let output = loop_runner
+        .run_with_thread(input, &build_context("system", "请继续"), active_thread)
+        .await
+        .expect("loop should allow compact tool after runtime override");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 3);
+    assert_eq!(output.events[0].kind, AgentLoopEventKind::ToolCall);
+    assert_eq!(output.events[1].kind, AgentLoopEventKind::Compact);
+    assert_eq!(output.events[2].kind, AgentLoopEventKind::TextOutput);
+    assert_eq!(output.reply, "override compact 完成");
+}
+
+#[tokio::test]
+async fn agent_loop_auto_compact_injects_budget_prompt_and_exposes_compact_tool() {
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    auto_compact: true
+    runtime_threshold_ratio: 1.0
+    tool_visible_threshold_ratio: 0.1
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 3000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("auto compact config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                tool_only_response("compact", serde_json::json!({})),
+                text_response(
+                    "{\"compacted_assistant\":\"这是压缩后的上下文，保留当前任务约束。\"}",
+                ),
+                text_response("继续完成"),
+            ])),
+        }),
+        runtime_without_skills(),
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let active_thread = thread_with_history(vec![
+        ChatMessage::new(
+            ChatMessageRole::User,
+            "需要大量上下文的历史问题".repeat(15),
+            chrono::Utc::now(),
+        ),
+        ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "需要大量上下文的历史回答".repeat(15),
+            chrono::Utc::now(),
+        ),
+    ]);
+
+    let output = loop_runner
+        .run_with_thread(input, &build_context("system", "请继续"), active_thread)
+        .await
+        .expect("loop should expose the compact tool");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 3);
+    assert!(
+        captured_requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "compact")
+    );
+    assert!(
+        captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<context capacity"))
+    );
+    assert!(
+        captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("超过 auto_compact 提前提醒阈值"))
+    );
+    let final_request = captured_requests
+        .last()
+        .expect("final post-compact request should exist");
+    assert!(
+        final_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<context capacity"))
+    );
+    assert_eq!(output.events[0].kind, AgentLoopEventKind::ToolCall);
+    assert_eq!(output.events[1].kind, AgentLoopEventKind::Compact);
+    assert_eq!(output.events[2].kind, AgentLoopEventKind::TextOutput);
+    assert!(
+        final_request
+            .messages
+            .iter()
+            .any(|message| message.content == "继续")
+    );
+    assert!(
+        !final_request
+            .messages
+            .iter()
+            .any(|message| message.content == "请继续")
+    );
+    assert_eq!(output.metadata["used_tool_name"], "compact");
+    assert!(!output.prepend_incoming_user);
+    assert_eq!(output.reply, "继续完成");
+}
+
 fn build_context(system_prompt: &str, user_message: &str) -> MessageContext {
     // 作用: 为 agent loop 测试构造一个最小上下文，模拟 worker 从 session 中拼好的 MessageContext。
     // 参数: system_prompt 为系统提示词，user_message 为用户输入文本。
@@ -650,6 +1032,13 @@ fn runtime_without_skills() -> AgentRuntime {
     )
 }
 
+fn thread_with_history(history: Vec<ChatMessage>) -> ConversationThread {
+    let now = chrono::Utc::now();
+    let mut thread = ConversationThread::new("default", now);
+    thread.store_turn(None, history, now, now);
+    thread
+}
+
 fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
     let (tx, rx) = mpsc::channel(32);
     (
@@ -657,6 +1046,7 @@ fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
             channel: "feishu".to_string(),
             user_id: "ou_xxx".to_string(),
             thread_id: "thread_1".to_string(),
+            compact_scope_key: CompactScopeKey::new("feishu", "ou_xxx", "thread_1"),
             event_tx: AgentEventSender::new(
                 tx,
                 "feishu",

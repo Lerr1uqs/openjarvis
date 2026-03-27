@@ -16,6 +16,12 @@ feishu:
 
 agent:
   hook: {}
+  compact:
+    enabled: false
+    auto_compact: false
+    runtime_threshold_ratio: 0.85
+    tool_visible_threshold_ratio: 0.70
+    reserved_output_tokens: 1024
   # 示例:
   # hook:
   #   user_prompt_submit: ["echo", "user prompt submitted"]
@@ -28,3 +34,5 @@ llm:
   api_key: ""
   api_key_path: ""
   mock_response: "[openjarvis][DEBUG] 测试回复"
+  context_window_tokens: 8192
+  tokenizer: "chars_div4"

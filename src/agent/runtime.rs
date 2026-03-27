@@ -1,6 +1,7 @@
-//! Shared runtime container that holds hooks, tools, and MCP registries for one agent.
+//! Shared runtime container that holds hooks, tools, compact runtime switches, and MCP registries for one agent.
 
 use super::{hook::HookRegistry, tool::ToolRegistry};
+use crate::compact::CompactRuntimeManager;
 use crate::config::AgentConfig;
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
@@ -9,6 +10,7 @@ use std::{path::PathBuf, sync::Arc};
 pub struct AgentRuntime {
     hooks: Arc<HookRegistry>,
     tools: Arc<ToolRegistry>,
+    compact_runtime: Arc<CompactRuntimeManager>,
 }
 
 impl AgentRuntime {
@@ -17,6 +19,7 @@ impl AgentRuntime {
         Self {
             hooks: Arc::new(HookRegistry::new()),
             tools: Arc::new(ToolRegistry::new()),
+            compact_runtime: Arc::new(CompactRuntimeManager::new()),
         }
     }
 
@@ -51,11 +54,16 @@ impl AgentRuntime {
                 ToolRegistry::from_config_with_skill_roots(config.tool_config(), skill_roots)
                     .await?,
             ),
+            compact_runtime: Arc::new(CompactRuntimeManager::new()),
         })
     }
 
     pub fn with_parts(hooks: Arc<HookRegistry>, tools: Arc<ToolRegistry>) -> Self {
-        Self { hooks, tools }
+        Self {
+            hooks,
+            tools,
+            compact_runtime: Arc::new(CompactRuntimeManager::new()),
+        }
     }
 
     /// Return the shared hook registry.
@@ -66,6 +74,11 @@ impl AgentRuntime {
     /// Return the shared tool registry.
     pub fn tools(&self) -> Arc<ToolRegistry> {
         Arc::clone(&self.tools)
+    }
+
+    /// Return the shared compact runtime override manager.
+    pub fn compact_runtime(&self) -> Arc<CompactRuntimeManager> {
+        Arc::clone(&self.compact_runtime)
     }
 }
 

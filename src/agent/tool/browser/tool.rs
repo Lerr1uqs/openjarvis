@@ -530,9 +530,10 @@ impl ToolHandler for BrowserTypeMatchTool {
         context: ToolCallContext,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
-        let thread_id = self.base.require_thread_id(&context, "browser__type_match")?;
-        let args: BrowserTypeMatchArguments =
-            parse_tool_arguments(request, "browser__type_match")?;
+        let thread_id = self
+            .base
+            .require_thread_id(&context, "browser__type_match")?;
+        let args: BrowserTypeMatchArguments = parse_tool_arguments(request, "browser__type_match")?;
         let matched = resolve_element_match(&self.base.sessions, thread_id, &args.matcher).await?;
         let result = self
             .base
@@ -760,8 +761,8 @@ fn build_helper_manager_config(
     chrome_path: Option<PathBuf>,
     default_root_dir_name: &str,
 ) -> BrowserSessionManagerConfig {
-    let artifact_root = output_dir
-        .unwrap_or_else(|| std::env::temp_dir().join(default_root_dir_name));
+    let artifact_root =
+        output_dir.unwrap_or_else(|| std::env::temp_dir().join(default_root_dir_name));
     let script_path = script_path.unwrap_or_else(default_sidecar_script_path);
     BrowserSessionManagerConfig {
         process: BrowserProcessCommandSpec {
@@ -801,7 +802,9 @@ async fn run_smoke_flow(manager: &BrowserSessionManager, url: &str) -> Result<()
 const DEFAULT_MATCH_MAX_ELEMENTS: usize = 500;
 
 fn resolve_match_limit(args: &BrowserElementMatchArguments) -> usize {
-    args.max_elements.unwrap_or(DEFAULT_MATCH_MAX_ELEMENTS).clamp(1, 500)
+    args.max_elements
+        .unwrap_or(DEFAULT_MATCH_MAX_ELEMENTS)
+        .clamp(1, 500)
 }
 
 async fn resolve_element_match(
@@ -907,7 +910,9 @@ fn bool_equals_if_present(actual: bool, expected: Option<bool>) -> bool {
 }
 
 fn contains_ignore_ascii_case(actual: &str, expected: &str) -> bool {
-    actual.to_ascii_lowercase().contains(&expected.to_ascii_lowercase())
+    actual
+        .to_ascii_lowercase()
+        .contains(&expected.to_ascii_lowercase())
 }
 
 fn describe_matcher(args: &BrowserElementMatchArguments) -> String {
@@ -1038,7 +1043,11 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
             BrowserScriptStep::ClickMatch { matcher } => {
                 let matched = resolve_element_match(manager, thread_id, matcher).await?;
                 let result = manager.click_ref(thread_id, &matched.reference).await?;
-                println!("step {} click_match: {}", index + 1, describe_matcher(matcher));
+                println!(
+                    "step {} click_match: {}",
+                    index + 1,
+                    describe_matcher(matcher)
+                );
                 println!(
                     "matched_ref: {} ({}/{})",
                     matched.reference, matched.role, matched.tag_name
@@ -1071,14 +1080,13 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
             } => {
                 let matched = resolve_element_match(manager, thread_id, matcher).await?;
                 let result = manager
-                    .type_ref(
-                        thread_id,
-                        &matched.reference,
-                        text,
-                        submit.unwrap_or(false),
-                    )
+                    .type_ref(thread_id, &matched.reference, text, submit.unwrap_or(false))
                     .await?;
-                println!("step {} type_match: {}", index + 1, describe_matcher(matcher));
+                println!(
+                    "step {} type_match: {}",
+                    index + 1,
+                    describe_matcher(matcher)
+                );
                 println!(
                     "matched_ref: {} ({}/{})",
                     matched.reference, matched.role, matched.tag_name
@@ -1095,7 +1103,11 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
             BrowserScriptStep::Close => {
                 let result = manager.close(thread_id).await?;
                 explicitly_closed = true;
-                println!("step {} close: had_session={}", index + 1, result.had_session);
+                println!(
+                    "step {} close: had_session={}",
+                    index + 1,
+                    result.had_session
+                );
                 if let Some(artifacts) = result.artifacts {
                     println!("artifacts: {}", artifacts.session_dir.display());
                 }
@@ -1246,7 +1258,12 @@ impl MockBrowserState {
             },
         ];
         let limit = max_elements.unwrap_or(self.elements.len());
-        let visible_elements = self.elements.iter().take(limit).cloned().collect::<Vec<_>>();
+        let visible_elements = self
+            .elements
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
         let snapshot_text = format!(
             "URL: {}\nTitle: {}\n[1] link More information -> https://example.com/more\n[2] textbox Search",
             self.current_url_or_blank(),

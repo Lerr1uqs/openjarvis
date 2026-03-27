@@ -12,6 +12,9 @@
 - [ ] tiktoken + 占用图
 - [ ] llm provider掉线重试方式？
 - [ ] searching tool tavily brave metaso
+- [ ] 需要有一个thread级别的全局状态来管理auto-compact 这种feature的开放 另外这个可以被Command打开 /auto-compact enable
+- [ ] 飞书不是先react再回复的
+- [ ] 压缩上下文的prompt注入
 
 # clean
 - [ ] sidecar

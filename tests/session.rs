@@ -339,6 +339,76 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
     assert_eq!(second_state.loaded_toolsets, vec!["demo_b".to_string()]);
 }
 
+#[tokio::test]
+async fn store_turn_with_active_thread_replaces_old_history_before_appending_new_turn() {
+    // 测试场景: compact 已经替换 active history 后，session 应写回 compacted turn，再追加本轮新 turn。
+    let manager = SessionManager::new();
+    let first_incoming = build_incoming("msg_compact_1", "before compact");
+    let locator = manager.load_or_create_thread(&first_incoming).await;
+    manager
+        .store_turn(
+            &locator,
+            first_incoming.external_message_id.clone(),
+            vec![
+                ChatMessage::new(
+                    ChatMessageRole::User,
+                    "before compact",
+                    first_incoming.received_at,
+                ),
+                ChatMessage::new(ChatMessageRole::Assistant, "old reply", Utc::now()),
+            ],
+            first_incoming.received_at,
+            Utc::now(),
+        )
+        .await;
+
+    let mut compacted_thread = manager
+        .load_thread_state(&locator)
+        .await
+        .thread
+        .expect("thread should exist before compact");
+    compacted_thread.turns = vec![openjarvis::thread::ConversationTurn::new(
+        None,
+        vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", Utc::now()),
+            ChatMessage::new(ChatMessageRole::User, "继续", Utc::now()),
+        ],
+        Utc::now(),
+        Utc::now(),
+    )];
+
+    manager
+        .store_turn_with_active_thread(
+            &locator,
+            Some(compacted_thread),
+            Some("msg_compact_2".to_string()),
+            vec![
+                ChatMessage::new(ChatMessageRole::User, "new question", Utc::now()),
+                ChatMessage::new(ChatMessageRole::Assistant, "new reply", Utc::now()),
+            ],
+            Utc::now(),
+            Utc::now(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+
+    let session = manager
+        .get_session(&SessionKey::from_incoming(&first_incoming))
+        .await
+        .expect("session should exist");
+    let thread = session
+        .threads
+        .get(&locator.thread_id)
+        .expect("thread should exist");
+
+    assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.turns[0].messages[0].content, "这是压缩后的上下文");
+    assert_eq!(thread.turns[0].messages[1].content, "继续");
+    assert_eq!(thread.turns[1].messages[0].content, "new question");
+    assert_eq!(thread.turns[1].messages[1].content, "new reply");
+}
+
 fn build_incoming(message_id: &str, content: &str) -> IncomingMessage {
     build_incoming_with_thread(message_id, content, None)
 }

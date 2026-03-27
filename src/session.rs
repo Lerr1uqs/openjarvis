@@ -11,6 +11,7 @@ use crate::thread::{ConversationThread, ThreadToolEvent};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -175,6 +176,7 @@ pub struct SessionStrategy {
 
 #[derive(Debug, Clone, Default)]
 pub struct StoredThreadState {
+    pub thread: Option<ConversationThread>,
     pub messages: Vec<ChatMessage>,
     pub loaded_toolsets: Vec<String>,
     pub tool_events: Vec<ThreadToolEvent>,
@@ -335,6 +337,7 @@ impl SessionManager {
             .get(&locator.session_key())
             .and_then(|session| session.threads.get(&locator.thread_id))
             .map(|thread| StoredThreadState {
+                thread: Some(thread.clone()),
                 messages: thread.load_messages(),
                 loaded_toolsets: thread.load_toolsets(),
                 tool_events: thread.load_tool_events(),
@@ -398,6 +401,31 @@ impl SessionManager {
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
     ) -> Uuid {
+        self.store_turn_with_active_thread(
+            locator,
+            None,
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+            loaded_toolsets,
+            tool_events,
+        )
+        .await
+    }
+
+    /// Store one completed turn after optionally replacing the current active thread history.
+    pub async fn store_turn_with_active_thread(
+        &self,
+        locator: &ThreadLocator,
+        active_thread: Option<ConversationThread>,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        loaded_toolsets: Vec<String>,
+        tool_events: Vec<ThreadToolEvent>,
+    ) -> Uuid {
         let session_key = locator.session_key();
         let mut sessions = self.sessions.write().await;
         let session = sessions
@@ -408,6 +436,14 @@ impl SessionManager {
             locator.thread_id,
             completed_at,
         );
+        if let Some(active_thread) = active_thread {
+            info!(
+                thread_id = %locator.thread_id,
+                turn_count = active_thread.turns.len(),
+                "replacing active thread history before storing turn"
+            );
+            thread.overwrite_active_history(&active_thread);
+        }
         let turn_id = thread.store_turn_state(
             external_message_id,
             messages,

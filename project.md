@@ -62,7 +62,7 @@ OpenJarvis 当前是一个消息驱动的 Rust agent 运行时，目标是让外
 
 -> `AgentRuntime::from_config()`
 
--> `ChannelRouter::new()`
+-> `ChannelRouter::builder().agent(...).build()`
 
 -> `ChannelRouter::register_channels()`
 
