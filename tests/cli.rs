@@ -1,6 +1,6 @@
 use clap::Parser;
 use openjarvis::{
-    cli::{InternalMcpCommand, OpenJarvisCli},
+    cli::{InternalBrowserCommand, InternalMcpCommand, OpenJarvisCli},
     config::{AgentMcpServerTransportConfig, AppConfig, BUILTIN_MCP_SERVER_NAME},
 };
 
@@ -44,6 +44,63 @@ fn cli_parses_internal_demo_http_command() {
         }
         other => panic!("unexpected parsed command: {other:?}"),
     }
+}
+
+#[test]
+fn cli_parses_internal_browser_smoke_command() {
+    // 验证 smoke helper 的核心参数能按预期解析。
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-browser",
+        "smoke",
+        "--url",
+        "https://example.com",
+        "--headless",
+    ]);
+
+    match cli.internal_browser_command() {
+        Some(InternalBrowserCommand::Smoke { url, headless, .. }) => {
+            assert_eq!(url, "https://example.com");
+            assert!(*headless);
+        }
+        other => panic!("unexpected parsed browser command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parses_internal_browser_script_command() {
+    // 验证 script helper 可以接收步骤文件并开启 headless 模式。
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-browser",
+        "script",
+        "--steps-file",
+        "tmp/browser-steps.json",
+        "--headless",
+    ]);
+
+    match cli.internal_browser_command() {
+        Some(InternalBrowserCommand::Script {
+            steps_file,
+            headless,
+            ..
+        }) => {
+            assert_eq!(steps_file, &std::path::PathBuf::from("tmp/browser-steps.json"));
+            assert!(*headless);
+        }
+        other => panic!("unexpected parsed browser command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parses_internal_browser_mock_sidecar_command() {
+    // 验证测试用 mock-sidecar 子命令仍然可解析。
+    let cli = OpenJarvisCli::parse_from(["openjarvis", "internal-browser", "mock-sidecar"]);
+
+    assert!(matches!(
+        cli.internal_browser_command(),
+        Some(InternalBrowserCommand::MockSidecar)
+    ));
 }
 
 #[test]

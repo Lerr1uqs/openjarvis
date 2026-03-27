@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "browser:sidecar": "node scripts/browser_sidecar.mjs",
     "feishu:ws": "node scripts/feishu_ws_client.mjs"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "1.59.0"
+    "@larksuiteoapi/node-sdk": "1.59.0",
+    "playwright": "^1.55.1"
   }
 }

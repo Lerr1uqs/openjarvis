@@ -107,9 +107,10 @@
 
 1. `snapshot`
 2. 从 snapshot 中拿到元素 `ref`
-3. `click <ref>` / `type <ref>` / `highlight <ref>` / `screenshot --ref <ref>`
-4. 页面变化后重新 `snapshot`
-5. 继续下一轮动作
+3. 优先执行 `click <ref>` / `type <ref>` / `highlight <ref>` / `screenshot --ref <ref>`
+4. 如果动态页面导致 `ref` 漂移，则退回到 `click_match(...)` / `type_match(...)`
+5. 页面变化后重新 `snapshot`
+6. 继续下一轮动作
 
 ## 4. 当前 Rust 生态调研
 
@@ -339,6 +340,70 @@ Playwright 官方文档当前主要面向 Node.js / Python / Java / .NET。
 - `trace_stop`
 - `responsebody`
 
+### 6.4 当前仓库原型验证入口
+
+当前仓库已经落了首版 `browser` toolset 原型，执行链路为：
+
+`Rust browser tool -> Node Playwright sidecar -> Chrome`
+
+当前实现除了基础的 `navigate / snapshot / click_ref / type_ref / screenshot / close`
+之外，还补了一层“语义匹配定位”能力：
+
+- `browser__click_match`
+- `browser__type_match`
+
+这层能力会先抓一份新的 snapshot，再按 `role`、`tag_name`、`label_contains`、
+`text_contains`、`href_contains`、`placeholder_contains`、`input_type`、
+`section_hint`、`disabled`、`nth` 这些条件重新定位元素，然后再执行动作。
+
+它主要用来处理搜索结果页、瀑布流列表、前端重排等 `ref` 容易漂移的动态页面。
+
+本地前置条件：
+
+- 已安装 Node.js，并且仓库根目录执行过 `npm install`
+- 已安装本机 Chrome，或者显式设置 `OPENJARVIS_BROWSER_CHROME_PATH`
+- 如需跑真实浏览器 smoke，建议先确认 `scripts/browser_sidecar.mjs` 可被 `node` 正常启动
+
+当前可用的本地验证入口：
+
+- `npm run browser:sidecar`
+  用途：直接启动 Node sidecar，通常配合 Rust helper 或手动 stdio 调试使用
+- `cargo run --bin openjarvis -- internal-browser smoke --url https://example.com --headless`
+  用途：通过 Rust helper 完成 `navigate -> snapshot -> screenshot -> close` 的最小闭环
+- `cargo run --bin openjarvis -- internal-browser script --steps-file tmp/browser-steps.json --headless`
+  用途：通过 JSON 步骤执行多步浏览器流程，支持 `navigate`、`snapshot`、`click_ref`、
+  `type_ref`、`click_match`、`type_match`、`screenshot`、`close`
+- `cargo run --bin browser_bilibili_search_dump -- --headless`
+  用途：执行固定的 B 站完整性验证链路
+  `bilibili -> 搜索“咒术回战” -> 点击第一个 href 包含 /video/ 的结果 -> dump 视频页`
+- `cargo test --test agent_test browser_sidecar_service_smoke_runs_against_real_node_sidecar -- --ignored --nocapture`
+  用途：执行真实浏览器链路 smoke test，默认不进入普通测试集
+
+`internal-browser script` 的一个典型示例如下：
+
+```json
+[
+  { "action": "navigate", "url": "https://www.bilibili.com" },
+  { "action": "type_match", "role": "textbox", "nth": 1, "text": "咒术回战", "submit": true },
+  { "action": "click_match", "role": "link", "href_contains": "/video/", "nth": 1 },
+  { "action": "snapshot", "max_elements": 180 },
+  { "action": "screenshot" }
+]
+```
+
+如果本机 Chrome 不在默认路径，可以这样运行：
+
+```powershell
+$env:OPENJARVIS_BROWSER_CHROME_PATH='C:\Program Files\Google\Chrome\Application\chrome.exe'
+cargo run --bin openjarvis -- internal-browser smoke --url https://example.com --headless
+```
+
+调试产物说明：
+
+- `internal-browser smoke` 默认会保留本次运行的 session 目录
+- 输出里会打印 `artifacts:` 路径，目录中至少会包含独立 `user-data-dir` 和 screenshot 产物
+- `browser` toolset 在正常 agent 线程内调用时默认不保留临时目录；显式 `browser__close` 或卸载 toolset 后会清理本次会话目录
+
 ## 7. 一个浏览器任务的推荐执行流程
 
 如果是 Agent 驱动浏览器，建议按下面的生命周期来做：
@@ -348,10 +413,11 @@ Playwright 官方文档当前主要面向 Node.js / Python / Java / .NET。
 3. 启动浏览器控制服务，建立到 Chromium 的 CDP 连接。
 4. 打开页面并 `navigate`。
 5. 生成一次 `snapshot` 和必要的 `screenshot`。
-6. 模型根据 snapshot 中的 `ref` 发出 `click(ref)`、`type(ref, text)` 等动作。
-7. 页面变化后重新 `snapshot`，进入下一轮观察-行动循环。
-8. 保存 snapshot、截图、PDF、console、requests、errors、trace 等产物。
-9. 清理页面、关闭浏览器、删除临时目录。
+6. 模型优先根据 snapshot 中的 `ref` 发出 `click(ref)`、`type(ref, text)` 等动作。
+7. 如果目标位于动态列表或 `ref` 已经失稳，则改用 `click_match(...)`、`type_match(...)`。
+8. 页面变化后重新 `snapshot`，进入下一轮观察-行动循环。
+9. 保存 snapshot、截图、PDF、console、requests、errors、trace 等产物。
+10. 清理页面、关闭浏览器、删除临时目录。
 
 最关键的工程原则：
 

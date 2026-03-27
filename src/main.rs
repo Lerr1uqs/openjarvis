@@ -3,7 +3,10 @@
 use anyhow::Result;
 use clap::Parser;
 use openjarvis::{
-    agent::{AgentRuntime, AgentWorker, tool::mcp::demo},
+    agent::{
+        AgentRuntime, AgentWorker,
+        tool::{browser, mcp::demo},
+    },
     cli::OpenJarvisCli,
     config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     llm::build_provider,
@@ -16,9 +19,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 async fn main() -> Result<()> {
     let cli = OpenJarvisCli::parse();
     init_tracing();
-
+    // test-only
     if let Some(command) = cli.internal_mcp_command() {
         return demo::run_internal_demo_command(command).await;
+    }
+    if let Some(command) = cli.internal_browser_command() {
+        return browser::run_internal_browser_command(command).await;
     }
 
     let mut config = AppConfig::load()?;

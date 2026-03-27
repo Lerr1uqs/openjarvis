@@ -1,5 +1,6 @@
 //! Shared tool traits, schemas, and registry for the built-in agent tool set.
 
+pub mod browser;
 pub mod edit;
 pub mod mcp;
 pub mod read;
@@ -120,6 +121,34 @@ pub struct ToolCallResult {
     pub is_error: bool,
 }
 
+/// Thread-scoped runtime context attached to one tool invocation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallContext {
+    pub thread_id: Option<String>,
+}
+
+impl ToolCallContext {
+    /// Create a tool call context bound to one internal thread id.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::ToolCallContext;
+    ///
+    /// let context = ToolCallContext::for_thread("thread-1");
+    /// assert_eq!(context.thread_id(), Some("thread-1"));
+    /// ```
+    pub fn for_thread(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: Some(thread_id.into()),
+        }
+    }
+
+    /// Return the bound internal thread id when present.
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+}
+
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     /// Return the definition exposed to the agent loop and the model provider.
@@ -127,12 +156,32 @@ pub trait ToolHandler: Send + Sync {
 
     /// Execute one tool call and return a normalized result payload.
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult>;
+
+    /// Execute one tool call with optional thread-scoped runtime context.
+    async fn call_with_context(
+        &self,
+        context: ToolCallContext,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        let _ = context;
+        self.call(request).await
+    }
+}
+
+#[async_trait]
+pub trait ToolsetRuntime: Send + Sync {
+    /// Run cleanup when one toolset is unloaded from the current internal thread.
+    async fn on_unload(&self, thread_id: &str) -> Result<()> {
+        let _ = thread_id;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 struct StaticToolsetDefinition {
     entry: ToolsetCatalogEntry,
     handlers: HashMap<String, Arc<dyn ToolHandler>>,
+    runtime: Option<Arc<dyn ToolsetRuntime>>,
 }
 
 #[derive(Clone)]
@@ -288,6 +337,17 @@ impl ToolRegistry {
         entry: ToolsetCatalogEntry,
         handlers: Vec<Arc<dyn ToolHandler>>,
     ) -> Result<()> {
+        self.register_toolset_with_runtime(entry, handlers, None)
+            .await
+    }
+
+    /// Register one program-defined static toolset with optional lifecycle callbacks.
+    pub async fn register_toolset_with_runtime(
+        &self,
+        entry: ToolsetCatalogEntry,
+        handlers: Vec<Arc<dyn ToolHandler>>,
+        runtime: Option<Arc<dyn ToolsetRuntime>>,
+    ) -> Result<()> {
         validate_toolset_name(&entry.name)?;
 
         let mut routed_handlers = HashMap::new();
@@ -313,6 +373,7 @@ impl ToolRegistry {
             RegisteredToolset::Static(StaticToolsetDefinition {
                 entry,
                 handlers: routed_handlers,
+                runtime,
             }),
         );
         Ok(())
@@ -324,6 +385,9 @@ impl ToolRegistry {
         self.register_if_missing(Arc::new(WriteTool::new())).await;
         self.register_if_missing(Arc::new(EditTool::new())).await;
         self.register_if_missing(Arc::new(ShellTool::new())).await;
+        if !self.toolset_registered("browser").await {
+            browser::register_browser_toolset(self).await?;
+        }
         self.skills.reload().await?;
         self.sync_skill_handlers().await;
         Ok(())
@@ -342,7 +406,9 @@ impl ToolRegistry {
             bail!("tool `{}` is not registered", request.name);
         };
 
-        handler.call(request).await
+        handler
+            .call_with_context(ToolCallContext::default(), request)
+            .await
     }
 
     /// Return all registered tool definitions.
@@ -384,6 +450,7 @@ impl ToolRegistry {
         thread_id: &str,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
+        let context = ToolCallContext::for_thread(thread_id);
         match request.name.as_str() {
             "load_toolset" => self.load_toolset(thread_id, request).await,
             "unload_toolset" => self.unload_toolset(thread_id, request).await,
@@ -395,14 +462,14 @@ impl ToolRegistry {
                     .get(&request.name)
                     .cloned()
                 {
-                    return handler.call(request).await;
+                    return handler.call_with_context(context.clone(), request).await;
                 }
 
                 let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
                 for toolset_name in loaded_toolsets {
                     let handlers = self.resolve_toolset_handlers(&toolset_name).await?;
                     if let Some(handler) = handlers.get(&request.name).cloned() {
-                        return handler.call(request).await;
+                        return handler.call_with_context(context.clone(), request).await;
                     }
                 }
 
@@ -485,6 +552,10 @@ impl ToolRegistry {
         handlers.entry(definition.name).or_insert(handler);
     }
 
+    pub(crate) async fn toolset_registered(&self, toolset_name: &str) -> bool {
+        self.toolsets.read().await.contains_key(toolset_name)
+    }
+
     async fn ensure_tool_name_available(&self, tool_name: &str) -> Result<()> {
         if self
             .always_visible_handlers
@@ -534,6 +605,21 @@ impl ToolRegistry {
                     })
                     .collect())
             }
+        }
+    }
+
+    async fn resolve_toolset_runtime(
+        &self,
+        toolset_name: &str,
+    ) -> Result<Option<Arc<dyn ToolsetRuntime>>> {
+        let toolset = self.toolsets.read().await.get(toolset_name).cloned();
+        let Some(toolset) = toolset else {
+            bail!("toolset `{toolset_name}` is not registered");
+        };
+
+        match toolset {
+            RegisteredToolset::Static(definition) => Ok(definition.runtime),
+            RegisteredToolset::McpServer { .. } => Ok(None),
         }
     }
 
@@ -631,6 +717,16 @@ impl ToolRegistry {
         let toolset_name = args.name.trim();
         if toolset_name.is_empty() {
             bail!("unload_toolset requires a non-empty `name`");
+        }
+
+        let is_loaded = self
+            .thread_runtimes
+            .loaded_toolsets(thread_id)
+            .await
+            .into_iter()
+            .any(|loaded_name| loaded_name == toolset_name);
+        if is_loaded && let Ok(Some(runtime)) = self.resolve_toolset_runtime(toolset_name).await {
+            runtime.on_unload(thread_id).await?;
         }
 
         let removed = self

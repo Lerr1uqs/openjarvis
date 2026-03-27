@@ -2,6 +2,7 @@
 name = "openjarvis"
 version = "0.1.0"
 edition = "2024"
+default-run = "openjarvis"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -25,3 +26,7 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 [[bin]]
 name = "llm_test"
 path = "scripts/llm_test.rs"
+
+[[bin]]
+name = "browser_bilibili_search_dump"
+path = "scripts/browser_bilibili_search_dump.rs"

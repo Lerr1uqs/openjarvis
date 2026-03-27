@@ -11,3 +11,6 @@
 - [ ] command 能够解析用户输入转换为格式化的schema从而进行execute
 - [ ] tiktoken + 占用图
 - [ ] llm provider掉线重试方式？
+
+# clean
+- [ ] sidecar

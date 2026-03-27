@@ -495,8 +495,9 @@ async fn agent_loop_refreshes_tools_after_load_and_hides_them_after_unload_in_sa
     assert!(second_tools.contains(&"demo__echo"));
     assert!(!fourth_tools.contains(&"demo__echo"));
     assert!(
-        first_messages.iter().any(|content| content
-            .contains("Available toolsets:\n- demo: Demo toolset for loop refresh")),
+        first_messages
+            .iter()
+            .any(|content| content.contains("- demo: Demo toolset for loop refresh")),
         "toolset catalog prompt was not injected: {first_messages:?}"
     );
     assert!(output.loaded_toolsets.is_empty());

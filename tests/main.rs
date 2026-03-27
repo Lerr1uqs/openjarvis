@@ -98,3 +98,33 @@ fn startup_exits_when_test_only_load_skill_target_is_missing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("local skill `missing_local_skill` does not exist"));
 }
+
+#[test]
+fn cargo_manifest_sets_default_run_to_openjarvis() {
+    // 验证场景: 仓库存在多个二进制目标时, `cargo run -- ...` 仍应默认落到 openjarvis。
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest =
+        fs::read_to_string(&manifest_path).expect("Cargo.toml should be readable for assertions");
+
+    assert!(manifest.contains("default-run = \"openjarvis\""));
+}
+
+#[test]
+fn internal_browser_helper_runs_before_app_config_load_and_reports_spawn_errors() {
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("internal-browser")
+        .arg("smoke")
+        .arg("--url")
+        .arg("https://example.com")
+        .arg("--headless")
+        .arg("--node-bin")
+        .arg("missing-browser-node")
+        .env("RUST_LOG", "info")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to spawn browser sidecar executable"));
+}
