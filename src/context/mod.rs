@@ -11,7 +11,7 @@ pub enum ChatMessageRole {
     Memory,
     User,
     Assistant,
-    Tool,
+    Toolcall,
     ToolResult,
 }
 
@@ -23,7 +23,7 @@ impl ChatMessageRole {
             Self::Memory => "memory",
             Self::User => "user",
             Self::Assistant => "assistant",
-            Self::Tool => "tool",
+            Self::Toolcall => "toolcall",
             Self::ToolResult => "tool_result",
         }
     }

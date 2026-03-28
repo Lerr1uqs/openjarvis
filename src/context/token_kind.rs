@@ -63,7 +63,7 @@ impl ContextTokenKind {
             ChatMessageRole::Memory => Self::Memory,
             ChatMessageRole::User
             | ChatMessageRole::Assistant
-            | ChatMessageRole::Tool
+            | ChatMessageRole::Toolcall
             | ChatMessageRole::ToolResult => Self::Chat,
         }
     }

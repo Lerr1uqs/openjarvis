@@ -17,6 +17,7 @@
 - [ ] 压缩上下文的prompt注入
 - [ ] 如何发送image
 - [ ] 旧的 CompactRuntimeManager 兼容缓存 取出
+- [ ] /clear 会把该线程的 ChatMessages、tool events、loaded toolsets、/auto-compact 等线程级状态 ??? events是什么？
 
 # clean
 - [ ] sidecar

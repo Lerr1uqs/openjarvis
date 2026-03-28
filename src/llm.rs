@@ -264,7 +264,7 @@ fn serialize_context_message(message: &ChatMessage) -> Result<ChatCompletionRequ
             .build()
             .context("failed to build tool result message from context")?
             .into()),
-        ChatMessageRole::Assistant | ChatMessageRole::Tool => {
+        ChatMessageRole::Assistant | ChatMessageRole::Toolcall => {
             let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
             if !message.content.trim().is_empty() {
                 builder.content(message.content.clone());
