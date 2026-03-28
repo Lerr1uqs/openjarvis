@@ -160,6 +160,53 @@ fn retain_latest_messages_with_zero_clears_all_turns() {
 }
 
 #[test]
+fn clear_to_initial_state_resets_thread_context_layers() {
+    // 测试场景: clear 要把 conversation、tool state、feature override 和 pending runtime state 一起恢复到初始态。
+    let now = Utc::now();
+    let thread_id = derive_internal_thread_id("ou_xxx:feishu:thread_clear");
+    let mut context = ThreadContext::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_clear",
+            thread_id.to_string(),
+        ),
+        now,
+    );
+    let event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
+        event.toolset_name = Some("demo".to_string());
+        event.tool_name = Some("load_toolset".to_string());
+        event
+    };
+    context.enable_auto_compact();
+    context.store_turn_state(
+        Some("msg_clear".to_string()),
+        vec![ChatMessage::new(ChatMessageRole::User, "历史消息", now)],
+        now,
+        now,
+        vec!["demo".to_string()],
+        vec![event],
+    );
+    let pending_event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now);
+        event.tool_name = Some("demo__echo".to_string());
+        event
+    };
+    context.record_tool_event(pending_event);
+
+    context.clear_to_initial_state(now);
+
+    assert!(context.load_messages().is_empty());
+    assert!(context.load_toolsets().is_empty());
+    assert!(context.load_tool_events().is_empty());
+    assert!(context.pending_tool_events().is_empty());
+    assert!(!context.compact_enabled(false));
+    assert!(!context.auto_compact_enabled(false));
+}
+
+#[test]
 fn store_turn_state_persists_loaded_toolsets_and_tool_events() {
     let now = Utc::now();
     let mut thread = ConversationThread::new("default", now);

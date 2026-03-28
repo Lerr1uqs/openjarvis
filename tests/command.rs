@@ -3,7 +3,10 @@ use openjarvis::{
     command::{CommandInvocation, CommandRegistry, register_runtime_commands},
     compact::{CompactRuntimeManager, CompactScopeKey},
     model::{IncomingMessage, ReplyTarget},
-    thread::{ThreadContext, ThreadContextLocator, derive_internal_thread_id},
+    thread::{
+        ThreadContext, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
+        derive_internal_thread_id,
+    },
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -53,6 +56,52 @@ async fn builtin_echo_command_returns_the_full_argument_payload() {
         reply.formatted_content(),
         "[Command][echo][SUCCESS]: mirror this content"
     );
+}
+
+#[tokio::test]
+async fn builtin_clear_command_resets_thread_context_to_initial_state() {
+    // 测试场景: /clear 应清空当前线程全部历史消息和线程级 runtime 状态。
+    let registry = CommandRegistry::with_builtin_commands();
+    let incoming = build_incoming("/clear");
+    let now = Utc::now();
+    let mut thread_context = build_thread_context();
+    let event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
+        event.toolset_name = Some("demo".to_string());
+        event.tool_name = Some("load_toolset".to_string());
+        event
+    };
+    thread_context.enable_auto_compact();
+    thread_context.store_turn_state(
+        Some("msg_history".to_string()),
+        vec![openjarvis::context::ChatMessage::new(
+            openjarvis::context::ChatMessageRole::User,
+            "需要被清空的历史",
+            now,
+        )],
+        now,
+        now,
+        vec!["demo".to_string()],
+        vec![event],
+    );
+    thread_context.record_tool_event(ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now));
+
+    let reply = registry
+        .try_execute_with_thread_context(&incoming, &mut thread_context)
+        .await
+        .expect("clear command should execute")
+        .expect("clear command should be handled");
+
+    assert_eq!(
+        reply.formatted_content(),
+        "[Command][clear][SUCCESS]: cleared current thread `thread_command`; all chat messages and thread-scoped runtime state have been reset"
+    );
+    assert!(thread_context.load_messages().is_empty());
+    assert!(thread_context.load_toolsets().is_empty());
+    assert!(thread_context.load_tool_events().is_empty());
+    assert!(thread_context.pending_tool_events().is_empty());
+    assert!(!thread_context.compact_enabled(false));
+    assert!(!thread_context.auto_compact_enabled(false));
 }
 
 #[tokio::test]

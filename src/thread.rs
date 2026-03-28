@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ops::{Deref, DerefMut};
+use tracing::info;
 use uuid::Uuid;
 
 const OPENJARVIS_THREAD_ID_NAMESPACE: Uuid =
@@ -704,6 +705,45 @@ impl ThreadContext {
     /// Retain only the latest `max_messages` across the whole thread conversation.
     pub fn retain_latest_messages(&mut self, max_messages: usize) {
         self.conversation.retain_latest_messages(max_messages);
+    }
+
+    /// Clear the current thread back to one empty initial state.
+    ///
+    /// This drops all stored chat turns, tool events, loaded toolsets, feature overrides, approval
+    /// state, and pending runtime tool events while keeping the current thread identity.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::context::{ChatMessage, ChatMessageRole};
+    /// use openjarvis::thread::{ThreadContext, ThreadContextLocator};
+    ///
+    /// let now = Utc::now();
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// context.store_turn(
+    ///     Some("msg_1".to_string()),
+    ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+    ///     now,
+    ///     now,
+    /// );
+    ///
+    /// context.clear_to_initial_state(now);
+    ///
+    /// assert!(context.load_messages().is_empty());
+    /// assert!(context.load_toolsets().is_empty());
+    /// ```
+    pub fn clear_to_initial_state(&mut self, now: DateTime<Utc>) {
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            "clearing thread context back to initial state"
+        );
+        self.conversation = ThreadConversation::new(self.locator.external_thread_id.clone(), now);
+        self.state = ThreadState::default();
+        self.pending_tool_events.clear();
     }
 
     /// Return the effective compact-enabled state for this thread context.

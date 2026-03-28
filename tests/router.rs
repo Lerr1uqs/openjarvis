@@ -17,7 +17,7 @@ use openjarvis::{
     model::{IncomingMessage, OutgoingMessage, ReplyTarget},
     router::ChannelRouter,
     router::ChannelRouterBuilder,
-    session::{SessionKey, SessionManager, SessionStrategy},
+    session::{MemorySessionStore, SessionKey, SessionManager, SessionStore, SessionStrategy},
     thread::{ConversationThread, ThreadContext, ThreadContextLocator},
 };
 use serde_json::json;
@@ -1050,6 +1050,150 @@ async fn router_thread_scoped_command_updates_thread_context_without_agent_dispa
         assert!(compact_runtime.compact_enabled(&scope, false).await);
         assert!(compact_runtime.auto_compact_enabled(&scope, false).await);
     }
+}
+
+#[tokio::test]
+async fn router_clear_command_resets_persisted_thread_context_without_agent_dispatch() {
+    // 测试场景: /clear 应清空当前线程的持久化历史和线程状态，同时不触发 agent dispatch。
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, mut request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
+    let compact_runtime = Arc::new(CompactRuntimeManager::new());
+    let mut commands = CommandRegistry::with_builtin_commands();
+    register_runtime_commands(&mut commands, false, false, Arc::clone(&compact_runtime))
+        .expect("runtime command should register");
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let sessions = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+        .await
+        .expect("shared store session manager should build");
+    let seed_incoming =
+        build_incoming_with("msg_clear_seed", "ou_thread_clear", Some("thread_clear"), "seed");
+    let locator = sessions
+        .load_or_create_thread(&seed_incoming)
+        .await
+        .expect("thread should resolve before clear");
+    let now = Utc::now();
+    let mut seeded_thread = ThreadContext::new(ThreadContextLocator::from(&locator), now);
+    seeded_thread.enable_auto_compact();
+    seeded_thread.store_turn_state(
+        seed_incoming.external_message_id.clone(),
+        vec![ChatMessage::new(ChatMessageRole::User, "需要被清空的历史", now)],
+        now,
+        now,
+        vec!["demo".to_string()],
+        Vec::new(),
+    );
+    sessions
+        .store_thread_context(&locator, seeded_thread, now)
+        .await
+        .expect("seed thread state should store");
+
+    let mut router = ChannelRouter::builder()
+        .agent_handle(AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        })
+        .session_manager(sessions)
+        .command_registry(commands)
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_command_clear",
+        "ou_thread_clear",
+        Some("thread_clear"),
+        "/clear",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("clear command should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clear command reply should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_tx);
+
+    let recorded = sent.lock().await.clone();
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_thread_clear".to_string(),
+        })
+        .await
+        .expect("clear command should keep session state");
+    let thread = session
+        .threads
+        .values()
+        .next()
+        .expect("thread should remain addressable after clear");
+    let restored_reader = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+        .await
+        .expect("restored reader should build");
+    let restored = restored_reader
+        .load_thread_context(&locator)
+        .await
+        .expect("restored thread should load")
+        .expect("restored thread should exist");
+
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].content,
+        "[Command][clear][SUCCESS]: cleared current thread `thread_clear`; all chat messages and thread-scoped runtime state have been reset"
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "Command");
+    assert_eq!(recorded[0].metadata["command_name"], "clear");
+    assert_eq!(recorded[0].metadata["command_status"], "SUCCESS");
+    assert!(request_rx.try_recv().is_err());
+    assert!(thread.load_messages().is_empty());
+    assert!(thread.load_toolsets().is_empty());
+    assert!(!thread.compact_enabled(false));
+    assert!(!thread.auto_compact_enabled(false));
+    assert!(restored.load_messages().is_empty());
+    assert!(restored.load_toolsets().is_empty());
+    assert!(!restored.compact_enabled(false));
+    assert!(!restored.auto_compact_enabled(false));
 }
 
 #[tokio::test]

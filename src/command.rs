@@ -16,6 +16,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::info;
 
 /// Formatted command execution reply returned back to the upstream channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +265,9 @@ impl CommandRegistry {
             .register("echo", Arc::new(EchoCommand))
             .expect("built-in echo command should register");
         registry
+            .register("clear", Arc::new(ClearCommand))
+            .expect("built-in clear command should register");
+        registry
     }
 
     /// Return whether the registry currently has no handlers.
@@ -468,6 +472,42 @@ impl CommandHandler for EchoCommand {
         Ok(CommandReply::success(
             invocation.name(),
             invocation.raw_arguments().to_string(),
+        ))
+    }
+}
+
+struct ClearCommand;
+
+impl ClearCommand {
+    fn usage(name: &str) -> CommandReply {
+        CommandReply::failed(name, "usage: /clear")
+    }
+}
+
+#[async_trait]
+impl CommandHandler for ClearCommand {
+    async fn execute(
+        &self,
+        invocation: &CommandInvocation,
+        incoming: &IncomingMessage,
+        thread_context: &mut ThreadContext,
+    ) -> Result<CommandReply> {
+        if !invocation.arguments().is_empty() {
+            return Ok(Self::usage(invocation.name()));
+        }
+
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            external_thread_id = %thread_context.locator.external_thread_id,
+            "clearing thread history and runtime state by command"
+        );
+        thread_context.clear_to_initial_state(incoming.received_at);
+        Ok(CommandReply::success(
+            invocation.name(),
+            format!(
+                "cleared current thread `{}`; all chat messages and thread-scoped runtime state have been reset",
+                thread_context.locator.external_thread_id
+            ),
         ))
     }
 }
