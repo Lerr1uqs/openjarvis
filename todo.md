@@ -18,6 +18,12 @@
 - [ ] 如何发送image
 - [ ] 旧的 CompactRuntimeManager 兼容缓存 取出
 - [ ] /clear 会把该线程的 ChatMessages、tool events、loaded toolsets、/auto-compact 等线程级状态 ??? events是什么？
+- [ ] mcp server as toolset?
 
 # clean
 - [ ] sidecar
+
+# tmp
+
+› AGENTS.md 创建一个model文件夹 里面存放着当前各个组件模型的：边界 职责 概念 和 能力等等 其实就是告诉别人这个组件是怎么用负责什么的。只对关键概念进行说  
+  明 并且要求精简不要废话 不要对builder helper之类的辅助函数去说明
