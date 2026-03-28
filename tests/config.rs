@@ -664,8 +664,25 @@ llm:
             .reserved_output_tokens(),
         512
     );
-    assert_eq!(config.llm_config().context_window_tokens, 16384);
+    assert_eq!(config.llm_config().context_window_tokens(), 16384);
     assert_eq!(config.llm_config().tokenizer, "chars_div4");
+}
+
+#[test]
+fn kimi_k2_5_token_limits_fall_back_to_official_defaults_when_omitted() {
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+llm:
+  provider: "ark"
+  model: "kimi-k2.5"
+  base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("kimi config should parse");
+
+    assert_eq!(config.llm_config().context_window_tokens(), 262144);
+    assert_eq!(config.llm_config().max_output_tokens(), 32768);
 }
 
 #[test]

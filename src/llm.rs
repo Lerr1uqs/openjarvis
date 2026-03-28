@@ -211,6 +211,10 @@ fn build_openai_request(
     builder.model(config.model.clone());
     builder.messages(messages);
     builder.temperature(0.1);
+    #[allow(deprecated)]
+    {
+        builder.max_tokens(u32::try_from(config.max_output_tokens()).unwrap_or(u32::MAX));
+    }
 
     if !tools.is_empty() {
         builder.tools(tools);

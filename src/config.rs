@@ -13,6 +13,10 @@ use tracing_subscriber::EnvFilter;
 pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。";
 pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
 const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
+const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 8_192;
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1_024;
+const KIMI_K2_5_CONTEXT_WINDOW_TOKENS: usize = 262_144;
+const KIMI_K2_5_MAX_OUTPUT_TOKENS: usize = 32_768;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -693,7 +697,7 @@ pub struct AgentCompactConfig {
     auto_compact: bool,
     runtime_threshold_ratio: f64,
     tool_visible_threshold_ratio: f64,
-    reserved_output_tokens: usize,
+    reserved_output_tokens: Option<usize>,
 }
 
 impl Default for AgentCompactConfig {
@@ -703,7 +707,7 @@ impl Default for AgentCompactConfig {
             auto_compact: false,
             runtime_threshold_ratio: 0.85,
             tool_visible_threshold_ratio: 0.70,
-            reserved_output_tokens: 1024,
+            reserved_output_tokens: None,
         }
     }
 }
@@ -737,6 +741,12 @@ impl AgentCompactConfig {
     /// Return the reserved output token budget for one LLM request.
     pub fn reserved_output_tokens(&self) -> usize {
         self.reserved_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    }
+
+    /// Return the explicitly configured legacy reserved output token budget when present.
+    pub fn configured_reserved_output_tokens(&self) -> Option<usize> {
+        self.reserved_output_tokens
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -755,6 +765,12 @@ impl AgentCompactConfig {
         }
         if self.auto_compact && !self.enabled {
             bail!("agent.compact.auto_compact requires agent.compact.enabled=true");
+        }
+        if self
+            .reserved_output_tokens
+            .is_some_and(|reserved_output_tokens| reserved_output_tokens == 0)
+        {
+            bail!("agent.compact.reserved_output_tokens must be greater than 0");
         }
 
         Ok(())
@@ -1207,7 +1223,8 @@ pub struct LLMConfig {
     pub api_key: String,
     pub api_key_path: PathBuf,
     pub mock_response: String,
-    pub context_window_tokens: usize,
+    pub context_window_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
     pub tokenizer: String,
 }
 
@@ -1220,16 +1237,47 @@ impl Default for LLMConfig {
             api_key: String::new(),
             api_key_path: PathBuf::new(),
             mock_response: "[openjarvis][DEBUG] 测试回复".to_string(),
-            context_window_tokens: 8192,
+            context_window_tokens: None,
+            max_output_tokens: None,
             tokenizer: "chars_div4".to_string(),
         }
     }
 }
 
 impl LLMConfig {
+    /// Return the effective context window tokens for the configured model.
+    ///
+    /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
+    pub fn context_window_tokens(&self) -> usize {
+        self.context_window_tokens
+            .or_else(|| self.known_model_token_limits().map(|limits| limits.context_window_tokens))
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+    }
+
+    /// Return the effective max output tokens for the configured model.
+    ///
+    /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
+    pub fn max_output_tokens(&self) -> usize {
+        self.max_output_tokens
+            .or_else(|| self.known_model_token_limits().map(|limits| limits.max_output_tokens))
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    }
+
     fn validate(&self) -> Result<()> {
-        if self.context_window_tokens == 0 {
+        if self
+            .context_window_tokens
+            .is_some_and(|context_window_tokens| context_window_tokens == 0)
+        {
             bail!("llm.context_window_tokens must be greater than 0");
+        }
+        if self
+            .max_output_tokens
+            .is_some_and(|max_output_tokens| max_output_tokens == 0)
+        {
+            bail!("llm.max_output_tokens must be greater than 0");
+        }
+        if self.max_output_tokens() > self.context_window_tokens() {
+            bail!("llm.max_output_tokens must be less than or equal to llm.context_window_tokens");
         }
         if self.tokenizer.trim().is_empty() {
             bail!("llm.tokenizer must not be blank");
@@ -1243,6 +1291,24 @@ impl LLMConfig {
 
         Ok(())
     }
+
+    fn known_model_token_limits(&self) -> Option<ModelTokenLimits> {
+        let normalized_model = self.model.trim().to_ascii_lowercase();
+        match normalized_model.as_str() {
+            "kimi-k2.5" | "kimi-k2-0905-preview" | "kimi-k2-turbo-preview"
+            | "kimi-k2-thinking" | "kimi-k2-thinking-turbo" => Some(ModelTokenLimits {
+                context_window_tokens: KIMI_K2_5_CONTEXT_WINDOW_TOKENS,
+                max_output_tokens: KIMI_K2_5_MAX_OUTPUT_TOKENS,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelTokenLimits {
+    context_window_tokens: usize,
+    max_output_tokens: usize,
 }
 
 fn validate_ratio(value: f64, field_name: &str) -> Result<()> {

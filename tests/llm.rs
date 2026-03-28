@@ -127,6 +127,19 @@ async fn anthropic_provider_builds_but_generate_is_not_implemented() {
     );
 }
 
+#[test]
+fn kimi_k2_5_known_model_exposes_official_token_limits() {
+    let config = LLMConfig {
+        provider: "ark".to_string(),
+        model: "kimi-k2.5".to_string(),
+        base_url: "https://ark.cn-beijing.volces.com/api/coding/v3".to_string(),
+        ..LLMConfig::default()
+    };
+
+    assert_eq!(config.context_window_tokens(), 262144);
+    assert_eq!(config.max_output_tokens(), 32768);
+}
+
 fn build_messages(system_prompt: &str, user_message: &str) -> Vec<ChatMessage> {
     // 作用: 为 llm 单测构造最小结构化消息列表。
     // 参数: system_prompt 为系统提示词，user_message 为用户消息。

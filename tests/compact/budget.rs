@@ -68,3 +68,37 @@ fn context_budget_report_reaches_ratio_at_boundary() {
     assert!(report.reaches_ratio(0.8));
     assert!(!report.reaches_ratio(1.1));
 }
+
+#[test]
+fn context_budget_estimator_uses_known_model_limits_when_capacity_is_omitted() {
+    // 测试场景: 用户未显式填写容量时，预算估算应回落到已知模型的官方规格，而不是继续使用 8k/1k 默认值。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+llm:
+  provider: "ark"
+  model: "kimi-k2.5"
+  base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("kimi config should parse");
+    let estimator = ContextBudgetEstimator::from_config(
+        config.llm_config(),
+        config.agent_config().compact_config(),
+    );
+    let report = estimator.estimate(
+        &[ChatMessage::new(
+            ChatMessageRole::User,
+            "hello kimi",
+            Utc::now(),
+        )],
+        &[],
+    );
+
+    assert_eq!(estimator.context_window_tokens(), 262144);
+    assert_eq!(report.context_window_tokens, 262144);
+    assert_eq!(report.reserved_output_tokens(), 32768);
+}

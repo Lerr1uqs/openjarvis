@@ -52,5 +52,7 @@ llm:
   api_key: ""
   api_key_path: ""
   mock_response: "[openjarvis][DEBUG] 测试回复"
+  # 生产模型请按实际规格填写；例如 kimi-k2.5 为 262144 / 32768。
   context_window_tokens: 8192
+  max_output_tokens: 1024
   tokenizer: "chars_div4"

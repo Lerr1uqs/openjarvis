@@ -186,8 +186,11 @@ impl ContextBudgetEstimator {
     /// ```
     pub fn from_config(llm: &LLMConfig, compact: &AgentCompactConfig) -> Self {
         Self {
-            context_window_tokens: llm.context_window_tokens,
-            reserved_output_tokens: compact.reserved_output_tokens(),
+            context_window_tokens: llm.context_window_tokens(),
+            reserved_output_tokens: llm
+                .max_output_tokens
+                .or_else(|| compact.configured_reserved_output_tokens())
+                .unwrap_or_else(|| llm.max_output_tokens()),
             tokenizer: llm.tokenizer.clone(),
         }
     }

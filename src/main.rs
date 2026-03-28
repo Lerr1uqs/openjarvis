@@ -39,6 +39,13 @@ async fn main() -> Result<()> {
     if config.channel_config().feishu_config().dry_run {
         warn!("feishu.dry_run=true, outgoing messages will be logged instead of delivered");
     }
+    info!(
+        llm_provider = %config.llm_config().provider,
+        llm_model = %config.llm_config().model,
+        context_window_tokens = config.llm_config().context_window_tokens(),
+        max_output_tokens = config.llm_config().max_output_tokens(),
+        "resolved llm token limits"
+    );
 
     let runtime = AgentRuntime::from_config(config.agent_config()).await?;
     let compact_runtime = runtime.compact_runtime();
