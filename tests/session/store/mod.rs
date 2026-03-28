@@ -34,7 +34,7 @@ fn build_incoming(external_message_id: &str, external_thread_id: &str) -> Incomi
         },
     }
 }
-
+// TODO: ThreadLocator::build()
 fn build_locator(session_id: Uuid, incoming: &IncomingMessage) -> ThreadLocator {
     let session_key = SessionKey::from_incoming(incoming);
     let external_thread_id = incoming.resolved_external_thread_id();
