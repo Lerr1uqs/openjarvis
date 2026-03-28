@@ -7,7 +7,10 @@
 
 use crate::context::ChatMessage;
 use crate::model::IncomingMessage;
-use crate::thread::{ConversationThread, ThreadToolEvent};
+use crate::thread::{
+    ConversationThread, ThreadContext, ThreadContextLocator, ThreadToolEvent,
+    derive_internal_thread_id,
+};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -28,6 +31,43 @@ impl SessionKey {
             user_id: incoming.user_id.clone(),
         }
     }
+
+    /// Return the normalized thread key for one external thread inside this session.
+    ///
+    /// `thread_key` follows the contract `user:channel:external_thread_id`.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::session::SessionKey;
+    ///
+    /// let key = SessionKey {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    /// };
+    ///
+    /// assert_eq!(key.thread_key("thread_ext"), "ou_xxx:feishu:thread_ext");
+    /// ```
+    pub fn thread_key(&self, external_thread_id: &str) -> String {
+        format!("{}:{}:{}", self.user_id, self.channel, external_thread_id)
+    }
+
+    /// Derive the stable internal thread id for one external thread inside this session.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::session::SessionKey;
+    ///
+    /// let key = SessionKey {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    /// };
+    ///
+    /// let thread_id = key.derive_thread_id("thread_ext");
+    /// assert_eq!(thread_id, key.derive_thread_id("thread_ext"));
+    /// ```
+    pub fn derive_thread_id(&self, external_thread_id: &str) -> Uuid {
+        derive_internal_thread_id(&self.thread_key(external_thread_id))
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -40,13 +80,13 @@ pub struct ThreadLocator {
 }
 
 impl ThreadLocator {
-    /// Build a resolved session-thread locator from one incoming message and the stored ids.
+    /// Build a resolved session-thread locator from one incoming message and the derived ids.
     ///
     /// # 示例
     /// ```rust
     /// use chrono::Utc;
     /// use openjarvis::model::{IncomingMessage, ReplyTarget};
-    /// use openjarvis::session::ThreadLocator;
+    /// use openjarvis::session::{SessionKey, ThreadLocator};
     /// use serde_json::json;
     /// use uuid::Uuid;
     ///
@@ -57,7 +97,7 @@ impl ThreadLocator {
     ///     user_id: "ou_xxx".to_string(),
     ///     user_name: None,
     ///     content: "hello".to_string(),
-    ///     thread_id: None,
+    ///     external_thread_id: None,
     ///     received_at: Utc::now(),
     ///     metadata: json!({}),
     ///     attachments: Vec::new(),
@@ -68,10 +108,11 @@ impl ThreadLocator {
     /// };
     ///
     /// let session_id = Uuid::new_v4();
-    /// let thread_id = Uuid::new_v4();
+    /// let thread_id = SessionKey::from_incoming(&incoming).derive_thread_id("default");
     /// let locator = ThreadLocator::new(session_id, &incoming, "default", thread_id);
     /// assert_eq!(locator.external_thread_id, "default");
     /// assert_eq!(locator.thread_id, thread_id);
+    /// assert_eq!(locator.thread_key(), "ou_xxx:feishu:default");
     /// ```
     pub fn new(
         session_id: Uuid,
@@ -95,58 +136,77 @@ impl ThreadLocator {
             user_id: self.user_id.clone(),
         }
     }
+
+    /// Return the normalized thread key for this resolved thread locator.
+    pub fn thread_key(&self) -> String {
+        self.session_key().thread_key(&self.external_thread_id)
+    }
+}
+
+impl From<&ThreadLocator> for ThreadContextLocator {
+    fn from(value: &ThreadLocator) -> Self {
+        Self::new(
+            Some(value.session_id.to_string()),
+            value.channel.clone(),
+            value.user_id.clone(),
+            value.external_thread_id.clone(),
+            value.thread_id.to_string(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: Uuid,
-    pub external_thread_index: HashMap<String, Uuid>,
-    pub threads: HashMap<Uuid, ConversationThread>,
+    pub key: SessionKey,
+    pub threads: HashMap<Uuid, ThreadContext>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl Session {
     /// Create an empty session snapshot.
-    pub fn new(now: DateTime<Utc>) -> Self {
+    pub fn new(key: SessionKey, now: DateTime<Utc>) -> Self {
         Self {
             id: Uuid::new_v4(),
-            external_thread_index: HashMap::new(),
+            key,
             threads: HashMap::new(),
             updated_at: now,
         }
     }
 
-    /// Resolve one normalized external thread id into an internal conversation thread.
+    /// Resolve one normalized external thread id into an internal thread context.
     ///
     /// # 示例
     /// ```rust
     /// use chrono::Utc;
-    /// use openjarvis::session::Session;
-    /// use uuid::Uuid;
+    /// use openjarvis::{session::{Session, SessionKey}, thread::ThreadContextLocator};
     ///
     /// let now = Utc::now();
-    /// let mut session = Session::new(now);
-    /// let preferred_thread_id = Uuid::new_v4();
-    /// let thread = session.load_or_create_thread("default", preferred_thread_id, now);
+    /// let session_key = SessionKey {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    /// };
+    /// let mut session = Session::new(session_key.clone(), now);
+    /// let thread_id = session_key.derive_thread_id("default");
+    /// let thread = session.load_or_create_thread(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
+    ///     now,
+    /// );
     ///
-    /// assert_eq!(thread.id, preferred_thread_id);
-    /// assert_eq!(thread.external_thread_id, "default");
+    /// assert_eq!(thread.locator.thread_id, thread_id.to_string());
+    /// assert_eq!(thread.locator.external_thread_id, "default");
+    /// assert_eq!(thread.locator.thread_key(), "ou_xxx:feishu:default");
     /// ```
     pub fn load_or_create_thread(
         &mut self,
-        external_thread_id: impl Into<String>,
-        preferred_thread_id: Uuid,
+        locator: ThreadContextLocator,
         now: DateTime<Utc>,
-    ) -> &mut ConversationThread {
-        let external_thread_id = external_thread_id.into();
-        let thread_id = *self
-            .external_thread_index
-            .entry(external_thread_id.clone())
-            .or_insert(preferred_thread_id);
-
+    ) -> &mut ThreadContext {
+        let thread_id = Uuid::parse_str(&locator.thread_id)
+            .expect("thread context locator should carry a UUID thread_id");
         self.threads
             .entry(thread_id)
-            .or_insert_with(|| ConversationThread::with_id(thread_id, external_thread_id, now))
+            .or_insert_with(|| ThreadContext::new(locator, now))
     }
 
     /// Return the internal thread id currently bound to one normalized external thread id.
@@ -154,18 +214,25 @@ impl Session {
     /// # 示例
     /// ```rust
     /// use chrono::Utc;
-    /// use openjarvis::session::Session;
-    /// use uuid::Uuid;
+    /// use openjarvis::{session::{Session, SessionKey}, thread::ThreadContextLocator};
     ///
     /// let now = Utc::now();
-    /// let mut session = Session::new(now);
-    /// let thread_id = Uuid::new_v4();
-    /// session.load_or_create_thread("default", thread_id, now);
+    /// let session_key = SessionKey {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    /// };
+    /// let mut session = Session::new(session_key.clone(), now);
+    /// let thread_id = session_key.derive_thread_id("default");
+    /// session.load_or_create_thread(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
+    ///     now,
+    /// );
     ///
     /// assert_eq!(session.thread_id_for_external("default"), Some(thread_id));
     /// ```
     pub fn thread_id_for_external(&self, external_thread_id: &str) -> Option<Uuid> {
-        self.external_thread_index.get(external_thread_id).copied()
+        let thread_id = self.key.derive_thread_id(external_thread_id);
+        self.threads.contains_key(&thread_id).then_some(thread_id)
     }
 }
 
@@ -176,6 +243,7 @@ pub struct SessionStrategy {
 
 #[derive(Debug, Clone, Default)]
 pub struct StoredThreadState {
+    pub thread_context: Option<ThreadContext>,
     pub thread: Option<ConversationThread>,
     pub messages: Vec<ChatMessage>,
     pub loaded_toolsets: Vec<String>,
@@ -191,17 +259,21 @@ impl Default for SessionStrategy {
 }
 
 impl SessionStrategy {
-    /// Apply the current thread-storage policy to one conversation thread.
+    /// Apply the current thread-storage policy to one thread context conversation.
     ///
     /// # 示例
     /// ```rust
     /// use chrono::Utc;
     /// use openjarvis::context::{ChatMessage, ChatMessageRole};
     /// use openjarvis::session::SessionStrategy;
-    /// use openjarvis::thread::ConversationThread;
+    /// use openjarvis::thread::{ThreadContext, ThreadContextLocator};
     ///
     /// let now = Utc::now();
-    /// let mut thread = ConversationThread::new("default", now);
+    /// let thread_id = openjarvis::thread::derive_internal_thread_id("ou_xxx:feishu:default");
+    /// let mut thread = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
+    ///     now,
+    /// );
     /// thread.store_turn(
     ///     Some("msg_1".to_string()),
     ///     vec![
@@ -219,7 +291,7 @@ impl SessionStrategy {
     ///
     /// assert_eq!(thread.load_messages().len(), 1);
     /// ```
-    pub fn retain_thread_messages(&self, thread: &mut ConversationThread) {
+    pub fn retain_thread_messages(&self, thread: &mut ThreadContext) {
         thread.retain_latest_messages(self.max_messages_per_thread);
     }
 }
@@ -276,7 +348,7 @@ impl SessionManager {
     ///     user_id: "ou_xxx".to_string(),
     ///     user_name: None,
     ///     content: "hello".to_string(),
-    ///     thread_id: None,
+    ///     external_thread_id: None,
     ///     received_at: Utc::now(),
     ///     metadata: json!({}),
     ///     attachments: Vec::new(),
@@ -291,18 +363,33 @@ impl SessionManager {
     pub async fn load_or_create_thread(&self, incoming: &IncomingMessage) -> ThreadLocator {
         let session_key = SessionKey::from_incoming(incoming);
         let external_thread_id = incoming.resolved_external_thread_id();
+        let thread_key = session_key.thread_key(&external_thread_id);
+        let thread_id = session_key.derive_thread_id(&external_thread_id);
         let now = incoming.received_at;
         let mut sessions = self.sessions.write().await;
         let session = sessions
-            .entry(session_key)
-            .or_insert_with(|| Session::new(now));
+            .entry(session_key.clone())
+            .or_insert_with(|| Session::new(session_key.clone(), now));
         let session_id = session.id;
-        let preferred_thread_id = session
-            .thread_id_for_external(&external_thread_id)
-            .unwrap_or_else(Uuid::new_v4);
-        let thread_id = session
-            .load_or_create_thread(external_thread_id.clone(), preferred_thread_id, now)
-            .id;
+        info!(
+            session_id = %session_id,
+            channel = %incoming.channel,
+            user_id = %incoming.user_id,
+            external_thread_id = %external_thread_id,
+            thread_key = %thread_key,
+            thread_id = %thread_id,
+            "resolved incoming thread identity"
+        );
+        let _ = session.load_or_create_thread(
+            ThreadContextLocator::new(
+                Some(session_id.to_string()),
+                incoming.channel.clone(),
+                incoming.user_id.clone(),
+                external_thread_id.clone(),
+                thread_id.to_string(),
+            ),
+            now,
+        );
         session.updated_at = now;
 
         ThreadLocator::new(session_id, incoming, external_thread_id, thread_id)
@@ -330,17 +417,27 @@ impl SessionManager {
         self.load_thread_state(locator).await.messages
     }
 
+    /// Load the current thread context snapshot for one channel/user/thread tuple.
+    pub async fn load_thread_context(&self, locator: &ThreadLocator) -> Option<ThreadContext> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&locator.session_key())
+            .and_then(|session| session.threads.get(&locator.thread_id))
+            .cloned()
+    }
+
     /// Load the current thread state snapshot, including persisted toolset metadata.
     pub async fn load_thread_state(&self, locator: &ThreadLocator) -> StoredThreadState {
         let sessions = self.sessions.read().await;
         sessions
             .get(&locator.session_key())
             .and_then(|session| session.threads.get(&locator.thread_id))
-            .map(|thread| StoredThreadState {
-                thread: Some(thread.clone()),
-                messages: thread.load_messages(),
-                loaded_toolsets: thread.load_toolsets(),
-                tool_events: thread.load_tool_events(),
+            .map(|thread_context| StoredThreadState {
+                thread_context: Some(thread_context.clone()),
+                thread: Some(thread_context.to_conversation_thread()),
+                messages: thread_context.load_messages(),
+                loaded_toolsets: thread_context.load_toolsets(),
+                tool_events: thread_context.load_tool_events(),
             })
             .unwrap_or_default()
     }
@@ -414,6 +511,57 @@ impl SessionManager {
         .await
     }
 
+    /// Persist one updated thread context without appending a new turn.
+    pub async fn store_thread_context(
+        &self,
+        locator: &ThreadLocator,
+        mut thread_context: ThreadContext,
+        updated_at: DateTime<Utc>,
+    ) {
+        let session_key = locator.session_key();
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .entry(session_key.clone())
+            .or_insert_with(|| Session::new(session_key, updated_at));
+        thread_context.rebind_locator(ThreadContextLocator::from(locator));
+        let _ = session.load_or_create_thread(ThreadContextLocator::from(locator), updated_at);
+        session.threads.insert(locator.thread_id, thread_context);
+        session.updated_at = updated_at;
+    }
+
+    /// Store one completed turn after optionally replacing the current active thread context.
+    pub async fn store_turn_with_thread_context(
+        &self,
+        locator: &ThreadLocator,
+        thread_context: Option<ThreadContext>,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    ) -> Uuid {
+        let session_key = locator.session_key();
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .entry(session_key.clone())
+            .or_insert_with(|| Session::new(session_key, completed_at));
+        let mut thread_context = thread_context.unwrap_or_else(|| {
+            session
+                .threads
+                .get(&locator.thread_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ThreadContext::new(ThreadContextLocator::from(locator), completed_at)
+                })
+        });
+        thread_context.rebind_locator(ThreadContextLocator::from(locator));
+        let turn_id =
+            thread_context.store_turn(external_message_id, messages, started_at, completed_at);
+        self.strategy.retain_thread_messages(&mut thread_context);
+        session.threads.insert(locator.thread_id, thread_context);
+        session.updated_at = completed_at;
+        turn_id
+    }
+
     /// Store one completed turn after optionally replacing the current active thread history.
     pub async fn store_turn_with_active_thread(
         &self,
@@ -426,25 +574,18 @@ impl SessionManager {
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
     ) -> Uuid {
-        let session_key = locator.session_key();
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .entry(session_key)
-            .or_insert_with(|| Session::new(completed_at));
-        let thread = session.load_or_create_thread(
-            locator.external_thread_id.clone(),
-            locator.thread_id,
-            completed_at,
-        );
+        let mut thread_context = self.load_thread_context(locator).await.unwrap_or_else(|| {
+            ThreadContext::new(ThreadContextLocator::from(locator), completed_at)
+        });
         if let Some(active_thread) = active_thread {
             info!(
                 thread_id = %locator.thread_id,
                 turn_count = active_thread.turns.len(),
                 "replacing active thread history before storing turn"
             );
-            thread.overwrite_active_history(&active_thread);
+            thread_context.overwrite_active_history_from_conversation_thread(&active_thread);
         }
-        let turn_id = thread.store_turn_state(
+        let turn_id = thread_context.store_turn_state(
             external_message_id,
             messages,
             started_at,
@@ -452,8 +593,9 @@ impl SessionManager {
             loaded_toolsets,
             tool_events,
         );
-        self.strategy.retain_thread_messages(thread);
-        session.updated_at = completed_at;
+        self.strategy.retain_thread_messages(&mut thread_context);
+        self.store_thread_context(locator, thread_context, completed_at)
+            .await;
         turn_id
     }
 

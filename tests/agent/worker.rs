@@ -8,7 +8,7 @@ use openjarvis::{
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
     session::SessionManager,
-    thread::ConversationThread,
+    thread::{ConversationThread, ThreadContext, ThreadContextLocator},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -34,6 +34,10 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
         .send(AgentRequest {
             locator: locator.clone(),
             incoming: incoming.clone(),
+            thread_context: ThreadContext::from_conversation_thread(
+                ThreadContextLocator::from(&locator),
+                ConversationThread::with_id(locator.thread_id, "default", incoming.received_at),
+            ),
             thread: ConversationThread::with_id(locator.thread_id, "default", incoming.received_at),
             history: Vec::new(),
             loaded_toolsets: Vec::new(),
@@ -46,7 +50,7 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
     match &events[0] {
         AgentWorkerEvent::Dispatch(event) => {
             assert_eq!(event.content, "mock-reply");
-            assert_eq!(event.thread_id, None);
+            assert_eq!(event.external_thread_id, None);
             assert_eq!(event.session_external_thread_id, "default");
             assert_eq!(format!("{:?}", event.kind), "TextOutput");
             assert!(event.reply_to_source);
@@ -144,6 +148,10 @@ async fn worker_builds_context_from_history_and_current_user_message() {
     handle
         .request_tx
         .send(AgentRequest {
+            thread_context: ThreadContext::from_conversation_thread(
+                ThreadContextLocator::from(&locator),
+                thread.clone(),
+            ),
             locator,
             incoming,
             thread,
@@ -209,6 +217,10 @@ async fn worker_failed_turn_preserves_provider_error_chain() {
         .send(AgentRequest {
             locator: locator.clone(),
             incoming,
+            thread_context: ThreadContext::from_conversation_thread(
+                ThreadContextLocator::from(&locator),
+                ConversationThread::with_id(locator.thread_id, "default", Utc::now()),
+            ),
             thread: ConversationThread::with_id(locator.thread_id, "default", Utc::now()),
             history: Vec::new(),
             loaded_toolsets: Vec::new(),
@@ -258,7 +270,7 @@ fn build_incoming(content: &str) -> IncomingMessage {
         user_id: "ou_xxx".to_string(),
         user_name: Some("tester".to_string()),
         content: content.to_string(),
-        thread_id: None,
+        external_thread_id: None,
         received_at: Utc::now(),
         metadata: json!({}),
         attachments: Vec::new(),

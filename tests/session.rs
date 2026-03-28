@@ -9,7 +9,10 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     model::{IncomingMessage, ReplyTarget},
     session::{SessionKey, SessionManager, SessionStrategy},
-    thread::{ThreadToolEvent, ThreadToolEventKind},
+    thread::{
+        ThreadContext, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
+        derive_internal_thread_id,
+    },
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -206,6 +209,10 @@ async fn load_or_create_thread_reuses_internal_uuid_for_same_external_thread() {
     assert_eq!(first_locator.external_thread_id, "ext_thread_1");
     assert_eq!(second_locator.external_thread_id, "ext_thread_1");
     assert_eq!(first_locator.thread_id, second_locator.thread_id);
+    assert_eq!(
+        first_locator.thread_id,
+        derive_internal_thread_id("ou_xxx:feishu:ext_thread_1")
+    );
 }
 
 #[tokio::test]
@@ -245,6 +252,53 @@ async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
         Some("demo")
     );
     assert!(thread_state.tool_events[0].turn_id.is_some());
+}
+
+#[tokio::test]
+async fn store_and_load_thread_context_roundtrips_runtime_state() {
+    // 测试场景: Session 新的 ThreadContext 读写接口要能完整保留线程状态，而不是退回旧 thread shape。
+    let manager = SessionManager::new();
+    let incoming = build_incoming("msg_thread_context", "hello context");
+    let locator = manager.load_or_create_thread(&incoming).await;
+    let now = Utc::now();
+    let tool_event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
+        event.toolset_name = Some("demo".to_string());
+        event.tool_name = Some("load_toolset".to_string());
+        event
+    };
+    let mut thread_context = ThreadContext::new(ThreadContextLocator::from(&locator), now);
+    thread_context.enable_auto_compact();
+    thread_context.store_turn_state(
+        incoming.external_message_id.clone(),
+        vec![ChatMessage::new(
+            ChatMessageRole::User,
+            "hello context",
+            incoming.received_at,
+        )],
+        incoming.received_at,
+        now,
+        vec!["demo".to_string()],
+        vec![tool_event],
+    );
+
+    manager
+        .store_thread_context(&locator, thread_context, now)
+        .await;
+
+    let loaded = manager
+        .load_thread_context(&locator)
+        .await
+        .expect("thread context should be stored");
+    let thread_state = manager.load_thread_state(&locator).await;
+
+    assert_eq!(loaded.locator, ThreadContextLocator::from(&locator));
+    assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
+    assert!(loaded.compact_enabled(false));
+    assert!(loaded.auto_compact_enabled(false));
+    assert_eq!(loaded.load_tool_events().len(), 1);
+    assert!(thread_state.thread_context.is_some());
+    assert_eq!(thread_state.loaded_toolsets, vec!["demo".to_string()]);
 }
 
 #[tokio::test]
@@ -425,7 +479,7 @@ fn build_incoming_with_thread(
         user_id: "ou_xxx".to_string(),
         user_name: None,
         content: content.to_string(),
-        thread_id: thread_id.map(|value| value.to_string()),
+        external_thread_id: thread_id.map(|value| value.to_string()),
         received_at: Utc::now(),
         metadata: json!({}),
         attachments: Vec::new(),

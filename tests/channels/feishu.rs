@@ -43,7 +43,7 @@ fn long_connection_payload_is_mapped_to_unified_model() {
     assert_eq!(incoming.user_id, "ou_xxx");
     assert_eq!(incoming.content, "hello");
     assert_eq!(incoming.reply_target.receive_id, "oc_xxx");
-    assert_eq!(incoming.thread_id.as_deref(), Some("omt_xxx"));
+    assert_eq!(incoming.external_thread_id.as_deref(), Some("omt_xxx"));
 }
 
 #[test]
@@ -65,5 +65,5 @@ fn long_connection_payload_without_thread_id_keeps_none() {
         .expect("long connection payload should deserialize"),
     );
 
-    assert_eq!(incoming.thread_id, None);
+    assert_eq!(incoming.external_thread_id, None);
 }

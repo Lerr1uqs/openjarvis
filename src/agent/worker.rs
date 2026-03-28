@@ -11,7 +11,7 @@ use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::llm::{LLMProvider, build_provider};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
-use crate::thread::{ConversationThread, ThreadToolEvent};
+use crate::thread::{ConversationThread, ThreadContext, ThreadToolEvent};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use tracing::warn;
 pub struct AgentRequest {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
+    pub thread_context: ThreadContext,
     pub thread: ConversationThread,
     pub history: Vec<ChatMessage>,
     pub loaded_toolsets: Vec<String>,
@@ -31,6 +32,7 @@ pub struct AgentRequest {
 pub struct CompletedAgentTurn {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
+    pub thread_context: ThreadContext,
     pub active_thread: ConversationThread,
     pub messages: Vec<ChatMessage>,
     pub prepend_incoming_user: bool,
@@ -44,6 +46,7 @@ pub struct FailedAgentTurn {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub error: String,
+    pub thread_context: ThreadContext,
     pub active_thread: ConversationThread,
     pub loaded_toolsets: Vec<String>,
     pub completed_at: DateTime<Utc>,
@@ -307,16 +310,28 @@ impl AgentWorker {
 
     async fn handle_request(
         &self,
-        request: AgentRequest,
+        mut request: AgentRequest,
         event_tx: mpsc::Sender<AgentWorkerEvent>,
     ) -> Result<AgentLoopOutput> {
         let internal_thread_id = request.locator.thread_id.to_string();
         self.agent_loop
             .runtime()
             .tools()
-            .rehydrate_thread(&internal_thread_id, &request.loaded_toolsets)
+            .merge_legacy_thread_state(&mut request.thread_context)
             .await;
-        let context = build_context(&self.system_prompt, &request.history, &request.incoming);
+        self.agent_loop
+            .runtime()
+            .compact_runtime()
+            .merge_legacy_scope_overrides(
+                &CompactScopeKey::from_locator(&request.locator),
+                &mut request.thread_context,
+            )
+            .await;
+        let context = build_context(
+            &self.system_prompt,
+            &request.thread_context,
+            &request.incoming,
+        );
         let (dispatch_tx, mut dispatch_rx) = mpsc::channel(128);
         let forward_event_tx = event_tx.clone();
         let forward_dispatch_task = tokio::spawn(async move {
@@ -333,7 +348,7 @@ impl AgentWorker {
 
         let loop_output = self
             .agent_loop
-            .run_with_thread(
+            .run_with_thread_context(
                 InfoContext {
                     channel: request.incoming.channel.clone(),
                     user_id: request.incoming.user_id.clone(),
@@ -342,7 +357,7 @@ impl AgentWorker {
                     event_tx: AgentEventSender::new(
                         dispatch_tx,
                         request.incoming.channel.clone(),
-                        request.incoming.thread_id.clone(),
+                        request.incoming.external_thread_id.clone(),
                         request.incoming.external_message_id.clone(),
                         request.incoming.reply_target.clone(),
                         request.locator.session_id.to_string(),
@@ -353,7 +368,7 @@ impl AgentWorker {
                     ),
                 },
                 &context,
-                request.thread.clone(),
+                request.thread_context.clone(),
             )
             .await;
         forward_dispatch_task
@@ -367,7 +382,8 @@ impl AgentWorker {
                     .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                         locator: request.locator,
                         incoming: request.incoming,
-                        active_thread: loop_output.active_thread.clone(),
+                        thread_context: loop_output.thread_context.clone(),
+                        active_thread: loop_output.thread_context.to_conversation_thread(),
                         messages: loop_output.turn_messages.clone(),
                         prepend_incoming_user: loop_output.prepend_incoming_user,
                         loaded_toolsets: loop_output.loaded_toolsets.clone(),
@@ -381,19 +397,14 @@ impl AgentWorker {
             Err(error) => {
                 let completed_at = Utc::now();
                 let error_message = format!("{error:#}");
-                let loaded_toolsets = self
-                    .agent_loop
-                    .runtime()
-                    .tools()
-                    .loaded_toolsets_for_thread(&internal_thread_id)
-                    .await;
                 event_tx
                     .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
                         locator: request.locator,
                         incoming: request.incoming,
                         error: error_message.clone(),
-                        active_thread: request.thread.clone(),
-                        loaded_toolsets,
+                        thread_context: request.thread_context.clone(),
+                        active_thread: request.thread_context.to_conversation_thread(),
+                        loaded_toolsets: request.thread_context.load_toolsets(),
                         completed_at,
                     }))
                     .await
@@ -408,11 +419,11 @@ impl AgentWorker {
 
 fn build_context(
     system_prompt: &str,
-    history: &[ChatMessage],
+    thread_context: &ThreadContext,
     incoming: &IncomingMessage,
 ) -> MessageContext {
     let mut context = MessageContext::with_system_prompt(system_prompt.to_string());
-    context.extend_chat_messages(history.iter().cloned());
+    context.extend_chat_messages(thread_context.load_messages());
     context.chat.push(ChatMessage::new(
         ChatMessageRole::User,
         incoming.content.clone(),

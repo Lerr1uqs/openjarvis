@@ -3,7 +3,7 @@
 use super::{
     hook::{HookEvent, HookEventKind},
     runtime::AgentRuntime,
-    tool::{CompactToolProjection, ToolCallRequest, ToolDefinition},
+    tool::{ToolCallRequest, ToolDefinition},
 };
 use crate::{
     compact::{
@@ -14,7 +14,10 @@ use crate::{
     context::{ChatMessage, ChatMessageRole, ContextMessage, ContextTokenKind, Messages},
     llm::{LLMProvider, LLMRequest},
     model::ReplyTarget,
-    thread::{ConversationThread, ThreadToolEvent, ThreadToolEventKind},
+    thread::{
+        ConversationThread, ThreadCompactToolProjection, ThreadContext, ThreadToolEvent,
+        ThreadToolEventKind,
+    },
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -32,7 +35,7 @@ pub struct AgentDispatchEvent {
     pub content: String,
     pub metadata: Value,
     pub channel: String,
-    pub thread_id: Option<String>,
+    pub external_thread_id: Option<String>,
     pub source_message_id: Option<String>,
     pub target: ReplyTarget,
     pub session_id: String,
@@ -47,7 +50,7 @@ pub struct AgentDispatchEvent {
 pub struct AgentEventSender {
     router_tx: mpsc::Sender<AgentDispatchEvent>,
     channel: String,
-    thread_id: Option<String>,
+    external_thread_id: Option<String>,
     source_message_id: Option<String>,
     target: ReplyTarget,
     session_id: String,
@@ -63,7 +66,7 @@ impl AgentEventSender {
     pub fn new(
         router_tx: mpsc::Sender<AgentDispatchEvent>,
         channel: impl Into<String>,
-        thread_id: Option<String>,
+        external_thread_id: Option<String>,
         source_message_id: Option<String>,
         target: ReplyTarget,
         session_id: impl Into<String>,
@@ -75,7 +78,7 @@ impl AgentEventSender {
         Self {
             router_tx,
             channel: channel.into(),
-            thread_id,
+            external_thread_id,
             source_message_id,
             target,
             session_id: session_id.into(),
@@ -97,7 +100,7 @@ impl AgentEventSender {
                 content: event.content,
                 metadata: event.metadata,
                 channel: self.channel.clone(),
-                thread_id: self.thread_id.clone(),
+                external_thread_id: self.external_thread_id.clone(),
                 source_message_id: self.source_message_id.clone(),
                 target: self.target.clone(),
                 session_id: self.session_id.clone(),
@@ -141,6 +144,7 @@ pub struct AgentLoopOutput {
     pub events: Vec<AgentLoopEvent>,
     pub turn_messages: Vec<ChatMessage>,
     pub prepend_incoming_user: bool,
+    pub thread_context: ThreadContext,
     pub active_thread: ConversationThread,
     pub loaded_toolsets: Vec<String>,
     pub tool_events: Vec<ThreadToolEvent>,
@@ -203,20 +207,29 @@ impl AgentLoop {
         input: InfoContext,
         context: &ContextMessage,
     ) -> Result<AgentLoopOutput> {
-        let active_thread = backfill_active_thread_from_context(context);
-        self.run_with_thread(input, context, active_thread).await
+        let thread_context = backfill_thread_context_from_context(&input, context);
+        self.run_with_thread_context(input, context, thread_context)
+            .await
     }
 
-    /// Run one agent turn with an explicit persisted active thread snapshot.
-    pub async fn run_with_thread(
+    /// Run one agent turn with an explicit persisted thread context snapshot.
+    pub async fn run_with_thread_context(
         &self,
         input: InfoContext,
         context: &ContextMessage,
-        mut active_thread: ConversationThread,
+        mut thread_context: ThreadContext,
     ) -> Result<AgentLoopOutput> {
         self.runtime.tools().register_builtin_tools().await?;
+        self.runtime
+            .tools()
+            .merge_legacy_thread_state(&mut thread_context)
+            .await;
+        self.runtime
+            .compact_runtime()
+            .merge_legacy_scope_overrides(&input.compact_scope_key, &mut thread_context)
+            .await;
         let hooks = self.runtime.hooks();
-        let thread_id = input.thread_id.clone();
+        let thread_id = thread_context.locator.thread_id.clone();
         hooks
             .emit(HookEvent {
                 kind: HookEventKind::UserPromptSubmit,
@@ -230,25 +243,27 @@ impl AgentLoop {
 
         let current_user_message = current_user_message_from_context(context)
             .context("agent loop requires one user message")?;
-        let mut working_chat_messages = active_thread.load_messages();
+        let mut working_chat_messages = thread_context.load_messages();
         working_chat_messages.push(current_user_message);
         let mut events = Vec::new();
         let mut turn_messages = Vec::new();
         let mut prepend_incoming_user = true;
         let mut used_tool_names = Vec::new();
-        let mut tool_events = Vec::new();
         let mut last_visible_tools = Vec::new();
         let mut last_budget_report = None;
         let mut skip_next_runtime_compact = false;
 
         let loop_result = async {
             let reply = loop {
-                let toolset_catalog_prompt = self.runtime.tools().catalog_prompt(&thread_id).await;
+                let toolset_catalog_prompt = self
+                    .runtime
+                    .tools()
+                    .catalog_prompt_for_context(&thread_context)
+                    .await;
                 let skill_catalog_prompt = self.runtime.tools().skills().catalog_prompt().await;
                 let request_state = self
                     .prepare_request_state(
-                        &thread_id,
-                        &input.compact_scope_key,
+                        &mut thread_context,
                         context,
                         &working_chat_messages,
                         toolset_catalog_prompt.as_deref(),
@@ -268,7 +283,7 @@ impl AgentLoop {
                         .execute_working_chat_compaction(
                             &hooks,
                             &thread_id,
-                            &mut active_thread,
+                            &mut thread_context,
                             &mut working_chat_messages,
                             &mut turn_messages,
                             &mut prepend_incoming_user,
@@ -399,7 +414,7 @@ impl AgentLoop {
                             );
                             input.event_tx.send(compact_event.clone()).await?;
                             events.push(compact_event.clone());
-                            tool_events.push(build_compact_thread_tool_event(
+                            thread_context.record_tool_event(build_compact_thread_tool_event(
                                 &tool_call,
                                 &provider_tool_call.id,
                                 compact_event.metadata.clone(),
@@ -412,7 +427,7 @@ impl AgentLoop {
                             .execute_working_chat_compaction(
                                 &hooks,
                                 &thread_id,
-                                &mut active_thread,
+                                &mut thread_context,
                                 &mut working_chat_messages,
                                 &mut turn_messages,
                                 &mut prepend_incoming_user,
@@ -453,7 +468,7 @@ impl AgentLoop {
                                 );
                                 input.event_tx.send(compact_event.clone()).await?;
                                 events.push(compact_event.clone());
-                                tool_events.push(build_compact_thread_tool_event(
+                                thread_context.record_tool_event(build_compact_thread_tool_event(
                                     &tool_call,
                                     &provider_tool_call.id,
                                     compact_event.metadata.clone(),
@@ -487,7 +502,7 @@ impl AgentLoop {
                                 );
                                 input.event_tx.send(compact_event.clone()).await?;
                                 events.push(compact_event.clone());
-                                tool_events.push(build_compact_thread_tool_event(
+                                thread_context.record_tool_event(build_compact_thread_tool_event(
                                     &tool_call,
                                     &provider_tool_call.id,
                                     compact_event.metadata.clone(),
@@ -498,40 +513,41 @@ impl AgentLoop {
                         continue;
                     }
 
-                    let tool_result = match self.call_thread_tool(&thread_id, &tool_call).await {
-                        Ok(result) => {
-                            let result_metadata = result.metadata.clone();
-                            hooks
-                                .emit(HookEvent {
-                                    kind: HookEventKind::PostToolUse,
-                                    payload: json!({
-                                        "tool": tool_call.name.clone(),
-                                        "result": result_metadata,
-                                    }),
-                                })
-                                .await?;
-                            result
-                        }
-                        Err(error) => {
-                            hooks
-                                .emit(HookEvent {
-                                    kind: HookEventKind::PostToolUseFailure,
-                                    payload: json!({
-                                        "tool": tool_call.name.clone(),
-                                        "error": error.to_string(),
-                                    }),
-                                })
-                                .await?;
-                            super::ToolCallResult {
-                                content: error.to_string(),
-                                metadata: json!({
-                                    "tool": tool_call.name.clone(),
-                                }),
-                                is_error: true,
+                    let tool_result =
+                        match self.call_thread_tool(&mut thread_context, &tool_call).await {
+                            Ok(result) => {
+                                let result_metadata = result.metadata.clone();
+                                hooks
+                                    .emit(HookEvent {
+                                        kind: HookEventKind::PostToolUse,
+                                        payload: json!({
+                                            "tool": tool_call.name.clone(),
+                                            "result": result_metadata,
+                                        }),
+                                    })
+                                    .await?;
+                                result
                             }
-                        }
-                    };
-                    tool_events.push(build_thread_tool_event(
+                            Err(error) => {
+                                hooks
+                                    .emit(HookEvent {
+                                        kind: HookEventKind::PostToolUseFailure,
+                                        payload: json!({
+                                            "tool": tool_call.name.clone(),
+                                            "error": error.to_string(),
+                                        }),
+                                    })
+                                    .await?;
+                                super::ToolCallResult {
+                                    content: error.to_string(),
+                                    metadata: json!({
+                                        "tool": tool_call.name.clone(),
+                                    }),
+                                    is_error: true,
+                                }
+                            }
+                        };
+                    thread_context.record_tool_event(build_thread_tool_event(
                         &tool_call,
                         &provider_tool_call.id,
                         &tool_result,
@@ -567,11 +583,6 @@ impl AgentLoop {
                 }
             };
 
-            let loaded_toolsets = self
-                .runtime
-                .tools()
-                .loaded_toolsets_for_thread(&thread_id)
-                .await;
             let mcp_server_count = self.runtime.tools().mcp().list_servers().await.len();
             let hook_handler_count = hooks.len().await;
             let metadata = json!({
@@ -580,7 +591,7 @@ impl AgentLoop {
                 "hook_handler_count": hook_handler_count,
                 "used_tool_name": used_tool_names.first().cloned(),
                 "used_tool_names": used_tool_names,
-                "loaded_toolsets": loaded_toolsets,
+                "loaded_toolsets": thread_context.load_toolsets(),
                 "event_count": events.len(),
                 "context_budget": last_budget_report,
             });
@@ -601,35 +612,48 @@ impl AgentLoop {
                 events,
                 turn_messages,
                 prepend_incoming_user,
-                active_thread,
-                loaded_toolsets: self
-                    .runtime
-                    .tools()
-                    .loaded_toolsets_for_thread(&thread_id)
-                    .await,
-                tool_events,
+                active_thread: thread_context.to_conversation_thread(),
+                loaded_toolsets: thread_context.load_toolsets(),
+                tool_events: thread_context.pending_tool_events().to_vec(),
+                thread_context,
             })
         }
         .await;
-
-        self.runtime
-            .tools()
-            .set_compact_tool_projection(&thread_id, None)
-            .await;
         loop_result
+    }
+
+    /// Run one agent turn with an explicit legacy `ConversationThread` snapshot.
+    #[deprecated(note = "use run_with_thread_context instead")]
+    pub async fn run_with_thread(
+        &self,
+        input: InfoContext,
+        context: &ContextMessage,
+        active_thread: ConversationThread,
+    ) -> Result<AgentLoopOutput> {
+        let thread_context = ThreadContext::from_conversation_thread(
+            crate::thread::ThreadContextLocator::new(
+                None,
+                input.channel.clone(),
+                input.user_id.clone(),
+                input.compact_scope_key.external_thread_id.clone(),
+                input.thread_id.clone(),
+            ),
+            active_thread,
+        );
+        self.run_with_thread_context(input, context, thread_context)
+            .await
     }
 
     async fn prepare_request_state(
         &self,
-        thread_id: &str,
-        compact_scope_key: &CompactScopeKey,
+        thread_context: &mut ThreadContext,
         context: &ContextMessage,
         working_chat_messages: &[ChatMessage],
         toolset_catalog_prompt: Option<&str>,
         skill_catalog_prompt: Option<&str>,
     ) -> Result<RequestState> {
         let tools = self.runtime.tools();
-        let static_tools = tools.list_for_thread_static(thread_id).await?;
+        let static_tools = tools.list_for_context_static(thread_context).await?;
         let base_messages = build_react_messages(
             &context.system,
             &context.memory,
@@ -642,33 +666,20 @@ impl AgentLoop {
             .budget_estimator
             .estimate(&base_messages, &static_tools);
 
-        let compact_enabled = self
-            .runtime
-            .compact_runtime()
-            .compact_enabled(compact_scope_key, self.compact_config.enabled())
-            .await;
+        let compact_enabled = thread_context.compact_enabled(self.compact_config.enabled());
         let auto_compact_enabled = compact_enabled
-            && self
-                .runtime
-                .compact_runtime()
-                .auto_compact_enabled(compact_scope_key, self.compact_config.auto_compact())
-                .await;
+            && thread_context.auto_compact_enabled(self.compact_config.auto_compact());
 
         if auto_compact_enabled {
             // 规则: auto_compact 一旦开启，compact 工具就应始终对模型可见，
             // 并且每次 generate 都要注入当前上下文容量提示，让模型自主决定是否提前 compact。
             // tool_visible_threshold_ratio 在这里不控制“是否注入提示”，只控制提示语气是否升级为提前告警。
-            tools
-                .set_compact_tool_projection(
-                    thread_id,
-                    Some(CompactToolProjection {
-                        auto_compact: true,
-                        visible: true,
-                        budget_report: base_budget_report.clone(),
-                    }),
-                )
-                .await;
-            let visible_tools = tools.list_for_thread(thread_id).await?;
+            thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
+                auto_compact: true,
+                visible: true,
+                budget_report: base_budget_report.clone(),
+            }));
+            let visible_tools = tools.list_for_context(thread_context).await?;
             let visible_budget_report = self
                 .budget_estimator
                 .estimate(&base_messages, &visible_tools);
@@ -700,19 +711,14 @@ impl AgentLoop {
                 Some(&refreshed_auto_compact_prompt),
             );
             let budget_report = self.budget_estimator.estimate(&messages, &visible_tools);
-            tools
-                .set_compact_tool_projection(
-                    thread_id,
-                    Some(CompactToolProjection {
-                        auto_compact: true,
-                        visible: true,
-                        budget_report: budget_report.clone(),
-                    }),
-                )
-                .await;
+            thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
+                auto_compact: true,
+                visible: true,
+                budget_report: budget_report.clone(),
+            }));
 
             info!(
-                thread_id,
+                thread_id = %thread_context.locator.thread_id,
                 total_estimated_tokens = budget_report.total_estimated_tokens,
                 utilization_ratio = budget_report.utilization_ratio,
                 tool_count = visible_tools.len(),
@@ -729,9 +735,9 @@ impl AgentLoop {
             });
         }
 
-        tools.set_compact_tool_projection(thread_id, None).await;
+        thread_context.set_compact_tool_projection(None);
         info!(
-            thread_id,
+            thread_id = %thread_context.locator.thread_id,
             total_estimated_tokens = base_budget_report.total_estimated_tokens,
             utilization_ratio = base_budget_report.utilization_ratio,
             tool_count = static_tools.len(),
@@ -757,12 +763,12 @@ impl AgentLoop {
 
     async fn call_thread_tool(
         &self,
-        thread_id: &str,
+        thread_context: &mut ThreadContext,
         tool_call: &ToolCallRequest,
     ) -> Result<super::ToolCallResult> {
         self.runtime
             .tools()
-            .call_for_thread(thread_id, tool_call.clone())
+            .call_for_context(thread_context, tool_call.clone())
             .await
     }
 
@@ -770,7 +776,7 @@ impl AgentLoop {
         &self,
         hooks: &Arc<super::HookRegistry>,
         thread_id: &str,
-        active_thread: &mut ConversationThread,
+        thread_context: &mut ThreadContext,
         working_chat_messages: &mut Vec<ChatMessage>,
         turn_messages: &mut Vec<ChatMessage>,
         prepend_incoming_user: &mut bool,
@@ -780,7 +786,8 @@ impl AgentLoop {
         if working_chat_messages.is_empty() {
             return Ok(None);
         }
-        let working_thread = build_working_thread(active_thread, working_chat_messages, Utc::now());
+        let working_thread =
+            build_working_thread(thread_context, working_chat_messages, Utc::now());
 
         hooks
             .emit(HookEvent {
@@ -812,15 +819,15 @@ impl AgentLoop {
         else {
             return Ok(None);
         };
-        *active_thread = outcome.compacted_thread.clone();
-        *working_chat_messages = active_thread.load_messages();
+        thread_context.overwrite_active_history_from_conversation_thread(&outcome.compacted_thread);
+        *working_chat_messages = thread_context.load_messages();
         turn_messages.clear();
         *prepend_incoming_user = false;
 
         info!(
             thread_id,
             reason,
-            compacted_turn_count = active_thread.turns.len(),
+            compacted_turn_count = thread_context.conversation.turns.len(),
             compacted_message_count = working_chat_messages.len(),
             "thread compact completed"
         );
@@ -944,12 +951,12 @@ fn build_auto_compact_prompt(
 }
 
 fn build_working_thread(
-    active_thread: &ConversationThread,
+    thread_context: &ThreadContext,
     working_chat_messages: &[ChatMessage],
     now: chrono::DateTime<Utc>,
 ) -> ConversationThread {
-    let mut working_thread = active_thread.clone();
-    let persisted_message_count = active_thread.load_messages().len();
+    let mut working_thread = thread_context.to_conversation_thread();
+    let persisted_message_count = thread_context.load_messages().len();
     let pending_messages = if working_chat_messages.len() > persisted_message_count {
         working_chat_messages[persisted_message_count..].to_vec()
     } else {
@@ -1008,11 +1015,23 @@ fn current_user_message_from_context(context: &ContextMessage) -> Option<ChatMes
     context.chat.last().cloned()
 }
 
-fn backfill_active_thread_from_context(context: &ContextMessage) -> ConversationThread {
+fn backfill_thread_context_from_context(
+    input: &InfoContext,
+    context: &ContextMessage,
+) -> ThreadContext {
     let now = Utc::now();
-    let mut thread = ConversationThread::new("backfilled", now);
+    let mut thread_context = ThreadContext::new(
+        crate::thread::ThreadContextLocator::new(
+            None,
+            input.channel.clone(),
+            input.user_id.clone(),
+            input.compact_scope_key.external_thread_id.clone(),
+            input.thread_id.clone(),
+        ),
+        now,
+    );
     if context.chat.len() > 1 {
-        thread.store_turn(
+        thread_context.store_turn(
             None,
             context.chat[..context.chat.len() - 1].to_vec(),
             now,
@@ -1020,7 +1039,7 @@ fn backfill_active_thread_from_context(context: &ContextMessage) -> Conversation
         );
     }
 
-    thread
+    thread_context
 }
 
 struct RequestState {

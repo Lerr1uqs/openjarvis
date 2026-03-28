@@ -9,6 +9,8 @@ use openjarvis::{
     },
     channels::{Channel, ChannelRegistration},
     cli::OpenJarvisCli,
+    command::{CommandRegistry, register_runtime_commands},
+    compact::{CompactRuntimeManager, CompactScopeKey},
     config::{AppConfig, BUILTIN_MCP_SERVER_NAME, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
@@ -16,7 +18,7 @@ use openjarvis::{
     router::ChannelRouter,
     router::ChannelRouterBuilder,
     session::{SessionKey, SessionManager, SessionStrategy},
-    thread::ConversationThread,
+    thread::{ConversationThread, ThreadContext, ThreadContextLocator},
 };
 use serde_json::json;
 use std::{
@@ -812,7 +814,8 @@ async fn router_short_circuits_registered_command_without_session_or_agent() {
             channel: "feishu".to_string(),
             user_id: "ou_command".to_string(),
         })
-        .await;
+        .await
+        .expect("command should still resolve and persist the target thread");
 
     assert_eq!(recorded.len(), 1);
     assert_eq!(
@@ -823,7 +826,13 @@ async fn router_short_circuits_registered_command_without_session_or_agent() {
     assert_eq!(recorded[0].metadata["command_name"], "echo");
     assert_eq!(recorded[0].metadata["command_status"], "SUCCESS");
     assert!(request_rx.try_recv().is_err());
-    assert!(session.is_none());
+    assert_eq!(session.threads.len(), 1);
+    assert!(
+        session
+            .threads
+            .values()
+            .all(|thread| thread.load_messages().is_empty())
+    );
 }
 
 #[tokio::test]
@@ -904,7 +913,8 @@ async fn router_returns_failed_reply_for_unknown_command_without_session_or_agen
             channel: "feishu".to_string(),
             user_id: "ou_unknown".to_string(),
         })
-        .await;
+        .await
+        .expect("unknown command should still resolve and persist the target thread");
 
     assert_eq!(recorded.len(), 1);
     assert_eq!(
@@ -915,7 +925,123 @@ async fn router_returns_failed_reply_for_unknown_command_without_session_or_agen
     assert_eq!(recorded[0].metadata["command_name"], "missing");
     assert_eq!(recorded[0].metadata["command_status"], "FAILED");
     assert!(request_rx.try_recv().is_err());
-    assert!(session.is_none());
+    assert_eq!(session.threads.len(), 1);
+    assert!(
+        session
+            .threads
+            .values()
+            .all(|thread| thread.load_messages().is_empty())
+    );
+}
+
+#[tokio::test]
+async fn router_thread_scoped_command_updates_thread_context_without_agent_dispatch() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, mut request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
+    let compact_runtime = Arc::new(CompactRuntimeManager::new());
+    let mut commands = CommandRegistry::with_builtin_commands();
+    register_runtime_commands(&mut commands, false, false, Arc::clone(&compact_runtime))
+        .expect("runtime command should register");
+    let sessions = SessionManager::new();
+    let mut router = ChannelRouter::builder()
+        .agent_handle(AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        })
+        .session_manager(sessions)
+        .command_registry(commands)
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel(); // test-only: drives router shutdown explicitly.
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_command_thread",
+        "ou_thread_command",
+        Some("thread_runtime"),
+        "/auto-compact on",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("thread-scoped command should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("thread-scoped command reply should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_tx);
+
+    let recorded = sent.lock().await.clone();
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_thread_command".to_string(),
+        })
+        .await
+        .expect("thread-scoped command should create session state");
+    let thread = session
+        .threads
+        .values()
+        .next()
+        .expect("thread should be stored after command");
+
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].content,
+        "[Command][auto-compact][SUCCESS]: auto-compact enabled for current thread `thread_runtime`; future turns will expose `compact` and context capacity prompts"
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "Command");
+    assert_eq!(recorded[0].metadata["command_name"], "auto-compact");
+    assert_eq!(recorded[0].metadata["command_status"], "SUCCESS");
+    assert!(request_rx.try_recv().is_err());
+    assert!(thread.compact_enabled(false));
+    assert!(thread.auto_compact_enabled(false));
+    #[allow(deprecated)]
+    {
+        let scope = CompactScopeKey::new("feishu", "ou_thread_command", "thread_runtime");
+        assert!(compact_runtime.compact_enabled(&scope, false).await);
+        assert!(compact_runtime.auto_compact_enabled(&scope, false).await);
+    }
 }
 
 #[tokio::test]
@@ -954,9 +1080,11 @@ async fn router_failed_turn_replies_with_full_error_chain() {
     let locator = router.sessions().load_or_create_thread(&incoming).await;
 
     let send_task = tokio::spawn(async move {
+        let active_thread = empty_thread(locator.thread_id, &locator.external_thread_id);
         event_tx
             .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
-                active_thread: empty_thread(locator.thread_id, &locator.external_thread_id),
+                thread_context: thread_context_from_locator(&locator, active_thread.clone()),
+                active_thread,
                 locator,
                 incoming,
                 error: "failed to call llm provider `openai_compatible` model `demo-model` at `https://provider.test/v1`: provider said 429: rate limit exceeded".to_string(),
@@ -1356,6 +1484,7 @@ fn spawn_mock_agent_loop(
                         .expect("first dispatch should be sent");
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            thread_context: request.thread_context.clone(),
                             active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
@@ -1417,6 +1546,7 @@ fn spawn_mock_agent_loop(
                         .expect("final text dispatch should be sent");
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            thread_context: request.thread_context.clone(),
                             active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
@@ -1488,6 +1618,7 @@ fn spawn_truncation_mock_agent_loop(
                     }
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            thread_context: request.thread_context.clone(),
                             active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
@@ -1516,6 +1647,7 @@ fn spawn_truncation_mock_agent_loop(
                         .expect("final truncation dispatch should be sent");
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                            thread_context: request.thread_context.clone(),
                             active_thread: request.thread.clone(),
                             locator: request.locator,
                             incoming: request.incoming,
@@ -1565,6 +1697,7 @@ fn spawn_single_turn_mock_agent_loop(
             .expect("single-turn dispatch should be sent");
         event_tx
             .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                thread_context: request.thread_context.clone(),
                 active_thread: request.thread.clone(),
                 locator: request.locator,
                 incoming: request.incoming,
@@ -1618,6 +1751,10 @@ fn spawn_compact_mock_agent_loop(
             .expect("compact dispatch should be sent");
         event_tx
             .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                thread_context: thread_context_from_locator(
+                    &request.locator,
+                    active_thread.clone(),
+                ),
                 active_thread,
                 locator: request.locator,
                 incoming: request.incoming,
@@ -1648,7 +1785,7 @@ fn build_dispatch_event(
         content: content.to_string(),
         metadata,
         channel: request.incoming.channel.clone(),
-        thread_id: request.incoming.thread_id.clone(),
+        external_thread_id: request.incoming.external_thread_id.clone(),
         source_message_id: request.incoming.external_message_id.clone(),
         target: request.incoming.reply_target.clone(),
         session_id: request.locator.session_id.to_string(),
@@ -1693,7 +1830,7 @@ fn build_incoming() -> IncomingMessage {
 fn build_incoming_with(
     message_id: &str,
     user_id: &str,
-    thread_id: Option<&str>,
+    external_thread_id: Option<&str>,
     content: &str,
 ) -> IncomingMessage {
     IncomingMessage {
@@ -1703,7 +1840,7 @@ fn build_incoming_with(
         user_id: user_id.to_string(),
         user_name: None,
         content: content.to_string(),
-        thread_id: thread_id.map(|value| value.to_string()),
+        external_thread_id: external_thread_id.map(|value| value.to_string()),
         received_at: Utc::now(),
         metadata: json!({}),
         attachments: Vec::new(),
@@ -1716,4 +1853,11 @@ fn build_incoming_with(
 
 fn empty_thread(thread_id: Uuid, external_thread_id: &str) -> ConversationThread {
     ConversationThread::with_id(thread_id, external_thread_id.to_string(), Utc::now())
+}
+
+fn thread_context_from_locator(
+    locator: &openjarvis::session::ThreadLocator,
+    thread: ConversationThread,
+) -> ThreadContext {
+    ThreadContext::from_conversation_thread(ThreadContextLocator::from(locator), thread)
 }

@@ -3,7 +3,7 @@
 //! Static YAML config defines the default compact policy, while this module stores live overrides
 //! that can be toggled at runtime for one channel/user/external-thread scope.
 
-use crate::{model::IncomingMessage, session::ThreadLocator};
+use crate::{model::IncomingMessage, session::ThreadLocator, thread::ThreadContext};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -82,7 +82,23 @@ impl CompactRuntimeManager {
         Self::default()
     }
 
+    /// Merge deprecated scope-keyed overrides into one live `ThreadContext`.
+    #[allow(deprecated)]
+    pub async fn merge_legacy_scope_overrides(
+        &self,
+        scope: &CompactScopeKey,
+        thread_context: &mut ThreadContext,
+    ) {
+        if let Some(enabled) = self.compact_enabled_override(scope).await {
+            thread_context.set_compact_enabled_override(Some(enabled));
+        }
+        if let Some(enabled) = self.auto_compact_override(scope).await {
+            thread_context.set_auto_compact_override(Some(enabled));
+        }
+    }
+
     /// Set the thread-scoped compact-enabled override for one scope.
+    #[deprecated(note = "use ThreadContext::set_compact_enabled_override instead")]
     pub async fn set_compact_enabled(&self, scope: CompactScopeKey, enabled: bool) {
         info!(
             channel = scope.channel,
@@ -98,6 +114,7 @@ impl CompactRuntimeManager {
     }
 
     /// Return the explicit thread-scoped compact-enabled override when present.
+    #[deprecated(note = "use ThreadContext::compact_enabled instead")]
     pub async fn compact_enabled_override(&self, scope: &CompactScopeKey) -> Option<bool> {
         self.compact_enabled_overrides
             .read()
@@ -109,6 +126,7 @@ impl CompactRuntimeManager {
     /// Return the effective compact-enabled state for one scope.
     ///
     /// `default_enabled` is the static config value loaded from YAML.
+    #[deprecated(note = "use ThreadContext::compact_enabled instead")]
     pub async fn compact_enabled(&self, scope: &CompactScopeKey, default_enabled: bool) -> bool {
         self.compact_enabled_override(scope)
             .await
@@ -116,6 +134,7 @@ impl CompactRuntimeManager {
     }
 
     /// Set the thread-scoped auto-compact override for one scope.
+    #[deprecated(note = "use ThreadContext::set_auto_compact_override instead")]
     pub async fn set_auto_compact(&self, scope: CompactScopeKey, enabled: bool) {
         info!(
             channel = scope.channel,
@@ -131,6 +150,7 @@ impl CompactRuntimeManager {
     }
 
     /// Return the explicit thread-scoped auto-compact override when present.
+    #[deprecated(note = "use ThreadContext::auto_compact_enabled instead")]
     pub async fn auto_compact_override(&self, scope: &CompactScopeKey) -> Option<bool> {
         self.auto_compact_overrides.read().await.get(scope).copied()
     }
@@ -138,6 +158,7 @@ impl CompactRuntimeManager {
     /// Return the effective auto-compact state for one scope.
     ///
     /// `default_enabled` is the static config value loaded from YAML.
+    #[deprecated(note = "use ThreadContext::auto_compact_enabled instead")]
     pub async fn auto_compact_enabled(
         &self,
         scope: &CompactScopeKey,

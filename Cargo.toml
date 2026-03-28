@@ -21,7 +21,7 @@ tokio = { version = "1.48.0", features = ["io-util", "macros", "process", "rt-mu
 tokio-stream = "0.1.17"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
-uuid = { version = "1.18.1", features = ["serde", "v4"] }
+uuid = { version = "1.18.1", features = ["serde", "v4", "v5"] }
 
 [[bin]]
 name = "llm_test"

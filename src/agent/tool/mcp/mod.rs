@@ -22,9 +22,16 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
-use tokio::{process::Command, sync::RwLock};
+use tokio::{
+    process::Command,
+    sync::RwLock,
+    time::{Duration, sleep},
+};
+use tracing::warn;
 
 type McpClient = RunningService<RoleClient, ClientInfo>;
+const STREAMABLE_HTTP_PROBE_RETRIES: usize = 5;
+const STREAMABLE_HTTP_PROBE_DELAY: Duration = Duration::from_millis(150);
 
 /// Supported MCP transports managed by OpenJarvis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +523,40 @@ impl McpManager {
     }
 
     async fn probe_server(
+        definition: &McpServerDefinition,
+    ) -> Result<(McpClient, Vec<McpVisibleTool>)> {
+        let max_attempts = if definition.transport == McpTransport::StreamableHttp {
+            STREAMABLE_HTTP_PROBE_RETRIES
+        } else {
+            1
+        };
+        let mut last_error = None;
+
+        for attempt in 1..=max_attempts {
+            match Self::probe_server_once(definition).await {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    if attempt < max_attempts {
+                        warn!(
+                            server_name = %definition.name,
+                            attempt,
+                            max_attempts,
+                            error = %error,
+                            "retrying streamable_http mcp probe after transient startup failure"
+                        );
+                        last_error = Some(error);
+                        sleep(STREAMABLE_HTTP_PROBE_DELAY).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(last_error.expect("probe retry loop should record the last error"))
+    }
+
+    async fn probe_server_once(
         definition: &McpServerDefinition,
     ) -> Result<(McpClient, Vec<McpVisibleTool>)> {
         let mut client = connect_server(definition)

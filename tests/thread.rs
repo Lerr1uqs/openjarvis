@@ -1,9 +1,15 @@
 use chrono::Utc;
 use openjarvis::{
+    compact::ContextBudgetReport,
+    context::ContextTokenKind,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
-    thread::{ConversationThread, ThreadToolEvent, ThreadToolEventKind},
+    thread::{
+        ConversationThread, ThreadCompactToolProjection, ThreadContext, ThreadContextLocator,
+        ThreadToolEvent, ThreadToolEventKind, derive_internal_thread_id,
+    },
 };
 use serde_json::json;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[test]
@@ -211,4 +217,98 @@ fn overwrite_active_history_replaces_old_turns_but_keeps_thread_identity() {
     assert_eq!(thread.turns.len(), 1);
     assert_eq!(thread.turns[0].messages[0].content, "这是压缩后的上下文");
     assert_eq!(thread.turns[0].messages[1].content, "继续");
+}
+
+#[test]
+fn thread_context_roundtrips_legacy_thread_and_preserves_runtime_layers() {
+    // 测试场景: 旧的 ConversationThread 迁移到 ThreadContext 后，conversation/state 分层和兼容回写都必须保持一致。
+    let now = Utc::now();
+    let mut legacy = ConversationThread::new("thread_ext", now);
+    let event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
+        event.toolset_name = Some("demo".to_string());
+        event.tool_name = Some("load_toolset".to_string());
+        event
+    };
+    legacy.store_turn_state(
+        Some("msg_compat".to_string()),
+        vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+        now,
+        now,
+        vec!["demo".to_string(), "demo".to_string(), String::new()],
+        vec![event],
+    );
+
+    let locator = ThreadContextLocator::new(
+        Some("session-1".to_string()),
+        "feishu",
+        "ou_xxx",
+        "thread_ext",
+        derive_internal_thread_id("ou_xxx:feishu:thread_ext").to_string(),
+    );
+    let context = ThreadContext::from_conversation_thread(locator.clone(), legacy);
+    let roundtrip = context.to_conversation_thread();
+
+    assert_eq!(context.locator, locator);
+    assert_eq!(context.turns.len(), 1);
+    assert_eq!(context.load_toolsets(), vec!["demo".to_string()]);
+    assert_eq!(context.load_tool_events().len(), 1);
+    assert_eq!(roundtrip.external_thread_id, "thread_ext");
+    assert_eq!(
+        roundtrip.id,
+        derive_internal_thread_id("ou_xxx:feishu:thread_ext")
+    );
+    assert_eq!(roundtrip.loaded_toolsets, vec!["demo".to_string()]);
+    assert_eq!(roundtrip.tool_events.len(), 1);
+}
+
+#[test]
+fn thread_context_store_turn_binds_pending_tool_events_and_clears_compact_projection() {
+    // 测试场景: 当前轮累计的 pending tool event 必须在落 turn 时绑定 turn_id，同时清空本轮 compact projection。
+    let now = Utc::now();
+    let thread_id = derive_internal_thread_id("ou_xxx:feishu:thread_ext");
+    let mut context = ThreadContext::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_ext",
+            thread_id.to_string(),
+        ),
+        now,
+    );
+    context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
+        auto_compact: true,
+        visible: true,
+        budget_report: ContextBudgetReport::new(
+            HashMap::from([
+                (ContextTokenKind::System, 12),
+                (ContextTokenKind::Chat, 64),
+                (ContextTokenKind::VisibleTool, 20),
+                (ContextTokenKind::ReservedOutput, 16),
+            ]),
+            256,
+        ),
+    }));
+    let event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now);
+        event.tool_name = Some("demo__echo".to_string());
+        event.tool_call_id = Some("call_1".to_string());
+        event
+    };
+    context.record_tool_event(event);
+
+    let turn_id = context.store_turn(
+        Some("msg_runtime".to_string()),
+        vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+        now,
+        now,
+    );
+    let stored_events = context.load_tool_events();
+
+    assert!(context.pending_tool_events().is_empty());
+    assert!(context.compact_tool_projection().is_none());
+    assert_eq!(stored_events.len(), 1);
+    assert_eq!(stored_events[0].turn_id, Some(turn_id));
+    assert_eq!(stored_events[0].tool_call_id.as_deref(), Some("call_1"));
 }

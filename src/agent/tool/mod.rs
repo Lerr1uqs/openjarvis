@@ -11,8 +11,10 @@ pub mod write;
 
 use crate::compact::ContextBudgetReport;
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
+use crate::thread::{ThreadCompactToolProjection, ThreadContext, ThreadContextLocator};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use chrono::Utc;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -199,6 +201,26 @@ pub struct CompactToolProjection {
     pub auto_compact: bool,
     pub visible: bool,
     pub budget_report: ContextBudgetReport,
+}
+
+impl From<CompactToolProjection> for ThreadCompactToolProjection {
+    fn from(value: CompactToolProjection) -> Self {
+        Self {
+            auto_compact: value.auto_compact,
+            visible: value.visible,
+            budget_report: value.budget_report,
+        }
+    }
+}
+
+impl From<ThreadCompactToolProjection> for CompactToolProjection {
+    fn from(value: ThreadCompactToolProjection) -> Self {
+        Self {
+            auto_compact: value.auto_compact,
+            visible: value.visible,
+            budget_report: value.budget_report,
+        }
+    }
 }
 
 pub struct ToolRegistry {
@@ -435,14 +457,14 @@ impl ToolRegistry {
         definitions
     }
 
-    /// Return the thread-scoped visible tool definitions for one internal thread id.
-    pub async fn list_for_thread(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
-        let mut definitions = self.list_for_thread_static(thread_id).await?;
-        if self
-            .compact_tool_projections
-            .read()
-            .await
-            .get(thread_id)
+    /// Return the thread-scoped visible tool definitions for one thread context.
+    pub async fn list_for_context(
+        &self,
+        thread_context: &ThreadContext,
+    ) -> Result<Vec<ToolDefinition>> {
+        let mut definitions = self.list_for_context_static(thread_context).await?;
+        if thread_context
+            .compact_tool_projection()
             .is_some_and(|projection| projection.auto_compact && projection.visible)
         {
             definitions.push(compact_tool_definition());
@@ -452,13 +474,15 @@ impl ToolRegistry {
     }
 
     /// Return the thread-scoped visible tool definitions without dynamic compact projection.
-    pub async fn list_for_thread_static(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
+    pub async fn list_for_context_static(
+        &self,
+        thread_context: &ThreadContext,
+    ) -> Result<Vec<ToolDefinition>> {
         let mut definitions = self.list().await;
         definitions.push(load_toolset_definition());
         definitions.push(unload_toolset_definition());
 
-        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
-        for toolset_name in loaded_toolsets {
+        for toolset_name in thread_context.load_toolsets() {
             definitions.extend(
                 self.resolve_toolset_handlers(&toolset_name)
                     .await?
@@ -471,17 +495,18 @@ impl ToolRegistry {
         Ok(definitions)
     }
 
-    /// Execute one tool request within the current internal thread runtime.
-    pub async fn call_for_thread(
+    /// Execute one tool request within the current thread context runtime.
+    pub async fn call_for_context(
         &self,
-        thread_id: &str,
+        thread_context: &mut ThreadContext,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
-        let context = ToolCallContext::for_thread(thread_id);
+        let thread_id = thread_context.locator.thread_id.clone();
+        let context = ToolCallContext::for_thread(thread_id.clone());
         match request.name.as_str() {
             "compact" => bail!("tool `compact` must be handled by the agent loop compact runtime"),
-            "load_toolset" => self.load_toolset(thread_id, request).await,
-            "unload_toolset" => self.unload_toolset(thread_id, request).await,
+            "load_toolset" => self.load_toolset(thread_context, request).await,
+            "unload_toolset" => self.unload_toolset(thread_context, request).await,
             _ => {
                 if let Some(handler) = self
                     .always_visible_handlers
@@ -493,8 +518,7 @@ impl ToolRegistry {
                     return handler.call_with_context(context.clone(), request).await;
                 }
 
-                let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
-                for toolset_name in loaded_toolsets {
+                for toolset_name in thread_context.load_toolsets() {
                     let handlers = self.resolve_toolset_handlers(&toolset_name).await?;
                     if let Some(handler) = handlers.get(&request.name).cloned() {
                         return handler.call_with_context(context.clone(), request).await;
@@ -510,14 +534,17 @@ impl ToolRegistry {
         }
     }
 
-    /// Return the compact toolset catalog prompt for one internal thread.
-    pub async fn catalog_prompt(&self, thread_id: &str) -> Option<String> {
+    /// Return the compact toolset catalog prompt for one thread context.
+    pub async fn catalog_prompt_for_context(
+        &self,
+        thread_context: &ThreadContext,
+    ) -> Option<String> {
         let entries = self.list_toolsets().await;
         if entries.is_empty() {
             return None;
         }
 
-        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+        let loaded_toolsets = thread_context.load_toolsets();
         let loaded_summary = if loaded_toolsets.is_empty() {
             "none".to_string()
         } else {
@@ -547,7 +574,46 @@ impl ToolRegistry {
         entries
     }
 
+    /// Merge deprecated thread-id keyed compatibility state into one `ThreadContext`.
+    pub async fn merge_legacy_thread_state(&self, thread_context: &mut ThreadContext) {
+        let thread_id = thread_context.locator.thread_id.clone();
+        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(&thread_id).await;
+        if !loaded_toolsets.is_empty() {
+            thread_context.replace_loaded_toolsets(loaded_toolsets);
+        }
+
+        let projection = self
+            .compact_tool_projections
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .map(Into::into);
+        if projection.is_some() {
+            thread_context.set_compact_tool_projection(projection);
+        }
+    }
+
+    /// Sync one `ThreadContext` back into the deprecated thread-id keyed compatibility caches.
+    pub async fn sync_legacy_thread_state(&self, thread_context: &ThreadContext) {
+        let thread_id = thread_context.locator.thread_id.clone();
+        self.thread_runtimes
+            .replace_loaded_toolsets(&thread_id, &thread_context.load_toolsets())
+            .await;
+
+        let mut projections = self.compact_tool_projections.write().await;
+        match thread_context.compact_tool_projection().cloned() {
+            Some(projection) => {
+                projections.insert(thread_id, projection.into());
+            }
+            None => {
+                projections.remove(&thread_context.locator.thread_id);
+            }
+        }
+    }
+
     /// Replace one thread runtime from persisted thread metadata.
+    #[deprecated(note = "use merge_legacy_thread_state with ThreadContext instead")]
     pub async fn rehydrate_thread(
         &self,
         thread_id: &str,
@@ -559,11 +625,13 @@ impl ToolRegistry {
     }
 
     /// Return the loaded toolset names for one internal thread.
+    #[deprecated(note = "use ThreadContext::load_toolsets instead")]
     pub async fn loaded_toolsets_for_thread(&self, thread_id: &str) -> Vec<String> {
         self.thread_runtimes.loaded_toolsets(thread_id).await
     }
 
     /// Update one thread's dynamic compact-tool visibility projection.
+    #[deprecated(note = "use ThreadContext::set_compact_tool_projection instead")]
     pub async fn set_compact_tool_projection(
         &self,
         thread_id: &str,
@@ -578,6 +646,40 @@ impl ToolRegistry {
                 projections.remove(thread_id);
             }
         }
+    }
+
+    /// Return the thread-scoped visible tool definitions for one internal thread id.
+    #[deprecated(note = "use list_for_context instead")]
+    pub async fn list_for_thread(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
+        let thread_context = self.legacy_thread_context(thread_id).await;
+        self.list_for_context(&thread_context).await
+    }
+
+    /// Return the thread-scoped visible tool definitions without dynamic compact projection.
+    #[deprecated(note = "use list_for_context_static instead")]
+    pub async fn list_for_thread_static(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
+        let thread_context = self.legacy_thread_context(thread_id).await;
+        self.list_for_context_static(&thread_context).await
+    }
+
+    /// Execute one tool request within the deprecated thread-id keyed compatibility runtime.
+    #[deprecated(note = "use call_for_context instead")]
+    pub async fn call_for_thread(
+        &self,
+        thread_id: &str,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        let mut thread_context = self.legacy_thread_context(thread_id).await;
+        let result = self.call_for_context(&mut thread_context, request).await;
+        self.sync_legacy_thread_state(&thread_context).await;
+        result
+    }
+
+    /// Return the compact toolset catalog prompt for one internal thread.
+    #[deprecated(note = "use catalog_prompt_for_context instead")]
+    pub async fn catalog_prompt(&self, thread_id: &str) -> Option<String> {
+        let thread_context = self.legacy_thread_context(thread_id).await;
+        self.catalog_prompt_for_context(&thread_context).await
     }
 
     /// Return the MCP management API exposed by this tool registry.
@@ -595,6 +697,15 @@ impl ToolRegistry {
         let definition = handler.definition();
         let mut handlers = self.always_visible_handlers.write().await;
         handlers.entry(definition.name).or_insert(handler);
+    }
+
+    async fn legacy_thread_context(&self, thread_id: &str) -> ThreadContext {
+        let mut thread_context = ThreadContext::new(
+            ThreadContextLocator::for_internal_thread(thread_id),
+            Utc::now(),
+        );
+        self.merge_legacy_thread_state(&mut thread_context).await;
+        thread_context
     }
 
     pub(crate) async fn toolset_registered(&self, toolset_name: &str) -> bool {
@@ -719,7 +830,7 @@ impl ToolRegistry {
 
     async fn load_toolset(
         &self,
-        thread_id: &str,
+        thread_context: &mut ThreadContext,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: ManageToolsetArguments = parse_tool_arguments(request, "load_toolset")?;
@@ -729,11 +840,8 @@ impl ToolRegistry {
         }
 
         self.resolve_toolset_handlers(toolset_name).await?;
-        let inserted = self
-            .thread_runtimes
-            .load_toolset(thread_id, toolset_name)
-            .await;
-        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+        let inserted = thread_context.load_toolset(toolset_name);
+        let loaded_toolsets = thread_context.load_toolsets();
 
         Ok(ToolCallResult {
             content: if inserted {
@@ -755,7 +863,7 @@ impl ToolRegistry {
 
     async fn unload_toolset(
         &self,
-        thread_id: &str,
+        thread_context: &mut ThreadContext,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: ManageToolsetArguments = parse_tool_arguments(request, "unload_toolset")?;
@@ -764,21 +872,17 @@ impl ToolRegistry {
             bail!("unload_toolset requires a non-empty `name`");
         }
 
-        let is_loaded = self
-            .thread_runtimes
-            .loaded_toolsets(thread_id)
-            .await
+        let thread_id = thread_context.locator.thread_id.clone();
+        let is_loaded = thread_context
+            .load_toolsets()
             .into_iter()
             .any(|loaded_name| loaded_name == toolset_name);
         if is_loaded && let Ok(Some(runtime)) = self.resolve_toolset_runtime(toolset_name).await {
-            runtime.on_unload(thread_id).await?;
+            runtime.on_unload(&thread_id).await?;
         }
 
-        let removed = self
-            .thread_runtimes
-            .unload_toolset(thread_id, toolset_name)
-            .await;
-        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(thread_id).await;
+        let removed = thread_context.unload_toolset(toolset_name);
+        let loaded_toolsets = thread_context.load_toolsets();
 
         Ok(ToolCallResult {
             content: if removed {

@@ -46,7 +46,7 @@ fn compact_scope_key_can_be_built_from_incoming_and_locator() {
         user_id: "ou_xxx".to_string(),
         user_name: None,
         content: "hello".to_string(),
-        thread_id: Some("thread_ext".to_string()),
+        external_thread_id: Some("thread_ext".to_string()),
         received_at: Utc::now(),
         metadata: json!({}),
         attachments: Vec::new(),

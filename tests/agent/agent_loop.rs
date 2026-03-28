@@ -12,7 +12,7 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
     model::ReplyTarget,
-    thread::ConversationThread,
+    thread::{ConversationThread, ThreadContext, ThreadContextLocator},
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -506,6 +506,68 @@ async fn agent_loop_refreshes_tools_after_load_and_hides_them_after_unload_in_sa
     assert!(output.loaded_toolsets.is_empty());
     assert_eq!(output.tool_events.len(), 3);
     assert_eq!(output.tool_events[0].toolset_name.as_deref(), Some("demo"));
+}
+
+#[tokio::test]
+async fn agent_loop_run_with_thread_context_keeps_toolsets_isolated_per_thread() {
+    // 测试场景: AgentLoop 改为直接消费 ThreadContext 后，不同线程的 loaded toolset 不能互相串线。
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo isolated toolset"),
+            vec![Arc::new(DemoLoopTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+    let runtime = AgentRuntime::with_parts(Arc::new(HookRegistry::new()), registry);
+    let loop_runner = AgentLoop::new(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                text_response("thread-a-done"),
+                text_response("thread-b-done"),
+            ])),
+        }),
+        runtime,
+    );
+    let (input_a, _outgoing_a) = build_input_for("thread_a_internal", "thread_a");
+    let (input_b, _outgoing_b) = build_input_for("thread_b_internal", "thread_b");
+    let mut thread_a = ThreadContext::new(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_a", "thread_a_internal"),
+        chrono::Utc::now(),
+    );
+    let thread_b = ThreadContext::new(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_b", "thread_b_internal"),
+        chrono::Utc::now(),
+    );
+    assert!(thread_a.load_toolset("demo"));
+
+    let output_a = loop_runner
+        .run_with_thread_context(input_a, &build_context("system", "处理线程A"), thread_a)
+        .await
+        .expect("thread A loop should succeed");
+    let output_b = loop_runner
+        .run_with_thread_context(input_b, &build_context("system", "处理线程B"), thread_b)
+        .await
+        .expect("thread B loop should succeed");
+
+    let captured_requests = requests.lock().await;
+    let first_tools = captured_requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let second_tools = captured_requests[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(first_tools.contains(&"demo__echo"));
+    assert!(!second_tools.contains(&"demo__echo"));
+    assert_eq!(output_a.loaded_toolsets, vec!["demo".to_string()]);
+    assert!(output_b.loaded_toolsets.is_empty());
 }
 
 #[tokio::test]
@@ -1040,17 +1102,24 @@ fn thread_with_history(history: Vec<ChatMessage>) -> ConversationThread {
 }
 
 fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
+    build_input_for("thread_1", "thread_1")
+}
+
+fn build_input_for(
+    thread_id: &str,
+    external_thread_id: &str,
+) -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
     let (tx, rx) = mpsc::channel(32);
     (
         InfoContext {
             channel: "feishu".to_string(),
             user_id: "ou_xxx".to_string(),
-            thread_id: "thread_1".to_string(),
-            compact_scope_key: CompactScopeKey::new("feishu", "ou_xxx", "thread_1"),
+            thread_id: thread_id.to_string(),
+            compact_scope_key: CompactScopeKey::new("feishu", "ou_xxx", external_thread_id),
             event_tx: AgentEventSender::new(
                 tx,
                 "feishu",
-                Some("thread_1".to_string()),
+                Some(external_thread_id.to_string()),
                 Some("msg_1".to_string()),
                 ReplyTarget {
                     receive_id: "oc_xxx".to_string(),
@@ -1059,8 +1128,8 @@ fn build_input() -> (InfoContext, mpsc::Receiver<AgentDispatchEvent>) {
                 "session_1",
                 "feishu",
                 "ou_xxx",
-                "thread_1",
-                "thread_1",
+                external_thread_id,
+                thread_id,
             ),
         },
         rx,

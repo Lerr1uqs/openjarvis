@@ -26,8 +26,8 @@ pub struct IncomingMessage {
     pub user_name: Option<String>,
     /// Message content.
     pub content: String,
-    /// Thread/conversation ID for threaded conversations.
-    pub thread_id: Option<String>,
+    /// 上游聊天平台提供的外部线程 ID。
+    pub external_thread_id: Option<String>,
     /// When the message was received.
     pub received_at: DateTime<Utc>,
     /// Channel-specific metadata.
@@ -43,12 +43,37 @@ pub struct IncomingMessage {
 
 - SessionManager: 变量 包装下面这些概念 [单一变量 一般不会出现多次]
     - Session: 一个用户的上下文回话空间
-        - Thread: 一个用户和一个agent单次交互的全部聊天记录
-            - Turn: 用户输入 + AgentLoop循环完成的一轮Message
+        - ThreadContext: 一个用户和一个agent在单条 internal thread 上的统一运行时宿主
+            - ThreadConversation: 当前线程的全部聊天记录
+                - Turn: 用户输入 + AgentLoop循环完成的一轮Message
+            - ThreadState: 当前线程的 feature / tool / approval 等运行时状态
 
-通过 uuid:channel:external_thread_id来定位已有的thread
-注意thread第一次遇到会创建 后续会使用创建的thread (单一uuid)
+这里没有单独的 conversation ID。
+
+- `thread_key = user:channel:external_thread_id`
+- `internal thread id` 由 `thread_key` 稳定派生，作为线程唯一内部标识
+- `ThreadConversation` 只保存历史和审计信息，不再自带一份独立 conversation id
+
+注意 thread 第一次遇到会创建，后续始终复用同一个 internal thread id。
 后期这些都会落盘到postgres sql中去(TBD)
+
+## ThreadContext
+
+`ThreadContext` 是当前线程的统一事务边界。
+
+它至少持有：
+
+- `locator`: 当前线程定位信息
+- `conversation`: `ThreadConversation`
+- `state`: `ThreadState`
+
+其中：
+
+- `ThreadConversation` 只负责 turn / message / tool_event 等对话与审计历史
+- `ThreadState` 负责线程级 feature、工具状态、权限审批状态以及后续其他 thread runtime metadata
+- 当前线程身份统一来自 `locator.thread_id`，而不是 `ThreadConversation` 自己的 id 字段
+
+线程级能力都应该优先挂在 `ThreadContext` 上，而不是散落到 `ToolRegistry`、`CompactRuntimeManager` 或各个工具内部。
 
 另外有一个SessionStrategy 负责做会话保存的策略 比如turn只保留五个 多余进行丢弃(暂时)
 session message实现两个接口：一个是 load_turn，一个是 store_turn。
@@ -72,6 +97,10 @@ Worker: 包装沙箱容器 + AgenticLoop
 ### AgenticLoop
 负责Agent整个react循环和执行 还有事件外放给Router
 详细情看: hook.md
+
+- `AgentLoop` 在进入线程执行时应该直接接收一个 `ThreadContext`
+- 循环内部通过 `ThreadContext` 完成历史读取、工具可见性计算、工具调用、compact 状态读取和事件记录
+
 ### AgentHook: 从配置文件中加载hook
 ```yaml
 agent:
@@ -93,11 +122,13 @@ MessageContext = order{
 用户传入的消息会先被Command组件截取 如果发现是注册的Command比如 /approve 开头 就会执行对应的命令而不需要执行相关上下文 Command的使用方式也能转换为docs暴露给agent 从而让agent 通过 openjarvis命令行去执行比如 openjarvis command approve --channel feishu --username sakiko 但是要通过某种方式确认当前cli是哪个agent执行的 agent有当前用户交互的userid来判断有没有权限
 - CommandMessage不会进入Session
 - Command返回消息 `[Command][${name}][SUCCESS/FAILED]: ${对应的执行结果}`
+- 所有 Command 都是线程级命令，必须先 resolve 目标线程，再通过对应 `ThreadContext` 读写线程状态
 - `/auto-compact on|off|status` 是线程级 runtime command
 - 它按 `channel + user_id + external_thread_id` 生效，不会全局影响其他线程
 - 它可以覆盖 YAML 里的默认 compact/auto_compact 状态
 - `on` 后后续轮次会开启 auto-compact 提示并暴露 `compact`
 - `off` 后后续轮次会关闭这条线程上的 auto-compact 提示
+- 这类 thread-scoped command 修改的是当前线程 `ThreadContext` 中的状态 而不是额外的全局 override 容器
 
 ## Cron: 定时器
 
@@ -116,7 +147,23 @@ MessageContext = order{
 ## ToolRegistry
 基本工具的使用 bash memory等等
 
-目前是tool提供了thread级别的工具集加载 (后面可能会改？)
+`ToolRegistry` 是全局工具池 / 目录层，不是线程事务管理器。
+
+它负责：
+
+- 注册 builtin tools
+- 注册 program-defined toolsets
+- 管理 MCP server 与 skill registry
+- 提供全局 tool / toolset / handler 的解析入口
+
+它不负责长期持有线程自己的：
+
+- loaded toolsets
+- tool visibility projection
+- compact/auto_compact 的线程开关
+- 工具权限与审批状态
+
+这些 thread-scoped 状态统一由 `ThreadContext` 管理，然后再由 `ThreadContext` 去调用全局 `ToolRegistry`。
 
 ### load_toolset/mcp
 我想设计一个渐进式加载的 tool set（或者是MCP，它本质也是一个工具集）。
@@ -128,6 +175,8 @@ MessageContext = order{
 2. 将这些描述放在里面，并提供一个 loader 工具。
 3. 如果需要使用，就通过该 loader 工具进行加载。
 4. 用完了unload
+
+这里的加载状态属于当前线程自己的 `ThreadContext`，不是 `ToolRegistry` 自己的线程 map。
 
 
 ### builtin tools
@@ -163,6 +212,8 @@ MCP 归属在 ToolRegistry 内部统一管理 配置入口是 `agent.tool.mcp.se
 - 运行时启停/刷新/查询通过 `runtime.tools().mcp()` 暴露给其他组件
 - demo-only MCP server 也放在 tool 模块下 通过内部子命令启动用于测试
 - ./config/openjarvis/mcp.json 作为目前默认的配置文件
+- MCP server 的生命周期仍然归属全局 `ToolRegistry`
+- 但某个线程当前是否加载某个 MCP toolset 以及是否对模型可见 由该线程的 `ThreadContext` 决定
 
 ## skill
 - 支持用户配置skill 选择skill 下载skill
@@ -283,7 +334,7 @@ Compact 的核心不是“少一段文本”，而是“把当前任务恢复所
 - 如果已经达到硬阈值，则 runtime 仍然可以直接先 compact；这和模型侧是否主动调用是两层机制
 - 用户也可以通过 `/auto-compact on|off|status` 对当前线程做 runtime 级开关，并收到命令回复确认
 
-为了支持这件事，ToolRegistry 里的工具除了“注册”之外，还需要有“当前线程当前状态是否 visible”的投影能力。这样 compact tool 就能按线程开启/关闭，而不是作为全局永久工具。
+为了支持这件事，线程级 compact 特性状态和工具可见性判断都应该收口到 `ThreadContext`。`ToolRegistry` 只提供全局 `compact` 工具定义或其他工具定义的解析能力，不再自己保存 thread-scoped compact projection。
 
 # TODO
 记忆

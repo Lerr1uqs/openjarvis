@@ -11,7 +11,7 @@ use crate::config::ChannelConfig;
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
-use crate::thread::ConversationThread;
+use crate::thread::ThreadContext;
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, pending};
@@ -407,9 +407,24 @@ impl ChannelRouter {
             "router accepted incoming message"
         );
 
-        if let Some(reply) = self.commands.try_execute(&message).await? {
-            self.dispatch_command_reply(&message, reply).await?;
-            return Ok(());
+        if self.commands.is_command(&message)? {
+            let locator = self.sessions.load_or_create_thread(&message).await;
+            let mut thread_context = self
+                .sessions
+                .load_thread_context(&locator)
+                .await
+                .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
+            if let Some(reply) = self
+                .commands
+                .try_execute_with_thread_context(&message, &mut thread_context)
+                .await?
+            {
+                self.sessions
+                    .store_thread_context(&locator, thread_context, message.received_at)
+                    .await;
+                self.dispatch_command_reply(&message, reply).await?;
+                return Ok(());
+            }
         }
 
         let locator = self.sessions.load_or_create_thread(&message).await;
@@ -435,7 +450,7 @@ impl ChannelRouter {
             id: Uuid::new_v4(),
             channel: event.channel,
             content: event.content,
-            thread_id: event.thread_id,
+            external_thread_id: event.external_thread_id,
             metadata: serde_json::json!({
                 "source_message_id": source_message_id,
                 "session_id": event.session_id,
@@ -465,7 +480,7 @@ impl ChannelRouter {
             id: Uuid::new_v4(),
             channel: incoming.channel.clone(),
             content: reply.formatted_content(),
-            thread_id: incoming.thread_id.clone(),
+            external_thread_id: incoming.external_thread_id.clone(),
             metadata: serde_json::json!({
                 "event_kind": "Command",
                 "command_name": reply.name(),
@@ -505,15 +520,13 @@ impl ChannelRouter {
         }
         messages.extend(turn.messages);
         self.sessions
-            .store_turn_with_active_thread(
+            .store_turn_with_thread_context(
                 &turn.locator,
-                Some(turn.active_thread),
+                Some(turn.thread_context),
                 turn.incoming.external_message_id.clone(),
                 messages,
                 turn.incoming.received_at,
                 turn.completed_at,
-                turn.loaded_toolsets,
-                turn.tool_events,
             )
             .await;
         self.release_or_dispatch_next(&turn.locator).await?;
@@ -526,7 +539,7 @@ impl ChannelRouter {
             id: Uuid::new_v4(),
             channel: turn.incoming.channel.clone(),
             content: failure_reply.clone(),
-            thread_id: turn.incoming.thread_id.clone(),
+            external_thread_id: turn.incoming.external_thread_id.clone(),
             metadata: serde_json::json!({
                 "event_kind": "AgentError",
                 "session_id": turn.locator.session_id.to_string(),
@@ -542,9 +555,9 @@ impl ChannelRouter {
         .await?;
 
         self.sessions
-            .store_turn_with_active_thread(
+            .store_turn_with_thread_context(
                 &turn.locator,
-                Some(turn.active_thread),
+                Some(turn.thread_context),
                 turn.incoming.external_message_id.clone(),
                 vec![
                     ChatMessage::new(
@@ -556,8 +569,6 @@ impl ChannelRouter {
                 ],
                 turn.incoming.received_at,
                 turn.completed_at,
-                turn.loaded_toolsets,
-                Vec::new(),
             )
             .await;
         self.release_or_dispatch_next(&turn.locator).await?;
@@ -592,20 +603,18 @@ impl ChannelRouter {
         message: IncomingMessage,
     ) -> Result<()> {
         let thread_state = self.sessions.load_thread_state(&locator).await;
+        let thread_context = thread_state
+            .thread_context
+            .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
         if let Err(error) = self
             .agent_tx
             .send(AgentRequest {
                 locator: locator.clone(),
                 incoming: message.clone(),
-                thread: thread_state.thread.unwrap_or_else(|| {
-                    ConversationThread::with_id(
-                        locator.thread_id,
-                        locator.external_thread_id.clone(),
-                        message.received_at,
-                    )
-                }),
-                history: thread_state.messages,
-                loaded_toolsets: thread_state.loaded_toolsets,
+                thread: thread_context.to_conversation_thread(),
+                history: thread_context.load_messages(),
+                loaded_toolsets: thread_context.load_toolsets(),
+                thread_context,
             })
             .await
         {

@@ -1,16 +1,17 @@
 //! Slash command parsing and dispatch before router messages enter session or agent flows.
 //!
 //! The router uses this module as a hard pre-processing stage. Any incoming message that starts
-//! with `/` is treated as a command message. Registered commands execute immediately and unknown
-//! commands return a formatted failure response without touching `SessionManager` or `AgentWorker`.
+//! with `/` is treated as a command message. Every command is thread-scoped, so the router must
+//! resolve the target `ThreadContext` before execution. Unknown commands return a formatted failure
+//! response without touching `AgentWorker`.
 //! Some Feishu channel messages may arrive as `@_user_1 /echo zxf`, so command matching strips
 //! one leading Feishu mention token before checking whether the message starts with `/`.
-//! Runtime-scoped commands such as `/auto-compact on` can still mutate shared live state and
-//! override static YAML defaults even though command messages themselves do not enter the
-//! persisted session history.
+//! Commands can still mutate shared live state and override static YAML defaults even though
+//! command messages themselves do not enter the persisted session history.
 
 use crate::compact::{CompactRuntimeManager, CompactScopeKey};
 use crate::model::IncomingMessage;
+use crate::thread::ThreadContext;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -217,6 +218,7 @@ pub trait CommandHandler: Send + Sync {
         &self,
         invocation: &CommandInvocation,
         incoming: &IncomingMessage,
+        thread_context: &mut ThreadContext,
     ) -> Result<CommandReply>;
 }
 
@@ -293,6 +295,7 @@ impl CommandRegistry {
     ///         &self,
     ///         _invocation: &CommandInvocation,
     ///         _incoming: &IncomingMessage,
+    ///         _thread_context: &mut openjarvis::thread::ThreadContext,
     ///     ) -> anyhow::Result<CommandReply> {
     ///         Ok(CommandReply::success("ping", "pong"))
     ///     }
@@ -315,47 +318,28 @@ impl CommandRegistry {
         Ok(())
     }
 
+    /// Return whether one incoming message should be treated as a slash command.
+    pub fn is_command(&self, incoming: &IncomingMessage) -> Result<bool> {
+        let normalized_content = remove_prefix_at_if_exist(incoming);
+        Ok(CommandInvocation::parse(&normalized_content)?.is_some())
+    }
+
     /// Try to execute one incoming message as a slash command.
     ///
     /// Returns `Ok(None)` when the message is not a command. Slash commands always return
     /// `Some(CommandReply)`, including unknown-command failures.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::command::CommandRegistry;
-    /// use openjarvis::model::{IncomingMessage, ReplyTarget};
-    /// use serde_json::json;
-    /// use uuid::Uuid;
-    ///
-    /// let registry = CommandRegistry::with_builtin_commands();
-    /// let incoming = IncomingMessage {
-    ///     id: Uuid::new_v4(),
-    ///     external_message_id: Some("msg_1".to_string()),
-    ///     channel: "feishu".to_string(),
-    ///     user_id: "ou_xxx".to_string(),
-    ///     user_name: None,
-    ///     content: "/echo hello".to_string(),
-    ///     thread_id: None,
-    ///     received_at: Utc::now(),
-    ///     metadata: json!({}),
-    ///     attachments: Vec::new(),
-    ///     reply_target: ReplyTarget {
-    ///         receive_id: "oc_xxx".to_string(),
-    ///         receive_id_type: "chat_id".to_string(),
-    ///     },
-    /// };
-    ///
-    /// let reply = registry
-    ///     .try_execute(&incoming)
-    ///     .await?
-    ///     .expect("slash command should be handled");
-    /// assert_eq!(reply.formatted_content(), "[Command][echo][SUCCESS]: hello");
-    /// # Ok(())
-    /// # }
-    /// ```
+    #[deprecated(note = "resolve a ThreadContext first and call try_execute_with_thread_context")]
     pub async fn try_execute(&self, incoming: &IncomingMessage) -> Result<Option<CommandReply>> {
+        let _ = incoming;
+        bail!("all commands require a resolved thread context")
+    }
+
+    /// Try to execute one incoming message as a slash command with the resolved target thread context.
+    pub async fn try_execute_with_thread_context(
+        &self,
+        incoming: &IncomingMessage,
+        thread_context: &mut ThreadContext,
+    ) -> Result<Option<CommandReply>> {
         let normalized_content = remove_prefix_at_if_exist(incoming);
         let Some(invocation) = CommandInvocation::parse(&normalized_content)? else {
             return Ok(None);
@@ -368,7 +352,11 @@ impl CommandRegistry {
             )));
         };
 
-        Ok(Some(handler.execute(&invocation, incoming).await?))
+        Ok(Some(
+            handler
+                .execute(&invocation, incoming, thread_context)
+                .await?,
+        ))
     }
 }
 
@@ -424,6 +412,7 @@ impl CommandHandler for TestCommand {
         &self,
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
+        _thread_context: &mut ThreadContext,
     ) -> Result<CommandReply> {
         let message = if invocation.raw_arguments().is_empty() {
             "test command ok".to_string()
@@ -442,6 +431,7 @@ impl CommandHandler for EqualCommand {
         &self,
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
+        _thread_context: &mut ThreadContext,
     ) -> Result<CommandReply> {
         let arguments = invocation.arguments();
         if arguments.len() != 2 {
@@ -473,6 +463,7 @@ impl CommandHandler for EchoCommand {
         &self,
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
+        _thread_context: &mut ThreadContext,
     ) -> Result<CommandReply> {
         Ok(CommandReply::success(
             invocation.name(),
@@ -507,10 +498,12 @@ impl AutoCompactCommand {
 
 #[async_trait]
 impl CommandHandler for AutoCompactCommand {
+    #[allow(deprecated)]
     async fn execute(
         &self,
         invocation: &CommandInvocation,
         incoming: &IncomingMessage,
+        thread_context: &mut ThreadContext,
     ) -> Result<CommandReply> {
         let Some(action) = invocation.arguments().first().map(|value| value.as_str()) else {
             return Ok(Self::usage(invocation.name()));
@@ -519,6 +512,7 @@ impl CommandHandler for AutoCompactCommand {
 
         match action {
             "on" => {
+                thread_context.enable_auto_compact();
                 self.compact_runtime
                     .set_compact_enabled(scope.clone(), true)
                     .await;
@@ -534,6 +528,7 @@ impl CommandHandler for AutoCompactCommand {
                 ))
             }
             "off" => {
+                thread_context.disable_auto_compact();
                 self.compact_runtime
                     .set_compact_enabled(scope.clone(), self.default_compact_enabled)
                     .await;
@@ -549,10 +544,7 @@ impl CommandHandler for AutoCompactCommand {
                 ))
             }
             "status" => {
-                let enabled = self
-                    .compact_runtime
-                    .auto_compact_enabled(&scope, self.default_auto_compact)
-                    .await;
+                let enabled = thread_context.auto_compact_enabled(self.default_auto_compact);
                 Ok(CommandReply::success(
                     invocation.name(),
                     format!(

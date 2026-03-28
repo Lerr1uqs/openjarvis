@@ -12,7 +12,7 @@ fn message_models_roundtrip_with_serde() {
         user_id: "ou_xxx".to_string(),
         user_name: Some("tester".to_string()),
         content: "hello".to_string(),
-        thread_id: Some("thread_1".to_string()),
+        external_thread_id: Some("thread_1".to_string()),
         received_at: Utc::now(),
         metadata: json!({ "source": "test" }),
         attachments: vec![IncomingAttachment {
@@ -30,7 +30,7 @@ fn message_models_roundtrip_with_serde() {
         id: Uuid::new_v4(),
         channel: "feishu".to_string(),
         content: "reply".to_string(),
-        thread_id: Some("thread_1".to_string()),
+        external_thread_id: Some("thread_1".to_string()),
         metadata: json!({ "kind": "reply" }),
         reply_to_message_id: Some("msg_1".to_string()),
         target: ReplyTarget {
@@ -66,7 +66,7 @@ fn missing_thread_id_falls_back_to_default() {
         user_id: "ou_xxx".to_string(),
         user_name: None,
         content: "hello".to_string(),
-        thread_id: None,
+        external_thread_id: None,
         received_at: Utc::now(),
         metadata: json!({}),
         attachments: Vec::new(),

@@ -29,9 +29,10 @@ pub struct IncomingMessage {
     /// Upstream chat-software thread identifier.
     ///
     /// This field is owned by the external channel implementation such as Feishu or Telegram.
-    /// It is only used to resolve the internal OpenJarvis thread identity and is not the real
-    /// persisted conversation thread ID inside `SessionManager`.
-    pub thread_id: Option<String>,
+    /// It is only used to resolve the internal OpenJarvis thread identity and is not itself the
+    /// internal thread id persisted inside `SessionManager`.
+    #[serde(default, alias = "thread_id")]
+    pub external_thread_id: Option<String>,
     pub received_at: DateTime<Utc>,
     pub metadata: Value,
     pub attachments: Vec<IncomingAttachment>,
@@ -55,7 +56,7 @@ impl IncomingMessage {
     ///     user_id: "ou_xxx".to_string(),
     ///     user_name: None,
     ///     content: "hello".to_string(),
-    ///     thread_id: None,
+    ///     external_thread_id: None,
     ///     received_at: Utc::now(),
     ///     metadata: json!({}),
     ///     attachments: Vec::new(),
@@ -68,7 +69,7 @@ impl IncomingMessage {
     /// assert_eq!(message.resolved_external_thread_id(), "default");
     /// ```
     pub fn resolved_external_thread_id(&self) -> String {
-        self.thread_id
+        self.external_thread_id
             .clone()
             .filter(|thread_id| !thread_id.trim().is_empty())
             .unwrap_or_else(|| "default".to_string())
@@ -88,7 +89,8 @@ pub struct OutgoingMessage {
     pub id: Uuid,
     pub channel: String,
     pub content: String,
-    pub thread_id: Option<String>,
+    #[serde(default, alias = "thread_id")]
+    pub external_thread_id: Option<String>,
     pub metadata: Value,
     pub reply_to_message_id: Option<String>,
     pub target: ReplyTarget,

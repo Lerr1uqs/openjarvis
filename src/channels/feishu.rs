@@ -44,7 +44,7 @@ impl FeishuChannel {
         let message_id = payload.message_id.clone();
         let chat_id = payload.chat_id.clone();
         let raw_thread_id = payload.thread_id.clone();
-        let thread_id = raw_thread_id
+        let external_thread_id = raw_thread_id
             .clone()
             .filter(|value| !value.trim().is_empty());
 
@@ -53,8 +53,8 @@ impl FeishuChannel {
             chat_id,
             has_thread_id = raw_thread_id.is_some(),
             raw_thread_id = ?raw_thread_id,
-            resolved_thread_id = ?thread_id,
-            "parsed feishu long-connection thread_id"
+            resolved_external_thread_id = ?external_thread_id,
+            "parsed feishu long-connection external_thread_id"
         );
 
         IncomingMessage {
@@ -64,7 +64,7 @@ impl FeishuChannel {
             user_id: payload.sender_open_id,
             user_name: None,
             content,
-            thread_id,
+            external_thread_id,
             received_at: Utc::now(),
             metadata: json!({
                 "event_id": payload.event_id,
