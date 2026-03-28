@@ -16,6 +16,7 @@
 - [ ] 飞书不是先react再回复的
 - [ ] 压缩上下文的prompt注入
 - [ ] 如何发送image
+- [ ] 旧的 CompactRuntimeManager 兼容缓存 取出
 
 # clean
 - [ ] sidecar
