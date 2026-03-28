@@ -17,7 +17,7 @@ use openjarvis::{
     model::{IncomingMessage, OutgoingMessage, ReplyTarget},
     router::ChannelRouter,
     router::ChannelRouterBuilder,
-    session::{MemorySessionStore, SessionKey, SessionManager, SessionStore, SessionStrategy},
+    session::{MemorySessionStore, SessionKey, SessionManager, SessionStore},
     thread::{ConversationThread, ThreadContext, ThreadContextLocator},
 };
 use serde_json::json;
@@ -586,15 +586,13 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
 }
 
 #[tokio::test]
-async fn router_applies_five_message_truncation_strategy_before_next_turn() {
+async fn router_preserves_large_history_before_next_turn() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
     let observed_requests = Arc::new(Mutex::new(Vec::new()));
     let agent_harness = build_truncation_mock_agent_handle(Arc::clone(&observed_requests));
     let event_keepalive_tx = agent_harness.event_keepalive_tx; // test-only: prevents the mock downstream channel from looking crashed.
-    let sessions = SessionManager::with_strategy(SessionStrategy {
-        max_messages_per_thread: 5,
-    });
+    let sessions = SessionManager::new();
     let mut router = ChannelRouter::builder()
         .agent_handle(agent_harness.handle)
         .session_manager(sessions)
@@ -689,7 +687,7 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
 
     assert_eq!(observed_requests.len(), 2);
     assert!(observed_requests[0].history.is_empty());
-    assert_eq!(observed_requests[1].history.len(), 5);
+    assert_eq!(observed_requests[1].history.len(), 7);
     assert_eq!(
         observed_requests[1]
             .history
@@ -697,6 +695,8 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
         vec![
+            "trigger many replies".to_string(),
+            "message_1".to_string(),
             "message_2".to_string(),
             "message_3".to_string(),
             "message_4".to_string(),
@@ -707,7 +707,7 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
 
     assert_eq!(thread.turns.len(), 2);
     assert_eq!(thread.external_thread_id, "thread_truncation");
-    assert_eq!(thread.turns[0].messages.len(), 3);
+    assert_eq!(thread.turns[0].messages.len(), 7);
     assert_eq!(thread.turns[1].messages.len(), 2);
     assert_eq!(
         thread.turns[0]
@@ -716,6 +716,10 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
         vec![
+            "trigger many replies".to_string(),
+            "message_1".to_string(),
+            "message_2".to_string(),
+            "message_3".to_string(),
             "message_4".to_string(),
             "message_5".to_string(),
             "message_6".to_string(),
@@ -732,11 +736,12 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
             "final-after-truncation".to_string(),
         ]
     );
-    assert_eq!(history.len(), 5);
-    assert_eq!(history[0].content, "message_4");
-    assert_eq!(history[2].content, "message_6");
-    assert_eq!(history[3].content, "check history after truncation");
-    assert_eq!(history[4].content, "final-after-truncation");
+    assert_eq!(history.len(), 9);
+    assert_eq!(history[0].content, "trigger many replies");
+    assert_eq!(history[1].content, "message_1");
+    assert_eq!(history[6].content, "message_6");
+    assert_eq!(history[7].content, "check history after truncation");
+    assert_eq!(history[8].content, "final-after-truncation");
 
     assert_eq!(recorded.len(), 7);
     assert_eq!(recorded[0].content, "message_1");
@@ -1064,11 +1069,15 @@ async fn router_clear_command_resets_persisted_thread_context_without_agent_disp
     register_runtime_commands(&mut commands, false, false, Arc::clone(&compact_runtime))
         .expect("runtime command should register");
     let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-    let sessions = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+    let sessions = SessionManager::with_store(Arc::clone(&store))
         .await
         .expect("shared store session manager should build");
-    let seed_incoming =
-        build_incoming_with("msg_clear_seed", "ou_thread_clear", Some("thread_clear"), "seed");
+    let seed_incoming = build_incoming_with(
+        "msg_clear_seed",
+        "ou_thread_clear",
+        Some("thread_clear"),
+        "seed",
+    );
     let locator = sessions
         .load_or_create_thread(&seed_incoming)
         .await
@@ -1078,7 +1087,11 @@ async fn router_clear_command_resets_persisted_thread_context_without_agent_disp
     seeded_thread.enable_auto_compact();
     seeded_thread.store_turn_state(
         seed_incoming.external_message_id.clone(),
-        vec![ChatMessage::new(ChatMessageRole::User, "需要被清空的历史", now)],
+        vec![ChatMessage::new(
+            ChatMessageRole::User,
+            "需要被清空的历史",
+            now,
+        )],
         now,
         now,
         vec!["demo".to_string()],
@@ -1168,7 +1181,7 @@ async fn router_clear_command_resets_persisted_thread_context_without_agent_disp
         .values()
         .next()
         .expect("thread should remain addressable after clear");
-    let restored_reader = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+    let restored_reader = SessionManager::with_store(Arc::clone(&store))
         .await
         .expect("restored reader should build");
     let restored = restored_reader

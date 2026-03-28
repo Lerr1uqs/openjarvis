@@ -94,16 +94,12 @@ pub struct IncomingMessage {
 - compact turn 必须按 `ConversationTurn` 原样保存，不能只存扁平 messages 再反推 turn 边界
 - `external_message_id` 去重记录会单独落盘，保证重启后仍能识别重复消息
 
-另外有一个SessionStrategy 负责做会话保存的策略 比如turn只保留五个 多余进行丢弃(暂时)
 session message实现两个接口：一个是 load_turn，一个是 store_turn。
 
 1. store：存储新增的消息。
 2. load：加载当前传入的 history。
 
-当前默认策略已经切到 compact 优先：
-
 - 如果启用了 `compact`，runtime 会在真正请求 LLM 前基于完整请求预算判断是否压缩 `chat`
-- `max_messages_per_thread` 只作为 compact 关闭时的兼容 fallback
 
 TODO:
 - [ ] 后面要加入对初始加入的审批

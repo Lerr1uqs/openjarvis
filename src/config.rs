@@ -698,6 +698,7 @@ pub struct AgentCompactConfig {
     runtime_threshold_ratio: f64,
     tool_visible_threshold_ratio: f64,
     reserved_output_tokens: Option<usize>,
+    mock_compacted_assistant: Option<String>,
 }
 
 impl Default for AgentCompactConfig {
@@ -708,6 +709,7 @@ impl Default for AgentCompactConfig {
             runtime_threshold_ratio: 0.85,
             tool_visible_threshold_ratio: 0.70,
             reserved_output_tokens: None,
+            mock_compacted_assistant: None,
         }
     }
 }
@@ -749,6 +751,11 @@ impl AgentCompactConfig {
         self.reserved_output_tokens
     }
 
+    /// Return the optional static compact summary used for deterministic mock compaction.
+    pub fn mock_compacted_assistant(&self) -> Option<&str> {
+        self.mock_compacted_assistant.as_deref()
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         validate_ratio(
             self.runtime_threshold_ratio,
@@ -771,6 +778,13 @@ impl AgentCompactConfig {
             .is_some_and(|reserved_output_tokens| reserved_output_tokens == 0)
         {
             bail!("agent.compact.reserved_output_tokens must be greater than 0");
+        }
+        if self
+            .mock_compacted_assistant
+            .as_deref()
+            .is_some_and(|summary| summary.trim().is_empty())
+        {
+            bail!("agent.compact.mock_compacted_assistant must not be blank");
         }
 
         Ok(())
@@ -1250,7 +1264,10 @@ impl LLMConfig {
     /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
     pub fn context_window_tokens(&self) -> usize {
         self.context_window_tokens
-            .or_else(|| self.known_model_token_limits().map(|limits| limits.context_window_tokens))
+            .or_else(|| {
+                self.known_model_token_limits()
+                    .map(|limits| limits.context_window_tokens)
+            })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
     }
 
@@ -1259,7 +1276,10 @@ impl LLMConfig {
     /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
     pub fn max_output_tokens(&self) -> usize {
         self.max_output_tokens
-            .or_else(|| self.known_model_token_limits().map(|limits| limits.max_output_tokens))
+            .or_else(|| {
+                self.known_model_token_limits()
+                    .map(|limits| limits.max_output_tokens)
+            })
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
     }
 
@@ -1295,8 +1315,11 @@ impl LLMConfig {
     fn known_model_token_limits(&self) -> Option<ModelTokenLimits> {
         let normalized_model = self.model.trim().to_ascii_lowercase();
         match normalized_model.as_str() {
-            "kimi-k2.5" | "kimi-k2-0905-preview" | "kimi-k2-turbo-preview"
-            | "kimi-k2-thinking" | "kimi-k2-thinking-turbo" => Some(ModelTokenLimits {
+            "kimi-k2.5"
+            | "kimi-k2-0905-preview"
+            | "kimi-k2-turbo-preview"
+            | "kimi-k2-thinking"
+            | "kimi-k2-thinking-turbo" => Some(ModelTokenLimits {
                 context_window_tokens: KIMI_K2_5_CONTEXT_WINDOW_TOKENS,
                 max_output_tokens: KIMI_K2_5_MAX_OUTPUT_TOKENS,
             }),

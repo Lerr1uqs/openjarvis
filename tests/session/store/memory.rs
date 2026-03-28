@@ -1,8 +1,8 @@
 use super::{build_compacted_thread_context, build_incoming, build_locator};
+use chrono::Utc;
 use openjarvis::session::{
     ExternalMessageDedupRecord, MemorySessionStore, SessionStore, SessionStoreError,
 };
-use chrono::Utc;
 
 #[tokio::test]
 async fn memory_store_roundtrips_thread_snapshot_and_dedup_record() {
@@ -14,7 +14,10 @@ async fn memory_store_roundtrips_thread_snapshot_and_dedup_record() {
         .expect("memory schema initialization should succeed");
     let incoming = build_incoming("msg_memory_store", "thread_memory_store");
     let session = store
-        .resolve_or_create_session(&openjarvis::session::SessionKey::from_incoming(&incoming), Utc::now())
+        .resolve_or_create_session(
+            &openjarvis::session::SessionKey::from_incoming(&incoming),
+            Utc::now(),
+        )
         .await
         .expect("session should resolve");
     let locator = build_locator(session.id, &incoming);
@@ -57,7 +60,10 @@ async fn memory_store_rejects_stale_revision_writes() {
     let store = MemorySessionStore::new();
     let incoming = build_incoming("msg_memory_conflict", "thread_memory_conflict");
     let session = store
-        .resolve_or_create_session(&openjarvis::session::SessionKey::from_incoming(&incoming), Utc::now())
+        .resolve_or_create_session(
+            &openjarvis::session::SessionKey::from_incoming(&incoming),
+            Utc::now(),
+        )
         .await
         .expect("session should resolve");
     let locator = build_locator(session.id, &incoming);

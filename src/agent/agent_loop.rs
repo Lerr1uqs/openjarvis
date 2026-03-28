@@ -7,8 +7,9 @@ use super::{
 };
 use crate::{
     compact::{
-        CompactAllChatStrategy, CompactManager, CompactScopeKey, CompactionOutcome,
-        ContextBudgetEstimator, ContextBudgetReport, LLMCompactProvider,
+        CompactAllChatStrategy, CompactManager, CompactProvider, CompactScopeKey, CompactSummary,
+        CompactionOutcome, ContextBudgetEstimator, ContextBudgetReport, LLMCompactProvider,
+        StaticCompactProvider,
     },
     config::{AgentCompactConfig, LLMConfig},
     context::{ChatMessage, ChatMessageRole, ContextMessage, ContextTokenKind, Messages},
@@ -176,11 +177,21 @@ impl AgentLoop {
         llm_config: LLMConfig,
         compact_config: AgentCompactConfig,
     ) -> Self {
+        let compact_provider = build_compact_provider(&llm, &compact_config);
+        Self::with_compact_provider(llm, runtime, llm_config, compact_config, compact_provider)
+    }
+
+    /// Create an agent loop with an explicitly injected compact provider.
+    pub fn with_compact_provider(
+        llm: Arc<dyn LLMProvider>,
+        runtime: AgentRuntime,
+        llm_config: LLMConfig,
+        compact_config: AgentCompactConfig,
+        compact_provider: Arc<dyn CompactProvider>,
+    ) -> Self {
         let budget_estimator = ContextBudgetEstimator::from_config(&llm_config, &compact_config);
-        let compact_manager = CompactManager::new(
-            Arc::new(LLMCompactProvider::new(Arc::clone(&llm))),
-            Arc::new(CompactAllChatStrategy),
-        );
+        let compact_manager =
+            CompactManager::new(compact_provider, Arc::new(CompactAllChatStrategy));
 
         Self {
             llm,
@@ -1086,4 +1097,21 @@ fn build_compact_thread_tool_event(
     event.metadata = metadata;
     event.is_error = is_error;
     event
+}
+
+fn build_compact_provider(
+    llm: &Arc<dyn LLMProvider>,
+    compact_config: &AgentCompactConfig,
+) -> Arc<dyn CompactProvider> {
+    if let Some(compacted_assistant) = compact_config.mock_compacted_assistant() {
+        info!(
+            summary_length = compacted_assistant.len(),
+            "using static compact mock provider from config"
+        );
+        return Arc::new(StaticCompactProvider::new(CompactSummary {
+            compacted_assistant: compacted_assistant.to_string(),
+        }));
+    }
+
+    Arc::new(LLMCompactProvider::new(Arc::clone(llm)))
 }

@@ -21,8 +21,6 @@
   已解析的线程身份，包含 `session_id / external_thread_id / thread_id`。
 - `SessionStore`
   持久化后端，当前实现有 memory 和 sqlite。
-- `SessionStrategy`
-  历史保留策略；当前仍保留兼容裁剪能力，但主路径已经是 compact 优先。
 
 ## 核心能力
 

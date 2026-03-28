@@ -68,7 +68,10 @@ pub trait SessionStore: Send + Sync {
     async fn initialize_schema(&self) -> SessionStoreResult<()>;
 
     /// Load an existing session metadata record by its stable session key.
-    async fn load_session(&self, key: &SessionKey) -> SessionStoreResult<Option<StoredSessionRecord>>;
+    async fn load_session(
+        &self,
+        key: &SessionKey,
+    ) -> SessionStoreResult<Option<StoredSessionRecord>>;
 
     /// Resolve one session metadata record and create it on first use.
     async fn resolve_or_create_session(

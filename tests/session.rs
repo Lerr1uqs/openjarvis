@@ -8,10 +8,7 @@ use openjarvis::{
     },
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     model::{IncomingMessage, ReplyTarget},
-    session::{
-        MemorySessionStore, SessionKey, SessionManager, SessionStore, SessionStrategy,
-        SqliteSessionStore,
-    },
+    session::{MemorySessionStore, SessionKey, SessionManager, SessionStore, SqliteSessionStore},
     thread::{
         ThreadContext, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
@@ -95,7 +92,10 @@ async fn store_and_load_turn_creates_session_state() {
         .await
         .expect("turn should store");
 
-    let history = manager.load_turn(&locator).await.expect("history should load");
+    let history = manager
+        .load_turn(&locator)
+        .await
+        .expect("history should load");
     let session = manager
         .get_session(&SessionKey::from_incoming(&incoming))
         .await
@@ -148,7 +148,10 @@ async fn load_turn_keeps_tool_call_id_history() {
         .await
         .expect("turn should store");
 
-    let history = manager.load_turn(&locator).await.expect("history should load");
+    let history = manager
+        .load_turn(&locator)
+        .await
+        .expect("history should load");
 
     assert!(
         history
@@ -163,54 +166,92 @@ async fn load_turn_keeps_tool_call_id_history() {
 }
 
 #[tokio::test]
-async fn strategy_keeps_only_latest_five_messages_per_thread() {
-    let manager = SessionManager::with_strategy(SessionStrategy {
-        max_messages_per_thread: 5,
-    });
-    let incoming = build_incoming("msg_1", "trim this");
+async fn large_turn_history_keeps_tool_calls_and_results_intact() {
+    // 测试场景: 长串 tool call 历史写回 session 后，不能再发生按 message 数裁剪，
+    // 否则后续请求会留下悬空 tool_result 并触发 provider 侧 Invalid tool_call_id。
+    let manager = SessionManager::new();
+    let incoming = build_incoming("msg_large_tool_turn", "keep large tool history");
     let locator = manager
         .load_or_create_thread(&incoming)
         .await
         .expect("thread should resolve");
 
+    let now = Utc::now();
     manager
         .store_turn(
             &locator,
             incoming.external_message_id.clone(),
-            (0..7)
-                .map(|index| {
-                    ChatMessage::new(
-                        ChatMessageRole::Assistant,
-                        format!("message_{index}"),
-                        Utc::now(),
-                    )
-                })
-                .collect(),
+            vec![
+                ChatMessage::new(
+                    ChatMessageRole::User,
+                    "keep large tool history",
+                    incoming.received_at,
+                ),
+                ChatMessage::new(ChatMessageRole::Assistant, "", now).with_tool_calls(vec![
+                    ChatToolCall {
+                        id: "read:4".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "agent-doc/agent.md" }),
+                    },
+                    ChatToolCall {
+                        id: "read:5".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "arch/system.md" }),
+                    },
+                    ChatToolCall {
+                        id: "read:6".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "src/mod.md" }),
+                    },
+                    ChatToolCall {
+                        id: "read:7".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "src/agent/mod.md" }),
+                    },
+                ]),
+                ChatMessage::new(ChatMessageRole::ToolResult, "agent-doc", now)
+                    .with_tool_call_id("read:4"),
+                ChatMessage::new(ChatMessageRole::ToolResult, "arch", now)
+                    .with_tool_call_id("read:5"),
+                ChatMessage::new(ChatMessageRole::ToolResult, "src", now)
+                    .with_tool_call_id("read:6"),
+                ChatMessage::new(ChatMessageRole::ToolResult, "agent", now)
+                    .with_tool_call_id("read:7"),
+                ChatMessage::new(ChatMessageRole::Assistant, "", now).with_tool_calls(vec![
+                    ChatToolCall {
+                        id: "read:8".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "model/session.md" }),
+                    },
+                    ChatToolCall {
+                        id: "read:9".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "model/thread.md" }),
+                    },
+                    ChatToolCall {
+                        id: "read:10".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "README.md" }),
+                    },
+                ]),
+                ChatMessage::new(ChatMessageRole::ToolResult, "session-model", now)
+                    .with_tool_call_id("read:8"),
+                ChatMessage::new(ChatMessageRole::ToolResult, "thread-model", now)
+                    .with_tool_call_id("read:9"),
+                ChatMessage::new(ChatMessageRole::ToolResult, "readme", now)
+                    .with_tool_call_id("read:10"),
+                ChatMessage::new(ChatMessageRole::Assistant, "final answer", now),
+            ],
             incoming.received_at,
             Utc::now(),
         )
         .await
-        .expect("first turn should store");
-    manager
-        .store_turn(
-            &locator,
-            Some("msg_2".to_string()),
-            (7..10)
-                .map(|index| {
-                    ChatMessage::new(
-                        ChatMessageRole::Assistant,
-                        format!("message_{index}"),
-                        Utc::now(),
-                    )
-                })
-                .collect(),
-            incoming.received_at,
-            Utc::now(),
-        )
-        .await
-        .expect("second turn should store");
+        .expect("large tool turn should store");
 
-    let history = manager.load_turn(&locator).await.expect("history should load");
+    let history = manager
+        .load_turn(&locator)
+        .await
+        .expect("history should load");
     let session = manager
         .get_session(&SessionKey::from_incoming(&incoming))
         .await
@@ -220,25 +261,28 @@ async fn strategy_keeps_only_latest_five_messages_per_thread() {
         .get(&locator.thread_id)
         .expect("default thread should exist");
 
-    assert_eq!(history.len(), 5);
+    assert_eq!(history.len(), 11);
     assert_eq!(
+        history[1]
+            .tool_calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read:4", "read:5", "read:6", "read:7"]
+    );
+    assert!(
         history
             .iter()
-            .map(|message| message.content.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            "message_5".to_string(),
-            "message_6".to_string(),
-            "message_7".to_string(),
-            "message_8".to_string(),
-            "message_9".to_string(),
-        ]
+            .any(|message| message.tool_call_id.as_deref() == Some("read:7"))
     );
-    assert_eq!(thread.turns.len(), 2);
-    assert_eq!(thread.turns[0].messages.len(), 2);
-    assert_eq!(thread.turns[1].messages.len(), 3);
-    assert_eq!(thread.turns[0].messages[0].content, "message_5");
-    assert_eq!(thread.turns[1].messages[2].content, "message_9");
+    assert!(
+        history
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("read:10"))
+    );
+    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.turns[0].messages.len(), 11);
+    assert_eq!(thread.turns[0].messages[10].content, "final answer");
 }
 
 #[tokio::test]
@@ -560,13 +604,14 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
 async fn shared_store_merges_stale_state_updates_and_restores_external_message_dedup() {
     // 测试场景: 多个 SessionManager 共享同一个 store 时，旧线程状态写入要和最新快照合并，而不是覆盖 turn；dedup 记录也要能被新 manager 恢复。
     let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-    let manager_a = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+    let manager_a = SessionManager::with_store(Arc::clone(&store))
         .await
         .expect("manager A should build");
-    let manager_b = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+    let manager_b = SessionManager::with_store(Arc::clone(&store))
         .await
         .expect("manager B should build");
-    let incoming = build_incoming_with_thread("msg_conflict_1", "conflict", Some("thread_conflict"));
+    let incoming =
+        build_incoming_with_thread("msg_conflict_1", "conflict", Some("thread_conflict"));
     let locator_a = manager_a
         .load_or_create_thread(&incoming)
         .await
@@ -616,7 +661,7 @@ async fn shared_store_merges_stale_state_updates_and_restores_external_message_d
         .await
         .expect("dedup turn should store");
 
-    let manager_c = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+    let manager_c = SessionManager::with_store(Arc::clone(&store))
         .await
         .expect("manager C should build");
     let locator_c = manager_c
@@ -641,15 +686,11 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
             .await
             .expect("sqlite store A should open"),
     );
-    let manager_a = SessionManager::with_store(
-        Arc::clone(&store_a),
-        SessionStrategy {
-            max_messages_per_thread: usize::MAX,
-        },
-    )
-    .await
-    .expect("manager A should build");
-    let incoming = build_incoming_with_thread("msg_restart_1", "restore me", Some("thread_restart"));
+    let manager_a = SessionManager::with_store(Arc::clone(&store_a))
+        .await
+        .expect("manager A should build");
+    let incoming =
+        build_incoming_with_thread("msg_restart_1", "restore me", Some("thread_restart"));
     let locator_a = manager_a
         .load_or_create_thread(&incoming)
         .await
@@ -678,14 +719,9 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
             .await
             .expect("sqlite store B should open"),
     );
-    let manager_b = SessionManager::with_store(
-        Arc::clone(&store_b),
-        SessionStrategy {
-            max_messages_per_thread: usize::MAX,
-        },
-    )
-    .await
-    .expect("manager B should build");
+    let manager_b = SessionManager::with_store(Arc::clone(&store_b))
+        .await
+        .expect("manager B should build");
     let locator_b = manager_b
         .load_or_create_thread(&incoming)
         .await
@@ -708,7 +744,11 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
             Some("msg_restart_2".to_string()),
             vec![
                 ChatMessage::new(ChatMessageRole::User, "follow-up", Utc::now()),
-                ChatMessage::new(ChatMessageRole::Assistant, "reply-after-restart", Utc::now()),
+                ChatMessage::new(
+                    ChatMessageRole::Assistant,
+                    "reply-after-restart",
+                    Utc::now(),
+                ),
             ],
             Utc::now(),
             Utc::now(),

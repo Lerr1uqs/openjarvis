@@ -775,6 +775,67 @@ llm:
 }
 
 #[tokio::test]
+async fn agent_loop_can_use_static_mock_compact_summary_without_extra_llm_call() {
+    // 测试场景: 配置了 compact mock summary 后，历史压缩应直接走 StaticCompactProvider，
+    // 不再额外消耗一次 LLM 请求去生成 compact 摘要。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    runtime_threshold_ratio: 0.25
+    tool_visible_threshold_ratio: 0.9
+    reserved_output_tokens: 16
+    mock_compacted_assistant: "这是压缩后的上下文，使用 mock 保留任务状态。"
+llm:
+  provider: "mock"
+  context_window_tokens: 1000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("compact mock config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![text_response("mock 压缩后继续")])),
+        }),
+        runtime_without_skills(),
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let active_thread = thread_with_history(vec![
+        ChatMessage::new(
+            ChatMessageRole::User,
+            "这是一段很长的历史问题，需要被压缩。".repeat(40),
+            chrono::Utc::now(),
+        ),
+        ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "这是一段很长的历史回答，也需要被压缩。".repeat(40),
+            chrono::Utc::now(),
+        ),
+    ]);
+
+    let output = loop_runner
+        .run_with_thread(input, &build_context("system", "新的问题"), active_thread)
+        .await
+        .expect("loop should compact history with static mock summary");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 1);
+    assert!(captured_requests[0].messages.iter().any(|message| {
+        message
+            .content
+            .contains("这是压缩后的上下文，使用 mock 保留任务状态。")
+    }));
+    assert_eq!(output.reply, "mock 压缩后继续");
+    assert_eq!(output.events[0].kind, AgentLoopEventKind::Compact);
+    assert_eq!(output.events[1].kind, AgentLoopEventKind::TextOutput);
+}
+
+#[tokio::test]
 async fn agent_loop_auto_compact_injects_status_prompt_before_budget_threshold() {
     // 测试场景: auto_compact 开启后，每次 generate 都应注入容量提示；
     // 即使预算远低于阈值，也要暴露 compact 工具，只是不升级为提前告警。

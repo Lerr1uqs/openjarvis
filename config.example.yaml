@@ -40,6 +40,7 @@ agent:
     runtime_threshold_ratio: 0.85
     tool_visible_threshold_ratio: 0.70
     reserved_output_tokens: 1024
+    # mock_compacted_assistant: "这是压缩后的上下文，请基于这些信息继续当前任务：..."
   # 示例:
   # hook:
   #   user_prompt_submit: ["echo", "user prompt submitted"]

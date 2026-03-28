@@ -13,7 +13,10 @@ async fn sqlite_store_roundtrips_thread_snapshot_and_dedup_record() -> SessionSt
     store.initialize_schema().await?;
     let incoming = build_incoming("msg_sqlite_store", "thread_sqlite_store");
     let session = store
-        .resolve_or_create_session(&openjarvis::session::SessionKey::from_incoming(&incoming), Utc::now())
+        .resolve_or_create_session(
+            &openjarvis::session::SessionKey::from_incoming(&incoming),
+            Utc::now(),
+        )
         .await?;
     let locator = build_locator(session.id, &incoming);
     let now = Utc::now();
@@ -55,13 +58,18 @@ async fn sqlite_store_rejects_stale_revision_writes() -> SessionStoreResult<()> 
     store.initialize_schema().await?;
     let incoming = build_incoming("msg_sqlite_conflict", "thread_sqlite_conflict");
     let session = store
-        .resolve_or_create_session(&openjarvis::session::SessionKey::from_incoming(&incoming), Utc::now())
+        .resolve_or_create_session(
+            &openjarvis::session::SessionKey::from_incoming(&incoming),
+            Utc::now(),
+        )
         .await?;
     let locator = build_locator(session.id, &incoming);
     let now = Utc::now();
     let (thread_context, _turn_id) = build_compacted_thread_context(&locator, now);
 
-    store.save_thread_context(&thread_context, now, None).await?;
+    store
+        .save_thread_context(&thread_context, now, None)
+        .await?;
     let stale = store
         .load_thread_context(&locator)
         .await?

@@ -426,8 +426,7 @@ impl ChannelRouter {
             let mut thread_context = self
                 .sessions
                 .load_thread_context(&locator)
-                .await
-                ?
+                .await?
                 .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
             if let Some(reply) = self
                 .commands

@@ -13,7 +13,7 @@ use openjarvis::{
     llm::build_provider,
     logging,
     router::ChannelRouter,
-    session::{MemorySessionStore, SessionManager, SessionStrategy, SessionStore, SqliteSessionStore},
+    session::{MemorySessionStore, SessionManager, SessionStore, SqliteSessionStore},
 };
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -78,13 +78,6 @@ async fn main() -> Result<()> {
         .llm_config(config.llm_config().clone())
         .compact_config(config.agent_config().compact_config().clone())
         .build()?;
-    let session_strategy = if config.agent_config().compact_config().enabled() {
-        SessionStrategy {
-            max_messages_per_thread: usize::MAX,
-        }
-    } else {
-        SessionStrategy::default()
-    };
     let session_store: Arc<dyn SessionStore> =
         match config.session_config().persistence_config().backend() {
             SessionStoreBackend::Memory => Arc::new(MemorySessionStore::new()),
@@ -101,7 +94,7 @@ async fn main() -> Result<()> {
         };
     let mut router = ChannelRouter::builder()
         .agent(agent)
-        .session_manager(SessionManager::with_store(session_store, session_strategy).await?)
+        .session_manager(SessionManager::with_store(session_store).await?)
         .command_registry(command_registry)
         .build()?;
 

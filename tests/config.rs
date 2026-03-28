@@ -176,7 +176,11 @@ llm:
         AppConfig::from_path(fixture.config_path()).expect("session sqlite path should resolve");
 
     assert_eq!(
-        config.session_config().persistence_config().sqlite_config().path(),
+        config
+            .session_config()
+            .persistence_config()
+            .sqlite_config()
+            .path(),
         fixture.root.join("runtime/session.sqlite3").as_path()
     );
 }
@@ -633,6 +637,7 @@ agent:
     runtime_threshold_ratio: 0.9
     tool_visible_threshold_ratio: 0.75
     reserved_output_tokens: 512
+    mock_compacted_assistant: "这是压缩后的上下文，使用 mock 固定摘要。"
 llm:
   provider: "mock"
   context_window_tokens: 16384
@@ -663,6 +668,13 @@ llm:
             .compact_config()
             .reserved_output_tokens(),
         512
+    );
+    assert_eq!(
+        config
+            .agent_config()
+            .compact_config()
+            .mock_compacted_assistant(),
+        Some("这是压缩后的上下文，使用 mock 固定摘要。")
     );
     assert_eq!(config.llm_config().context_window_tokens(), 16384);
     assert_eq!(config.llm_config().tokenizer, "chars_div4");
@@ -707,4 +719,25 @@ llm:
 
     assert!(error_chain.contains("tool_visible_threshold_ratio"));
     assert!(error_chain.contains("runtime_threshold_ratio"));
+}
+
+#[test]
+fn malformed_compact_config_with_blank_mock_summary_is_rejected() {
+    let fixture = ConfigFixture::new("openjarvis-compact-mock-summary-invalid");
+    fixture.write_yaml(
+        r#"
+agent:
+  compact:
+    enabled: true
+    mock_compacted_assistant: "   "
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let error = AppConfig::from_path(fixture.config_path())
+        .expect_err("blank compact mock summary should be rejected");
+    let error_chain = format!("{error:#}");
+
+    assert!(error_chain.contains("mock_compacted_assistant"));
 }

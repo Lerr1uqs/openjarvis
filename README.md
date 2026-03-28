@@ -89,6 +89,7 @@ agent:
     runtime_threshold_ratio: 0.85
     tool_visible_threshold_ratio: 0.70
     reserved_output_tokens: 1024
+    # mock_compacted_assistant: "这是压缩后的上下文，请基于这些信息继续当前任务：..."
 ```
 
 ## Feishu 接入要求
@@ -140,6 +141,7 @@ agent:
 - `agent.compact.tool_visible_threshold_ratio`
 - `agent.compact.reserved_output_tokens`
 - `agent.compact.auto_compact: true` 时，模型会收到预算信息，并在软阈值后看到 `compact` 工具
+- 如需本地调试 compact，可直接配置 `agent.compact.mock_compacted_assistant`，这样会走静态 mock，不再额外调用 compact LLM
 
 ## 当前限制
 

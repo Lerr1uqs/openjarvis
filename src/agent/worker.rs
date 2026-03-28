@@ -5,7 +5,7 @@ use super::{
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
 };
-use crate::compact::CompactScopeKey;
+use crate::compact::{CompactProvider, CompactScopeKey};
 use crate::config::{AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
 use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
 use crate::llm::{LLMProvider, build_provider};
@@ -91,6 +91,7 @@ pub struct AgentWorkerBuilder {
     system_prompt: String,
     llm_config: LLMConfig,
     compact_config: AgentCompactConfig,
+    compact_provider: Option<Arc<dyn CompactProvider>>,
 }
 
 impl Default for AgentWorkerBuilder {
@@ -101,6 +102,7 @@ impl Default for AgentWorkerBuilder {
             system_prompt: DEFAULT_ASSISTANT_SYSTEM_PROMPT.to_string(),
             llm_config: LLMConfig::default(),
             compact_config: AgentCompactConfig::default(),
+            compact_provider: None,
         }
     }
 }
@@ -141,19 +143,35 @@ impl AgentWorkerBuilder {
         self
     }
 
+    /// Override the compact provider used by runtime compaction.
+    pub fn compact_provider(mut self, compact_provider: Arc<dyn CompactProvider>) -> Self {
+        self.compact_provider = Some(compact_provider);
+        self
+    }
+
     /// Build the worker from the accumulated fields.
     pub fn build(self) -> Result<AgentWorker> {
         let Some(llm) = self.llm else {
             bail!("agent worker builder requires an llm provider");
         };
-
-        Ok(AgentWorker {
-            agent_loop: AgentLoop::with_compact_config(
+        let agent_loop = match self.compact_provider {
+            Some(compact_provider) => AgentLoop::with_compact_provider(
+                llm,
+                self.runtime,
+                self.llm_config,
+                self.compact_config,
+                compact_provider,
+            ),
+            None => AgentLoop::with_compact_config(
                 llm,
                 self.runtime,
                 self.llm_config,
                 self.compact_config,
             ),
+        };
+
+        Ok(AgentWorker {
+            agent_loop,
             sandbox: DummySandboxContainer::new(),
             system_prompt: self.system_prompt,
         })

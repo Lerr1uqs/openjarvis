@@ -200,7 +200,9 @@ WHERE channel = ?1 AND user_id = ?2
                 .map_err(Into::into)
         })
         .await
-        .map_err(|error| SessionStoreError::from(anyhow!("sqlite load_session task failed: {error}")))?
+        .map_err(|error| {
+            SessionStoreError::from(anyhow!("sqlite load_session task failed: {error}"))
+        })?
     }
 
     async fn resolve_or_create_session(
@@ -275,7 +277,9 @@ VALUES (?1, ?2, ?3, ?4, ?5)
         })
         .await
         .map_err(|error| {
-            SessionStoreError::from(anyhow!("sqlite resolve_or_create_session task failed: {error}"))
+            SessionStoreError::from(anyhow!(
+                "sqlite resolve_or_create_session task failed: {error}"
+            ))
         })?
     }
 
@@ -295,9 +299,7 @@ FROM thread_metadata
 WHERE session_id = ?1 AND thread_id = ?2
 "#,
                     params![session_id, thread_id],
-                    |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    },
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()
                 .context("failed to load sqlite thread snapshot")?
@@ -444,7 +446,9 @@ DO UPDATE SET turn_id = excluded.turn_id, completed_at = excluded.completed_at
                 .map_err(Into::into)
         })
         .await
-        .map_err(|error| SessionStoreError::from(anyhow!("sqlite save_thread_context task failed: {error}")))?
+        .map_err(|error| {
+            SessionStoreError::from(anyhow!("sqlite save_thread_context task failed: {error}"))
+        })?
     }
 
     async fn load_external_message_record(
@@ -464,9 +468,7 @@ FROM external_message_dedup
 WHERE thread_id = ?1 AND external_message_id = ?2
 "#,
                     params![thread_id, external_message_id],
-                    |row| {
-                        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
-                    },
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()
                 .context("failed to load sqlite external message dedup record")?

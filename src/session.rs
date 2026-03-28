@@ -259,11 +259,6 @@ impl Session {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SessionStrategy {
-    pub max_messages_per_thread: usize,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct StoredThreadState {
     pub thread_context: Option<ThreadContext>,
@@ -273,55 +268,8 @@ pub struct StoredThreadState {
     pub tool_events: Vec<ThreadToolEvent>,
 }
 
-impl Default for SessionStrategy {
-    fn default() -> Self {
-        Self {
-            max_messages_per_thread: 10,
-        }
-    }
-}
-
-impl SessionStrategy {
-    /// Apply the current thread-storage policy to one thread context conversation.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::context::{ChatMessage, ChatMessageRole};
-    /// use openjarvis::session::SessionStrategy;
-    /// use openjarvis::thread::{ThreadContext, ThreadContextLocator};
-    ///
-    /// let now = Utc::now();
-    /// let thread_id = openjarvis::thread::derive_internal_thread_id("ou_xxx:feishu:default");
-    /// let mut thread = ThreadContext::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
-    ///     now,
-    /// );
-    /// thread.store_turn(
-    ///     Some("msg_1".to_string()),
-    ///     vec![
-    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_0", now),
-    ///         ChatMessage::new(ChatMessageRole::Assistant, "message_1", now),
-    ///     ],
-    ///     now,
-    ///     now,
-    /// );
-    ///
-    /// SessionStrategy {
-    ///     max_messages_per_thread: 1,
-    /// }
-    /// .retain_thread_messages(&mut thread);
-    ///
-    /// assert_eq!(thread.load_messages().len(), 1);
-    /// ```
-    pub fn retain_thread_messages(&self, thread: &mut ThreadContext) {
-        thread.retain_latest_messages(self.max_messages_per_thread);
-    }
-}
-
 pub struct SessionManager {
     sessions: Mutex<HashMap<SessionKey, Session>>,
-    strategy: SessionStrategy,
     store: Arc<dyn SessionStore>,
 }
 
@@ -333,37 +281,22 @@ impl SessionManager {
     /// use openjarvis::session::SessionManager;
     ///
     /// let manager = SessionManager::new();
-    /// assert_eq!(manager.strategy().max_messages_per_thread, 10);
+    /// let _ = manager;
     /// ```
     pub fn new() -> Self {
-        Self::with_strategy(SessionStrategy::default())
-    }
-
-    /// Create an empty in-memory session manager with a custom storage strategy.
-    pub fn with_strategy(strategy: SessionStrategy) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            strategy,
             store: Arc::new(MemorySessionStore::new()),
         }
     }
 
     /// Create a session manager backed by the provided persistent store.
-    pub async fn with_store(
-        store: Arc<dyn SessionStore>,
-        strategy: SessionStrategy,
-    ) -> SessionStoreResult<Self> {
+    pub async fn with_store(store: Arc<dyn SessionStore>) -> SessionStoreResult<Self> {
         store.initialize_schema().await?;
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
-            strategy,
             store,
         })
-    }
-
-    /// Return the configured session storage strategy.
-    pub fn strategy(&self) -> &SessionStrategy {
-        &self.strategy
     }
 
     /// Resolve the external thread id on one incoming message and create the session/thread on
@@ -410,7 +343,8 @@ impl SessionManager {
             .store
             .resolve_or_create_session(&session_key, now)
             .await?;
-        let locator = ThreadLocator::new(session_record.id, incoming, external_thread_id, thread_id);
+        let locator =
+            ThreadLocator::new(session_record.id, incoming, external_thread_id, thread_id);
 
         info!(
             session_id = %locator.session_id,
@@ -555,7 +489,9 @@ impl SessionManager {
             turn_id,
             completed_at,
         };
-        self.store.save_external_message_record(locator, &record).await
+        self.store
+            .save_external_message_record(locator, &record)
+            .await
     }
 
     /// Store one completed turn for the provided channel/user/thread tuple.
@@ -692,23 +628,33 @@ impl SessionManager {
             .await?;
         let mut thread_context = match thread_context {
             Some(thread_context) => thread_context,
-            None => self
-                .load_thread_context(locator)
-                .await?
-                .unwrap_or_else(|| ThreadContext::new(ThreadContextLocator::from(locator), completed_at)),
+            None => self.load_thread_context(locator).await?.unwrap_or_else(|| {
+                ThreadContext::new(ThreadContextLocator::from(locator), completed_at)
+            }),
         };
         thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        let turn_id =
-            thread_context.store_turn(external_message_id.clone(), messages, started_at, completed_at);
-        self.strategy.retain_thread_messages(&mut thread_context);
-        let dedup_record = external_message_id.as_ref().map(|message_id| ExternalMessageDedupRecord {
-            thread_id: locator.thread_id,
-            external_message_id: message_id.clone(),
-            turn_id: Some(turn_id),
+        let turn_id = thread_context.store_turn(
+            external_message_id.clone(),
+            messages,
+            started_at,
             completed_at,
-        });
+        );
+        let dedup_record =
+            external_message_id
+                .as_ref()
+                .map(|message_id| ExternalMessageDedupRecord {
+                    thread_id: locator.thread_id,
+                    external_message_id: message_id.clone(),
+                    turn_id: Some(turn_id),
+                    completed_at,
+                });
         thread_context = self
-            .save_turn_snapshot_with_retry(locator, thread_context, completed_at, dedup_record.as_ref())
+            .save_turn_snapshot_with_retry(
+                locator,
+                thread_context,
+                completed_at,
+                dedup_record.as_ref(),
+            )
             .await?;
 
         let mut sessions = self.sessions.lock().await;
@@ -737,10 +683,9 @@ impl SessionManager {
             .store
             .resolve_or_create_session(&session_key, completed_at)
             .await?;
-        let mut thread_context = self
-            .load_thread_context(locator)
-            .await?
-            .unwrap_or_else(|| ThreadContext::new(ThreadContextLocator::from(locator), completed_at));
+        let mut thread_context = self.load_thread_context(locator).await?.unwrap_or_else(|| {
+            ThreadContext::new(ThreadContextLocator::from(locator), completed_at)
+        });
         if let Some(active_thread) = active_thread {
             info!(
                 thread_id = %locator.thread_id,
@@ -757,15 +702,22 @@ impl SessionManager {
             loaded_toolsets,
             tool_events,
         );
-        self.strategy.retain_thread_messages(&mut thread_context);
-        let dedup_record = external_message_id.as_ref().map(|message_id| ExternalMessageDedupRecord {
-            thread_id: locator.thread_id,
-            external_message_id: message_id.clone(),
-            turn_id: Some(turn_id),
-            completed_at,
-        });
+        let dedup_record =
+            external_message_id
+                .as_ref()
+                .map(|message_id| ExternalMessageDedupRecord {
+                    thread_id: locator.thread_id,
+                    external_message_id: message_id.clone(),
+                    turn_id: Some(turn_id),
+                    completed_at,
+                });
         thread_context = self
-            .save_turn_snapshot_with_retry(locator, thread_context, completed_at, dedup_record.as_ref())
+            .save_turn_snapshot_with_retry(
+                locator,
+                thread_context,
+                completed_at,
+                dedup_record.as_ref(),
+            )
             .await?;
 
         let mut sessions = self.sessions.lock().await;
