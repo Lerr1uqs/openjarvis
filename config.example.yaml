@@ -13,6 +13,12 @@ logging:
     filename_suffix: "log"
     max_files: 7
 
+session:
+  persistence:
+    backend: "sqlite"
+    sqlite:
+      path: "data/openjarvis/session.sqlite3"
+
 feishu:
   mode: "long_connection"
   webhook_path: "/webhook/feishu"

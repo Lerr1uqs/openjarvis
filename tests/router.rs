@@ -517,7 +517,11 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
 
     let observed_requests = observed_requests.lock().await.clone();
     let locator = observed_requests[0].locator.clone();
-    let history = router.sessions().load_turn(&locator).await;
+    let history = router
+        .sessions()
+        .load_turn(&locator)
+        .await
+        .expect("history should load");
     let session = router
         .sessions()
         .get_session(&SessionKey {
@@ -664,7 +668,11 @@ async fn router_applies_five_message_truncation_strategy_before_next_turn() {
 
     let observed_requests = observed_requests.lock().await.clone();
     let locator = observed_requests[0].locator.clone();
-    let history = router.sessions().load_turn(&locator).await;
+    let history = router
+        .sessions()
+        .load_turn(&locator)
+        .await
+        .expect("history should load");
     let session = router
         .sessions()
         .get_session(&SessionKey {
@@ -1077,7 +1085,11 @@ async fn router_failed_turn_replies_with_full_error_chain() {
         Some("thread_agent_error"),
         "why did provider fail",
     );
-    let locator = router.sessions().load_or_create_thread(&incoming).await;
+    let locator = router
+        .sessions()
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     let send_task = tokio::spawn(async move {
         let active_thread = empty_thread(locator.thread_id, &locator.external_thread_id);
@@ -1240,7 +1252,11 @@ async fn router_command_message_does_not_enter_existing_session() {
 
     let observed_requests = observed_requests.lock().await.clone();
     let locator = observed_requests[0].locator.clone();
-    let history = router.sessions().load_turn(&locator).await;
+    let history = router
+        .sessions()
+        .load_turn(&locator)
+        .await
+        .expect("history should load");
     let session = router
         .sessions()
         .get_session(&SessionKey {

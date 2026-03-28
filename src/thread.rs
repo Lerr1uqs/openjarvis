@@ -493,6 +493,8 @@ pub struct ThreadContext {
     #[serde(default)]
     pub state: ThreadState,
     #[serde(default, skip_serializing, skip_deserializing)]
+    revision: u64,
+    #[serde(default, skip_serializing, skip_deserializing)]
     pending_tool_events: Vec<ThreadToolEvent>,
 }
 
@@ -523,6 +525,7 @@ impl ThreadContext {
             locator,
             conversation: ThreadConversation::new(external_thread_id, now),
             state: ThreadState::default(),
+            revision: 0,
             pending_tool_events: Vec::new(),
         }
     }
@@ -564,6 +567,7 @@ impl ThreadContext {
                 },
                 approval: ThreadApprovalState::default(),
             },
+            revision: 0,
             pending_tool_events: Vec::new(),
         }
     }
@@ -571,6 +575,14 @@ impl ThreadContext {
     /// Rebind the runtime locator while keeping conversation and thread state intact.
     pub fn rebind_locator(&mut self, locator: ThreadContextLocator) {
         self.locator = locator;
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
     }
 
     /// Load the flattened message history for the whole thread.

@@ -55,7 +55,19 @@ pub struct IncomingMessage {
 - `ThreadConversation` 只保存历史和审计信息，不再自带一份独立 conversation id
 
 注意 thread 第一次遇到会创建，后续始终复用同一个 internal thread id。
-后期这些都会落盘到postgres sql中去(TBD)
+
+当前 SessionManager 是 “内存热缓存 + SessionStore 持久化后端” 模型：
+
+- 进程内只缓存当前命中过的 Session / ThreadContext
+- cache miss 时会从 `SessionStore` 懒加载恢复 `ThreadContext`
+- 线程写入走 write-through，会先完成 `ThreadContext` 快照持久化，再更新热缓存
+- `ThreadContext` 快照写入带 revision/CAS，避免旧快照覆盖新状态
+
+`SessionStore` 首版默认实现是 SQLite：
+
+- 默认数据库路径: `data/openjarvis/session.sqlite3`
+- 持久化内容: session 元数据、thread 快照 JSON、`external_message_id` 去重记录
+- 未来如果切 PostgreSQL，只需要补一个新的 store backend，不改 Router / Command / AgentLoop 的调用路径
 
 ## ThreadContext
 
@@ -74,6 +86,13 @@ pub struct IncomingMessage {
 - 当前线程身份统一来自 `locator.thread_id`，而不是 `ThreadConversation` 自己的 id 字段
 
 线程级能力都应该优先挂在 `ThreadContext` 上，而不是散落到 `ToolRegistry`、`CompactRuntimeManager` 或各个工具内部。
+
+持久化边界也以 `ThreadContext` 为准：
+
+- 会持久化: `locator`、`conversation(turns)`、`state`
+- 不会持久化: `pending_tool_events`、Router 排队状态、兼容缓存、live browser session 等纯运行时 attachment
+- compact turn 必须按 `ConversationTurn` 原样保存，不能只存扁平 messages 再反推 turn 边界
+- `external_message_id` 去重记录会单独落盘，保证重启后仍能识别重复消息
 
 另外有一个SessionStrategy 负责做会话保存的策略 比如turn只保留五个 多余进行丢弃(暂时)
 session message实现两个接口：一个是 load_turn，一个是 store_turn。
@@ -129,6 +148,8 @@ MessageContext = order{
 - `on` 后后续轮次会开启 auto-compact 提示并暴露 `compact`
 - `off` 后后续轮次会关闭这条线程上的 auto-compact 提示
 - 这类 thread-scoped command 修改的是当前线程 `ThreadContext` 中的状态 而不是额外的全局 override 容器
+
+兼容缓存如果仍存在，也只能从持久化后的 `ThreadContext` 单向重建，不能反向覆盖已经保存的线程快照。
 
 ## Cron: 定时器
 

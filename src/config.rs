@@ -19,6 +19,7 @@ const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
 pub struct AppConfig {
     server: ServerConfig,
     logging: LoggingConfig,
+    session: SessionConfig,
     #[serde(flatten)]
     channels: ChannelConfig,
     agent: AgentConfig,
@@ -30,6 +31,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
+            session: SessionConfig::default(),
             channels: ChannelConfig::default(),
             agent: AgentConfig::default(),
             llm: LLMConfig::default(),
@@ -106,6 +108,11 @@ impl AppConfig {
         &self.logging
     }
 
+    /// Return the read-only session persistence configuration view.
+    pub fn session_config(&self) -> &SessionConfig {
+        &self.session
+    }
+
     /// Return the read-only agent runtime configuration view.
     ///
     /// # 示例
@@ -152,12 +159,14 @@ impl AppConfig {
 
     fn validate(&self) -> Result<()> {
         self.logging.validate()?;
+        self.session.validate()?;
         self.llm.validate()?;
         self.agent.validate()
     }
 
     fn resolve_paths(&mut self, config_path: &Path) {
         self.logging.resolve_paths(config_path);
+        self.session.resolve_paths(config_path);
     }
 
     fn load_external_mcp_sidecar(&mut self, config_path: &Path) -> Result<()> {
@@ -427,6 +436,133 @@ impl ChannelConfig {
     /// Return the Feishu sub-configuration.
     pub fn feishu_config(&self) -> &FeishuConfig {
         &self.feishu
+    }
+}
+
+/// Session persistence configuration loaded from `session`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    persistence: SessionPersistenceConfig,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            persistence: SessionPersistenceConfig::default(),
+        }
+    }
+}
+
+impl SessionConfig {
+    /// Return the configured session persistence subsection.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::{AppConfig, SessionStoreBackend};
+    ///
+    /// let config = AppConfig::default();
+    /// assert_eq!(
+    ///     config.session_config().persistence_config().backend(),
+    ///     SessionStoreBackend::Sqlite
+    /// );
+    /// ```
+    pub fn persistence_config(&self) -> &SessionPersistenceConfig {
+        &self.persistence
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.persistence.validate()
+    }
+
+    pub(crate) fn resolve_paths(&mut self, config_path: &Path) {
+        self.persistence.resolve_paths(config_path);
+    }
+}
+
+/// Session persistence backend and backend-specific settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionPersistenceConfig {
+    backend: SessionStoreBackend,
+    sqlite: SessionSqliteConfig,
+}
+
+impl Default for SessionPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            backend: SessionStoreBackend::Sqlite,
+            sqlite: SessionSqliteConfig::default(),
+        }
+    }
+}
+
+impl SessionPersistenceConfig {
+    /// Return the selected session persistence backend.
+    pub fn backend(&self) -> SessionStoreBackend {
+        self.backend
+    }
+
+    /// Return the SQLite-specific session persistence configuration.
+    pub fn sqlite_config(&self) -> &SessionSqliteConfig {
+        &self.sqlite
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self.backend {
+            SessionStoreBackend::Memory => Ok(()),
+            SessionStoreBackend::Sqlite => self.sqlite.validate(),
+        }
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        self.sqlite.resolve_paths(config_path);
+    }
+}
+
+/// Supported backends for thread-context persistence.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStoreBackend {
+    Memory,
+    Sqlite,
+}
+
+/// SQLite-specific session persistence settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionSqliteConfig {
+    path: PathBuf,
+}
+
+impl Default for SessionSqliteConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("data/openjarvis/session.sqlite3"),
+        }
+    }
+}
+
+impl SessionSqliteConfig {
+    /// Return the SQLite database path used for thread persistence.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            bail!("session.persistence.sqlite.path must not be blank");
+        }
+        Ok(())
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        if self.path.is_absolute() || self.path.as_os_str().is_empty() {
+            return;
+        }
+
+        let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        self.path = config_root.join(&self.path);
     }
 }
 

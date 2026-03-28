@@ -27,7 +27,10 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
         .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
-    let locator = SessionManager::new().load_or_create_thread(&incoming).await;
+    let locator = SessionManager::new()
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     handle
         .request_tx
@@ -135,7 +138,10 @@ async fn worker_builds_context_from_history_and_current_user_message() {
         .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("what happened");
-    let locator = SessionManager::new().load_or_create_thread(&incoming).await;
+    let locator = SessionManager::new()
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
     let thread = thread_with_history(
         locator.thread_id,
         &[ChatMessage::new(
@@ -210,7 +216,10 @@ async fn worker_failed_turn_preserves_provider_error_chain() {
         .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
-    let locator = SessionManager::new().load_or_create_thread(&incoming).await;
+    let locator = SessionManager::new()
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     handle
         .request_tx

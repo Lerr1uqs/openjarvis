@@ -407,12 +407,27 @@ impl ChannelRouter {
             "router accepted incoming message"
         );
 
+        let locator = self.sessions.load_or_create_thread(&message).await?;
+        if let Some(external_message_id) = message.external_message_id.as_deref()
+            && self
+                .sessions
+                .is_external_message_processed(&locator, external_message_id)
+                .await?
+        {
+            info!(
+                thread_id = %locator.thread_id,
+                external_message_id,
+                "duplicate incoming message ignored by persisted dedup record"
+            );
+            return Ok(());
+        }
+
         if self.commands.is_command(&message)? {
-            let locator = self.sessions.load_or_create_thread(&message).await;
             let mut thread_context = self
                 .sessions
                 .load_thread_context(&locator)
                 .await
+                ?
                 .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
             if let Some(reply) = self
                 .commands
@@ -421,13 +436,22 @@ impl ChannelRouter {
             {
                 self.sessions
                     .store_thread_context(&locator, thread_context, message.received_at)
-                    .await;
+                    .await?;
                 self.dispatch_command_reply(&message, reply).await?;
+                if let Some(external_message_id) = message.external_message_id.as_deref() {
+                    self.sessions
+                        .mark_external_message_processed(
+                            &locator,
+                            external_message_id,
+                            None,
+                            message.received_at,
+                        )
+                        .await?;
+                }
                 return Ok(());
             }
         }
 
-        let locator = self.sessions.load_or_create_thread(&message).await;
         if self.try_mark_thread_pending(&locator).await {
             self.dispatch_to_agent(locator, message).await?;
         } else {
@@ -519,7 +543,8 @@ impl ChannelRouter {
             ));
         }
         messages.extend(turn.messages);
-        self.sessions
+        let store_result = self
+            .sessions
             .store_turn_with_thread_context(
                 &turn.locator,
                 Some(turn.thread_context),
@@ -529,8 +554,9 @@ impl ChannelRouter {
                 turn.completed_at,
             )
             .await;
-        self.release_or_dispatch_next(&turn.locator).await?;
-        Ok(())
+        let release_result = self.release_or_dispatch_next(&turn.locator).await;
+        store_result?;
+        release_result
     }
 
     async fn store_failed_turn(&self, turn: FailedAgentTurn) -> Result<()> {
@@ -554,7 +580,8 @@ impl ChannelRouter {
         })
         .await?;
 
-        self.sessions
+        let store_result = self
+            .sessions
             .store_turn_with_thread_context(
                 &turn.locator,
                 Some(turn.thread_context),
@@ -571,8 +598,9 @@ impl ChannelRouter {
                 turn.completed_at,
             )
             .await;
-        self.release_or_dispatch_next(&turn.locator).await?;
-        Ok(())
+        let release_result = self.release_or_dispatch_next(&turn.locator).await;
+        store_result?;
+        release_result
     }
 
     async fn mark_message_seen(&self, external_message_id: Option<&str>) -> bool {
@@ -602,7 +630,7 @@ impl ChannelRouter {
         locator: ThreadLocator,
         message: IncomingMessage,
     ) -> Result<()> {
-        let thread_state = self.sessions.load_thread_state(&locator).await;
+        let thread_state = self.sessions.load_thread_state(&locator).await?;
         let thread_context = thread_state
             .thread_context
             .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));

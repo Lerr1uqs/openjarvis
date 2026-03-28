@@ -9,12 +9,13 @@ use openjarvis::{
     },
     cli::OpenJarvisCli,
     command::{CommandRegistry, register_runtime_commands},
-    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
+    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, SessionStoreBackend},
     llm::build_provider,
     logging,
     router::ChannelRouter,
-    session::{SessionManager, SessionStrategy},
+    session::{MemorySessionStore, SessionManager, SessionStrategy, SessionStore, SqliteSessionStore},
 };
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -77,9 +78,23 @@ async fn main() -> Result<()> {
     } else {
         SessionStrategy::default()
     };
+    let session_store: Arc<dyn SessionStore> =
+        match config.session_config().persistence_config().backend() {
+            SessionStoreBackend::Memory => Arc::new(MemorySessionStore::new()),
+            SessionStoreBackend::Sqlite => Arc::new(
+                SqliteSessionStore::open(
+                    config
+                        .session_config()
+                        .persistence_config()
+                        .sqlite_config()
+                        .path(),
+                )
+                .await?,
+            ),
+        };
     let mut router = ChannelRouter::builder()
         .agent(agent)
-        .session_manager(SessionManager::with_strategy(session_strategy))
+        .session_manager(SessionManager::with_store(session_store, session_strategy).await?)
         .command_registry(command_registry)
         .build()?;
 

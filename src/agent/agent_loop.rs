@@ -222,11 +222,11 @@ impl AgentLoop {
         self.runtime.tools().register_builtin_tools().await?;
         self.runtime
             .tools()
-            .merge_legacy_thread_state(&mut thread_context)
+            .sync_legacy_thread_state(&thread_context)
             .await;
         self.runtime
             .compact_runtime()
-            .merge_legacy_scope_overrides(&input.compact_scope_key, &mut thread_context)
+            .sync_legacy_scope_overrides(&input.compact_scope_key, &thread_context)
             .await;
         let hooks = self.runtime.hooks();
         let thread_id = thread_context.locator.thread_id.clone();
@@ -716,6 +716,7 @@ impl AgentLoop {
                 visible: true,
                 budget_report: budget_report.clone(),
             }));
+            tools.sync_legacy_thread_state(thread_context).await;
 
             info!(
                 thread_id = %thread_context.locator.thread_id,
@@ -736,6 +737,7 @@ impl AgentLoop {
         }
 
         thread_context.set_compact_tool_projection(None);
+        tools.sync_legacy_thread_state(thread_context).await;
         info!(
             thread_id = %thread_context.locator.thread_id,
             total_estimated_tokens = base_budget_report.total_estimated_tokens,

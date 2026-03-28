@@ -8,17 +8,49 @@ use openjarvis::{
     },
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     model::{IncomingMessage, ReplyTarget},
-    session::{SessionKey, SessionManager, SessionStrategy},
+    session::{
+        MemorySessionStore, SessionKey, SessionManager, SessionStore, SessionStrategy,
+        SqliteSessionStore,
+    },
     thread::{
         ThreadContext, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
     },
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    env::temp_dir,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 struct DemoSessionTool;
+
+struct SessionSqliteFixture {
+    root: PathBuf,
+    db_path: PathBuf,
+}
+
+impl SessionSqliteFixture {
+    fn new(prefix: &str) -> Self {
+        let root = temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("session sqlite fixture root should be created");
+        let db_path = root.join("session.sqlite3");
+        Self { root, db_path }
+    }
+
+    fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+}
+
+impl Drop for SessionSqliteFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
 
 #[async_trait]
 impl ToolHandler for DemoSessionTool {
@@ -44,7 +76,10 @@ impl ToolHandler for DemoSessionTool {
 async fn store_and_load_turn_creates_session_state() {
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_1", "hello");
-    let locator = manager.load_or_create_thread(&incoming).await;
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     manager
         .store_turn(
@@ -57,9 +92,10 @@ async fn store_and_load_turn_creates_session_state() {
             incoming.received_at,
             Utc::now(),
         )
-        .await;
+        .await
+        .expect("turn should store");
 
-    let history = manager.load_turn(&locator).await;
+    let history = manager.load_turn(&locator).await.expect("history should load");
     let session = manager
         .get_session(&SessionKey::from_incoming(&incoming))
         .await
@@ -84,7 +120,10 @@ async fn store_and_load_turn_creates_session_state() {
 async fn load_turn_keeps_tool_call_id_history() {
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_1", "read config");
-    let locator = manager.load_or_create_thread(&incoming).await;
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     manager
         .store_turn(
@@ -106,9 +145,10 @@ async fn load_turn_keeps_tool_call_id_history() {
             incoming.received_at,
             Utc::now(),
         )
-        .await;
+        .await
+        .expect("turn should store");
 
-    let history = manager.load_turn(&locator).await;
+    let history = manager.load_turn(&locator).await.expect("history should load");
 
     assert!(
         history
@@ -128,7 +168,10 @@ async fn strategy_keeps_only_latest_five_messages_per_thread() {
         max_messages_per_thread: 5,
     });
     let incoming = build_incoming("msg_1", "trim this");
-    let locator = manager.load_or_create_thread(&incoming).await;
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     manager
         .store_turn(
@@ -146,7 +189,8 @@ async fn strategy_keeps_only_latest_five_messages_per_thread() {
             incoming.received_at,
             Utc::now(),
         )
-        .await;
+        .await
+        .expect("first turn should store");
     manager
         .store_turn(
             &locator,
@@ -163,9 +207,10 @@ async fn strategy_keeps_only_latest_five_messages_per_thread() {
             incoming.received_at,
             Utc::now(),
         )
-        .await;
+        .await
+        .expect("second turn should store");
 
-    let history = manager.load_turn(&locator).await;
+    let history = manager.load_turn(&locator).await.expect("history should load");
     let session = manager
         .get_session(&SessionKey::from_incoming(&incoming))
         .await
@@ -202,8 +247,14 @@ async fn load_or_create_thread_reuses_internal_uuid_for_same_external_thread() {
     let first_incoming = build_incoming_with_thread("msg_1", "hello", Some("ext_thread_1"));
     let second_incoming = build_incoming_with_thread("msg_2", "world", Some("ext_thread_1"));
 
-    let first_locator = manager.load_or_create_thread(&first_incoming).await;
-    let second_locator = manager.load_or_create_thread(&second_incoming).await;
+    let first_locator = manager
+        .load_or_create_thread(&first_incoming)
+        .await
+        .expect("first thread should resolve");
+    let second_locator = manager
+        .load_or_create_thread(&second_incoming)
+        .await
+        .expect("second thread should resolve");
 
     assert_eq!(first_locator.session_id, second_locator.session_id);
     assert_eq!(first_locator.external_thread_id, "ext_thread_1");
@@ -219,7 +270,10 @@ async fn load_or_create_thread_reuses_internal_uuid_for_same_external_thread() {
 async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_tool_state", "hello tool state");
-    let locator = manager.load_or_create_thread(&incoming).await;
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
     let tool_event = {
         let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, Utc::now());
         event.toolset_name = Some("demo".to_string());
@@ -241,9 +295,13 @@ async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
             vec!["demo".to_string()],
             vec![tool_event],
         )
-        .await;
+        .await
+        .expect("turn state should store");
 
-    let thread_state = manager.load_thread_state(&locator).await;
+    let thread_state = manager
+        .load_thread_state(&locator)
+        .await
+        .expect("thread state should load");
 
     assert_eq!(thread_state.loaded_toolsets, vec!["demo".to_string()]);
     assert_eq!(thread_state.tool_events.len(), 1);
@@ -259,7 +317,10 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
     // 测试场景: Session 新的 ThreadContext 读写接口要能完整保留线程状态，而不是退回旧 thread shape。
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_thread_context", "hello context");
-    let locator = manager.load_or_create_thread(&incoming).await;
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
     let now = Utc::now();
     let tool_event = {
         let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
@@ -284,13 +345,18 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
 
     manager
         .store_thread_context(&locator, thread_context, now)
-        .await;
+        .await
+        .expect("thread context should store");
 
     let loaded = manager
         .load_thread_context(&locator)
         .await
+        .expect("thread context should load")
         .expect("thread context should be stored");
-    let thread_state = manager.load_thread_state(&locator).await;
+    let thread_state = manager
+        .load_thread_state(&locator)
+        .await
+        .expect("thread state should load");
 
     assert_eq!(loaded.locator, ThreadContextLocator::from(&locator));
     assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
@@ -305,7 +371,10 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
 async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_rehydrate", "rehydrate demo");
-    let locator = manager.load_or_create_thread(&incoming).await;
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
 
     manager
         .store_turn_with_state(
@@ -321,7 +390,8 @@ async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
             vec!["demo".to_string()],
             Vec::new(),
         )
-        .await;
+        .await
+        .expect("turn state should store");
 
     let registry = ToolRegistry::new();
     registry
@@ -332,7 +402,10 @@ async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
         .await
         .expect("demo toolset should register");
 
-    let thread_state = manager.load_thread_state(&locator).await;
+    let thread_state = manager
+        .load_thread_state(&locator)
+        .await
+        .expect("thread state should load");
     registry
         .rehydrate_thread(
             &locator.thread_id.to_string(),
@@ -352,8 +425,14 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
     let manager = SessionManager::new();
     let first_incoming = build_incoming_with_thread("msg_a", "hello a", Some("thread_a"));
     let second_incoming = build_incoming_with_thread("msg_b", "hello b", Some("thread_b"));
-    let first_locator = manager.load_or_create_thread(&first_incoming).await;
-    let second_locator = manager.load_or_create_thread(&second_incoming).await;
+    let first_locator = manager
+        .load_or_create_thread(&first_incoming)
+        .await
+        .expect("first thread should resolve");
+    let second_locator = manager
+        .load_or_create_thread(&second_incoming)
+        .await
+        .expect("second thread should resolve");
 
     manager
         .store_turn_with_state(
@@ -369,7 +448,8 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
             vec!["demo_a".to_string()],
             Vec::new(),
         )
-        .await;
+        .await
+        .expect("first thread state should store");
     manager
         .store_turn_with_state(
             &second_locator,
@@ -384,10 +464,17 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
             vec!["demo_b".to_string()],
             Vec::new(),
         )
-        .await;
+        .await
+        .expect("second thread state should store");
 
-    let first_state = manager.load_thread_state(&first_locator).await;
-    let second_state = manager.load_thread_state(&second_locator).await;
+    let first_state = manager
+        .load_thread_state(&first_locator)
+        .await
+        .expect("first thread state should load");
+    let second_state = manager
+        .load_thread_state(&second_locator)
+        .await
+        .expect("second thread state should load");
 
     assert_eq!(first_state.loaded_toolsets, vec!["demo_a".to_string()]);
     assert_eq!(second_state.loaded_toolsets, vec!["demo_b".to_string()]);
@@ -398,7 +485,10 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
     // 测试场景: compact 已经替换 active history 后，session 应写回 compacted turn，再追加本轮新 turn。
     let manager = SessionManager::new();
     let first_incoming = build_incoming("msg_compact_1", "before compact");
-    let locator = manager.load_or_create_thread(&first_incoming).await;
+    let locator = manager
+        .load_or_create_thread(&first_incoming)
+        .await
+        .expect("thread should resolve");
     manager
         .store_turn(
             &locator,
@@ -414,11 +504,13 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
             first_incoming.received_at,
             Utc::now(),
         )
-        .await;
+        .await
+        .expect("initial turn should store");
 
     let mut compacted_thread = manager
         .load_thread_state(&locator)
         .await
+        .expect("thread state should load")
         .thread
         .expect("thread should exist before compact");
     compacted_thread.turns = vec![openjarvis::thread::ConversationTurn::new(
@@ -445,7 +537,8 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
             Vec::new(),
             Vec::new(),
         )
-        .await;
+        .await
+        .expect("compacted turn should store");
 
     let session = manager
         .get_session(&SessionKey::from_incoming(&first_incoming))
@@ -461,6 +554,184 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
     assert_eq!(thread.turns[0].messages[1].content, "继续");
     assert_eq!(thread.turns[1].messages[0].content, "new question");
     assert_eq!(thread.turns[1].messages[1].content, "new reply");
+}
+
+#[tokio::test]
+async fn shared_store_merges_stale_state_updates_and_restores_external_message_dedup() {
+    // 测试场景: 多个 SessionManager 共享同一个 store 时，旧线程状态写入要和最新快照合并，而不是覆盖 turn；dedup 记录也要能被新 manager 恢复。
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let manager_a = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+        .await
+        .expect("manager A should build");
+    let manager_b = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+        .await
+        .expect("manager B should build");
+    let incoming = build_incoming_with_thread("msg_conflict_1", "conflict", Some("thread_conflict"));
+    let locator_a = manager_a
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("manager A should resolve thread");
+    let locator_b = manager_b
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("manager B should resolve thread");
+    let stale = manager_b
+        .load_thread_context(&locator_b)
+        .await
+        .expect("manager B should load thread context")
+        .expect("thread context should exist");
+    let mut fresh = manager_a
+        .load_thread_context(&locator_a)
+        .await
+        .expect("manager A should load thread context")
+        .expect("thread context should exist");
+    fresh.enable_auto_compact();
+    manager_a
+        .store_thread_context(&locator_a, fresh, Utc::now())
+        .await
+        .expect("fresh context should store");
+
+    manager_b
+        .store_thread_context(&locator_b, stale, Utc::now())
+        .await
+        .expect("stale state update should merge with latest snapshot");
+    let merged = manager_b
+        .load_thread_context(&locator_b)
+        .await
+        .expect("merged context should load")
+        .expect("merged context should exist");
+    assert!(merged.auto_compact_enabled(false));
+
+    manager_a
+        .store_turn(
+            &locator_a,
+            Some("msg_conflict_2".to_string()),
+            vec![
+                ChatMessage::new(ChatMessageRole::User, "after conflict", Utc::now()),
+                ChatMessage::new(ChatMessageRole::Assistant, "stored once", Utc::now()),
+            ],
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .expect("dedup turn should store");
+
+    let manager_c = SessionManager::with_store(Arc::clone(&store), SessionStrategy::default())
+        .await
+        .expect("manager C should build");
+    let locator_c = manager_c
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("manager C should resolve thread");
+
+    assert!(
+        manager_c
+            .is_external_message_processed(&locator_c, "msg_conflict_2")
+            .await
+            .expect("dedup record should load")
+    );
+}
+
+#[tokio::test]
+async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow_up_turns() {
+    // 测试场景: SQLite 持久化后的线程在“重启”后要恢复 compact turn、loaded toolsets、/auto-compact 状态，并继续同线程追加新 turn。
+    let fixture = SessionSqliteFixture::new("openjarvis-session-restart");
+    let store_a: Arc<dyn SessionStore> = Arc::new(
+        SqliteSessionStore::open(fixture.db_path())
+            .await
+            .expect("sqlite store A should open"),
+    );
+    let manager_a = SessionManager::with_store(
+        Arc::clone(&store_a),
+        SessionStrategy {
+            max_messages_per_thread: usize::MAX,
+        },
+    )
+    .await
+    .expect("manager A should build");
+    let incoming = build_incoming_with_thread("msg_restart_1", "restore me", Some("thread_restart"));
+    let locator_a = manager_a
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("manager A should resolve thread");
+    let now = Utc::now();
+    let mut thread_context = ThreadContext::new(ThreadContextLocator::from(&locator_a), now);
+    thread_context.enable_auto_compact();
+    thread_context.store_turn_state(
+        None,
+        vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
+            ChatMessage::new(ChatMessageRole::User, "继续", now),
+        ],
+        now,
+        now,
+        vec!["demo".to_string()],
+        Vec::new(),
+    );
+    manager_a
+        .store_thread_context(&locator_a, thread_context, now)
+        .await
+        .expect("initial sqlite-backed context should store");
+
+    let store_b: Arc<dyn SessionStore> = Arc::new(
+        SqliteSessionStore::open(fixture.db_path())
+            .await
+            .expect("sqlite store B should open"),
+    );
+    let manager_b = SessionManager::with_store(
+        Arc::clone(&store_b),
+        SessionStrategy {
+            max_messages_per_thread: usize::MAX,
+        },
+    )
+    .await
+    .expect("manager B should build");
+    let locator_b = manager_b
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("manager B should resolve thread");
+    let restored = manager_b
+        .load_thread_context(&locator_b)
+        .await
+        .expect("restored thread context should load")
+        .expect("restored thread context should exist");
+
+    assert_eq!(restored.turns.len(), 1);
+    assert_eq!(restored.turns[0].messages[0].content, "这是压缩后的上下文");
+    assert_eq!(restored.turns[0].messages[1].content, "继续");
+    assert_eq!(restored.load_toolsets(), vec!["demo".to_string()]);
+    assert!(restored.auto_compact_enabled(false));
+
+    manager_b
+        .store_turn(
+            &locator_b,
+            Some("msg_restart_2".to_string()),
+            vec![
+                ChatMessage::new(ChatMessageRole::User, "follow-up", Utc::now()),
+                ChatMessage::new(ChatMessageRole::Assistant, "reply-after-restart", Utc::now()),
+            ],
+            Utc::now(),
+            Utc::now(),
+        )
+        .await
+        .expect("follow-up turn should store after restart");
+    let history = manager_b
+        .load_turn(&locator_b)
+        .await
+        .expect("history should load after restart");
+
+    assert_eq!(
+        history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "这是压缩后的上下文".to_string(),
+            "继续".to_string(),
+            "follow-up".to_string(),
+            "reply-after-restart".to_string(),
+        ]
+    );
 }
 
 fn build_incoming(message_id: &str, content: &str) -> IncomingMessage {

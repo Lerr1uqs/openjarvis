@@ -844,7 +844,8 @@ llm:
 
 #[tokio::test]
 async fn agent_loop_runtime_override_can_enable_auto_compact_for_current_thread() {
-    // 测试场景: 即使静态 compact 默认关闭，命令层写入的线程级 runtime override 也应让后续轮次开启 auto-compact。
+    // 测试场景: 即使静态 compact 默认关闭，只要 ThreadContext 中持久化了线程级 override，
+    // 后续轮次也应开启 auto-compact。
     let config: AppConfig = serde_yaml::from_str(
         r#"
 agent:
@@ -862,28 +863,24 @@ llm:
     )
     .expect("compact override config should parse");
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let runtime = runtime_without_skills();
-    runtime
-        .compact_runtime()
-        .set_compact_enabled(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
-        .await;
-    runtime
-        .compact_runtime()
-        .set_auto_compact(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
-        .await;
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(RecordingSequenceProvider {
             requests: Arc::clone(&requests),
             responses: Arc::new(Mutex::new(vec![text_response("override 生效")])),
         }),
-        runtime,
+        runtime_without_skills(),
         config.llm_config().clone(),
         config.agent_config().compact_config().clone(),
     );
     let (input, _outgoing_rx) = build_input();
+    let mut active_thread = ThreadContext::new(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_1", "thread_1"),
+        chrono::Utc::now(),
+    );
+    active_thread.enable_auto_compact();
 
     let output = loop_runner
-        .run(input, &build_context("system", "普通问题"))
+        .run_with_thread_context(input, &build_context("system", "普通问题"), active_thread)
         .await
         .expect("loop should honor thread-scoped auto-compact override");
 
@@ -906,7 +903,8 @@ llm:
 
 #[tokio::test]
 async fn agent_loop_runtime_override_can_execute_compact_tool_when_static_compact_disabled() {
-    // 测试场景: 即使静态 compact 默认关闭，只要线程级 override 开启，模型调用 compact 也应真正成功。
+    // 测试场景: 即使静态 compact 默认关闭，只要 ThreadContext 中的线程级 override 开启，
+    // 模型调用 compact 也应真正成功。
     let config: AppConfig = serde_yaml::from_str(
         r#"
 agent:
@@ -924,15 +922,6 @@ llm:
     )
     .expect("compact override config should parse");
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let runtime = runtime_without_skills();
-    runtime
-        .compact_runtime()
-        .set_compact_enabled(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
-        .await;
-    runtime
-        .compact_runtime()
-        .set_auto_compact(CompactScopeKey::new("feishu", "ou_xxx", "thread_1"), true)
-        .await;
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(RecordingSequenceProvider {
             requests: Arc::clone(&requests),
@@ -942,26 +931,30 @@ llm:
                 text_response("override compact 完成"),
             ])),
         }),
-        runtime,
+        runtime_without_skills(),
         config.llm_config().clone(),
         config.agent_config().compact_config().clone(),
     );
     let (input, _outgoing_rx) = build_input();
-    let active_thread = thread_with_history(vec![
-        ChatMessage::new(
-            ChatMessageRole::User,
-            "需要被 override compact 的历史问题".repeat(15),
-            chrono::Utc::now(),
-        ),
-        ChatMessage::new(
-            ChatMessageRole::Assistant,
-            "需要被 override compact 的历史回答".repeat(15),
-            chrono::Utc::now(),
-        ),
-    ]);
+    let mut active_thread = ThreadContext::from_conversation_thread(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_1", "thread_1"),
+        thread_with_history(vec![
+            ChatMessage::new(
+                ChatMessageRole::User,
+                "需要被 override compact 的历史问题".repeat(15),
+                chrono::Utc::now(),
+            ),
+            ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "需要被 override compact 的历史回答".repeat(15),
+                chrono::Utc::now(),
+            ),
+        ]),
+    );
+    active_thread.enable_auto_compact();
 
     let output = loop_runner
-        .run_with_thread(input, &build_context("system", "请继续"), active_thread)
+        .run_with_thread_context(input, &build_context("system", "请继续"), active_thread)
         .await
         .expect("loop should allow compact tool after runtime override");
 

@@ -1,5 +1,6 @@
 use openjarvis::config::{
     AgentMcpServerTransportConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LogRotation,
+    SessionStoreBackend,
 };
 use serde_json::json;
 use std::{
@@ -149,6 +150,53 @@ fn default_logging_config_enables_local_file_sink() {
     assert_eq!(
         config.logging_config().file_config().rotation(),
         LogRotation::Daily
+    );
+    assert_eq!(
+        config.session_config().persistence_config().backend(),
+        SessionStoreBackend::Sqlite
+    );
+}
+
+#[test]
+fn session_sqlite_path_resolves_relative_to_config_root() {
+    let fixture = ConfigFixture::new("openjarvis-session-sqlite-relative-path");
+    fixture.write_yaml(
+        r#"
+session:
+  persistence:
+    backend: "sqlite"
+    sqlite:
+      path: "runtime/session.sqlite3"
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let config =
+        AppConfig::from_path(fixture.config_path()).expect("session sqlite path should resolve");
+
+    assert_eq!(
+        config.session_config().persistence_config().sqlite_config().path(),
+        fixture.root.join("runtime/session.sqlite3").as_path()
+    );
+}
+
+#[test]
+fn session_memory_backend_parses_from_yaml() {
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+session:
+  persistence:
+    backend: "memory"
+llm:
+  provider: "mock"
+"#,
+    )
+    .expect("memory session backend should parse");
+
+    assert_eq!(
+        config.session_config().persistence_config().backend(),
+        SessionStoreBackend::Memory
     );
 }
 

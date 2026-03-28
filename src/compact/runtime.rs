@@ -97,6 +97,37 @@ impl CompactRuntimeManager {
         }
     }
 
+    /// Rebuild deprecated scope-keyed override caches from the persisted `ThreadContext`.
+    pub async fn sync_legacy_scope_overrides(
+        &self,
+        scope: &CompactScopeKey,
+        thread_context: &ThreadContext,
+    ) {
+        let compact_enabled_override = thread_context.state.features.compact_enabled_override;
+        let auto_compact_override = thread_context.state.features.auto_compact_override;
+
+        let mut compact_enabled_overrides = self.compact_enabled_overrides.write().await;
+        match compact_enabled_override {
+            Some(enabled) => {
+                compact_enabled_overrides.insert(scope.clone(), enabled);
+            }
+            None => {
+                compact_enabled_overrides.remove(scope);
+            }
+        }
+        drop(compact_enabled_overrides);
+
+        let mut auto_compact_overrides = self.auto_compact_overrides.write().await;
+        match auto_compact_override {
+            Some(enabled) => {
+                auto_compact_overrides.insert(scope.clone(), enabled);
+            }
+            None => {
+                auto_compact_overrides.remove(scope);
+            }
+        }
+    }
+
     /// Set the thread-scoped compact-enabled override for one scope.
     #[deprecated(note = "use ThreadContext::set_compact_enabled_override instead")]
     pub async fn set_compact_enabled(&self, scope: CompactScopeKey, enabled: bool) {
