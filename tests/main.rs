@@ -131,3 +131,89 @@ fn internal_browser_helper_runs_before_app_config_load_and_reports_spawn_errors(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to spawn browser sidecar executable"));
 }
+
+#[test]
+fn startup_writes_logs_to_local_file() {
+    let fixture = MainConfigFixture::new("openjarvis-main-file-logging");
+    fixture.write_yaml(
+        r#"
+logging:
+  level: "info"
+  stderr: false
+  file:
+    enabled: true
+    directory: "local-logs"
+    rotation: "never"
+    filename_prefix: "openjarvis-test"
+    filename_suffix: "log"
+    max_files: 2
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("--load-skill")
+        .arg("missing_local_skill")
+        .env("OPENJARVIS_CONFIG", fixture.config_path())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+
+    let log_directory = fixture.root.join("local-logs");
+    let log_entries = fs::read_dir(&log_directory)
+        .expect("local log directory should be created")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("local log directory entries should be readable");
+    assert!(
+        !log_entries.is_empty(),
+        "expected at least one local log file"
+    );
+
+    let log_path = log_entries[0].path();
+    let log_output = fs::read_to_string(&log_path).expect("local log file should be readable");
+
+    assert!(log_path.file_name().is_some());
+    assert!(log_output.contains("tracing initialized"));
+    assert!(log_output.contains("mcp sidecar config not found"));
+}
+
+#[test]
+fn startup_does_not_emit_missing_log_directory_noise_on_first_run() {
+    let fixture = MainConfigFixture::new("openjarvis-main-log-dir-bootstrap");
+    fixture.write_yaml(
+        r#"
+logging:
+  level: "info"
+  stderr: true
+  file:
+    enabled: true
+    directory: "first-run-logs"
+    rotation: "never"
+    filename_prefix: "openjarvis-first-run"
+    filename_suffix: "log"
+    max_files: 2
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("--load-skill")
+        .arg("missing_local_skill")
+        .env("OPENJARVIS_CONFIG", fixture.config_path())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // 验证场景: 首次启动且日志目录不存在时，不应再输出 tracing-appender 的目录扫描噪声。
+    assert!(!stderr.contains("Error reading the log directory/files"));
+
+    let log_directory = fixture.root.join("first-run-logs");
+    assert!(log_directory.exists());
+}

@@ -4,10 +4,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    env, fs,
+    env, fmt, fs,
     path::{Path, PathBuf},
 };
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。";
 pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
@@ -17,6 +18,7 @@ const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
 #[serde(default)]
 pub struct AppConfig {
     server: ServerConfig,
+    logging: LoggingConfig,
     #[serde(flatten)]
     channels: ChannelConfig,
     agent: AgentConfig,
@@ -27,6 +29,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            logging: LoggingConfig::default(),
             channels: ChannelConfig::default(),
             agent: AgentConfig::default(),
             llm: LLMConfig::default(),
@@ -77,6 +80,7 @@ impl AppConfig {
             Self::default()
         };
 
+        config.resolve_paths(path);
         config.load_external_mcp_sidecar(path)?;
         config
             .validate()
@@ -87,6 +91,19 @@ impl AppConfig {
     /// Return the read-only channel configuration view.
     pub fn channel_config(&self) -> &ChannelConfig {
         &self.channels
+    }
+
+    /// Return the read-only logging configuration view.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.logging_config().file_config().enabled());
+    /// ```
+    pub fn logging_config(&self) -> &LoggingConfig {
+        &self.logging
     }
 
     /// Return the read-only agent runtime configuration view.
@@ -134,8 +151,13 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.logging.validate()?;
         self.llm.validate()?;
         self.agent.validate()
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        self.logging.resolve_paths(config_path);
     }
 
     fn load_external_mcp_sidecar(&mut self, config_path: &Path) -> Result<()> {
@@ -184,6 +206,192 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+}
+
+/// Logging configuration loaded from `logging`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert_eq!(config.logging_config().level_filter(), "info");
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    level: String,
+    stderr: bool,
+    stderr_ansi: bool,
+    file: FileLoggingConfig,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            stderr: true,
+            stderr_ansi: false,
+            file: FileLoggingConfig::default(),
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Return the default tracing filter expression used when `RUST_LOG` is absent.
+    pub fn level_filter(&self) -> &str {
+        &self.level
+    }
+
+    /// Return whether logs should also be written to stderr.
+    pub fn stderr_enabled(&self) -> bool {
+        self.stderr
+    }
+
+    /// Return whether stderr output should keep ANSI colors.
+    pub fn stderr_ansi(&self) -> bool {
+        self.stderr_ansi
+    }
+
+    /// Return the file sink configuration.
+    pub fn file_config(&self) -> &FileLoggingConfig {
+        &self.file
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.level.trim().is_empty() {
+            bail!("logging.level must not be blank");
+        }
+        EnvFilter::try_new(self.level.trim()).with_context(|| {
+            format!(
+                "logging.level `{}` is not a valid tracing filter expression",
+                self.level
+            )
+        })?;
+        if !self.stderr && !self.file.enabled {
+            bail!("logging requires at least one enabled sink: stderr or file");
+        }
+        self.file.validate()
+    }
+
+    pub(crate) fn resolve_paths(&mut self, config_path: &Path) {
+        self.file.resolve_paths(config_path);
+    }
+}
+
+/// File sink configuration for local persistent logs.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert_eq!(config.logging_config().file_config().rotation(), openjarvis::config::LogRotation::Daily);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileLoggingConfig {
+    enabled: bool,
+    directory: PathBuf,
+    rotation: LogRotation,
+    filename_prefix: String,
+    filename_suffix: String,
+    max_files: usize,
+}
+
+impl Default for FileLoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: PathBuf::from("logs"),
+            rotation: LogRotation::Daily,
+            filename_prefix: "openjarvis".to_string(),
+            filename_suffix: "log".to_string(),
+            max_files: 7,
+        }
+    }
+}
+
+impl FileLoggingConfig {
+    /// Return whether file logging is enabled.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Return the directory used for local log files.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Return the rolling strategy used for local log files.
+    pub fn rotation(&self) -> LogRotation {
+        self.rotation
+    }
+
+    /// Return the configured file-name prefix.
+    pub fn filename_prefix(&self) -> &str {
+        &self.filename_prefix
+    }
+
+    /// Return the configured file-name suffix.
+    pub fn filename_suffix(&self) -> &str {
+        &self.filename_suffix
+    }
+
+    /// Return the maximum retained file count. `0` disables pruning.
+    pub fn max_files(&self) -> usize {
+        self.max_files
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.directory.as_os_str().is_empty() {
+            bail!("logging.file.directory must not be blank");
+        }
+        if self.filename_prefix.trim().is_empty() {
+            bail!("logging.file.filename_prefix must not be blank");
+        }
+
+        Ok(())
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        if self.directory.is_absolute() || self.directory.as_os_str().is_empty() {
+            return;
+        }
+
+        let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        self.directory = config_root.join(&self.directory);
+    }
+}
+
+/// Rolling strategy used for local log files.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogRotation {
+    Minutely,
+    Hourly,
+    Daily,
+    Never,
+}
+
+impl Default for LogRotation {
+    fn default() -> Self {
+        Self::Daily
+    }
+}
+
+impl fmt::Display for LogRotation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Minutely => "minutely",
+            Self::Hourly => "hourly",
+            Self::Daily => "daily",
+            Self::Never => "never",
+        })
     }
 }
 

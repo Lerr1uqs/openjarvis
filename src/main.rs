@@ -11,16 +11,16 @@ use openjarvis::{
     command::{CommandRegistry, register_runtime_commands},
     config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     llm::build_provider,
+    logging,
     router::ChannelRouter,
     session::{SessionManager, SessionStrategy},
 };
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = OpenJarvisCli::parse();
-    init_tracing();
+    let _logging_guards = logging::init_tracing_from_default_config()?;
     // test-only
     if let Some(command) = cli.internal_mcp_command() {
         return demo::run_internal_demo_command(command).await;
@@ -90,16 +90,6 @@ async fn main() -> Result<()> {
     );
 
     router.run_until_shutdown(shutdown_signal()).await
-}
-
-fn init_tracing() {
-    // Initialize tracing once and honor `RUST_LOG` when it is present.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
 }
 
 async fn shutdown_signal() {

@@ -1,5 +1,5 @@
 use openjarvis::config::{
-    AgentMcpServerTransportConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+    AgentMcpServerTransportConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LogRotation,
 };
 use serde_json::json;
 use std::{
@@ -133,6 +133,65 @@ llm:
     assert_eq!(config.channel_config().feishu_config().mode, "");
     assert_eq!(config.llm_config().provider, "mock_llm");
     assert_eq!(config.llm_config().mock_response, "pong");
+}
+
+#[test]
+fn default_logging_config_enables_local_file_sink() {
+    let config = AppConfig::default();
+
+    assert_eq!(config.logging_config().level_filter(), "info");
+    assert!(config.logging_config().stderr_enabled());
+    assert!(config.logging_config().file_config().enabled());
+    assert_eq!(
+        config.logging_config().file_config().directory(),
+        Path::new("logs")
+    );
+    assert_eq!(
+        config.logging_config().file_config().rotation(),
+        LogRotation::Daily
+    );
+}
+
+#[test]
+fn logging_config_resolves_relative_directory_against_config_path() {
+    let fixture = ConfigFixture::new("openjarvis-logging-relative-dir");
+    fixture.write_yaml(
+        r#"
+logging:
+  level: "debug"
+  file:
+    directory: "runtime-logs"
+    rotation: "hourly"
+    filename_prefix: "jarvis"
+    filename_suffix: "txt"
+    max_files: 3
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let config =
+        AppConfig::from_path(fixture.config_path()).expect("logging config should resolve paths");
+    let expected_directory = fixture.root.join("runtime-logs");
+
+    assert_eq!(config.logging_config().level_filter(), "debug");
+    assert_eq!(
+        config.logging_config().file_config().directory(),
+        expected_directory.as_path()
+    );
+    assert_eq!(
+        config.logging_config().file_config().rotation(),
+        LogRotation::Hourly
+    );
+    assert_eq!(
+        config.logging_config().file_config().filename_prefix(),
+        "jarvis"
+    );
+    assert_eq!(
+        config.logging_config().file_config().filename_suffix(),
+        "txt"
+    );
+    assert_eq!(config.logging_config().file_config().max_files(), 3);
 }
 
 #[test]
@@ -285,6 +344,46 @@ llm:
     let error_chain = format!("{error:#}");
 
     assert!(error_chain.contains("unknown field `not_a_real_event`"));
+}
+
+#[test]
+fn malformed_logging_config_with_blank_level_is_rejected() {
+    let fixture = ConfigFixture::new("openjarvis-logging-blank-level");
+    fixture.write_yaml(
+        r#"
+logging:
+  level: "   "
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let error =
+        AppConfig::from_path(fixture.config_path()).expect_err("blank logging level is invalid");
+    let error_chain = format!("{error:#}");
+
+    assert!(error_chain.contains("logging.level must not be blank"));
+}
+
+#[test]
+fn malformed_logging_config_without_any_sink_is_rejected() {
+    let fixture = ConfigFixture::new("openjarvis-logging-without-sink");
+    fixture.write_yaml(
+        r#"
+logging:
+  stderr: false
+  file:
+    enabled: false
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let error = AppConfig::from_path(fixture.config_path())
+        .expect_err("logging without any sink should be invalid");
+    let error_chain = format!("{error:#}");
+
+    assert!(error_chain.contains("logging requires at least one enabled sink"));
 }
 
 #[test]
