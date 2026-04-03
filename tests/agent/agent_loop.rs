@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use anyhow::Result;
 use async_trait::async_trait;
 use openjarvis::{
@@ -11,7 +13,7 @@ use openjarvis::{
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
-    model::ReplyTarget,
+    model::{IncomingMessage, ReplyTarget},
     thread::{ConversationThread, ThreadContext, ThreadContextLocator},
 };
 use serde_json::Value;
@@ -61,8 +63,7 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
     let loop_runner = AgentLoop::new(Arc::new(MockLLMProvider::new("loop-reply")), runtime);
     let (input, outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "hello"))
+    let output = run_simple_turn(&loop_runner, input, "system", "hello")
         .await
         .expect("loop should succeed");
     let outgoing = collect_outgoing(outgoing_rx, 1).await;
@@ -147,8 +148,7 @@ async fn agent_loop_runs_single_tool_round_and_returns_final_answer() {
     );
     let (input, outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "请读取 Cargo.toml"))
+    let output = run_simple_turn(&loop_runner, input, "system", "请读取 Cargo.toml")
         .await
         .expect("loop should succeed");
     let outgoing = collect_outgoing(outgoing_rx, 3).await;
@@ -198,8 +198,7 @@ async fn agent_loop_can_be_driven_by_mock_provider_to_verify_tool_hooks() {
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "请读取 Cargo.toml"))
+    let output = run_simple_turn(&loop_runner, input, "system", "请读取 Cargo.toml")
         .await
         .expect("loop should succeed");
 
@@ -250,8 +249,7 @@ async fn agent_loop_emits_post_tool_use_failure_when_mock_provider_requests_unkn
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "执行一个不存在的工具"))
+    let output = run_simple_turn(&loop_runner, input, "system", "执行一个不存在的工具")
         .await
         .expect("loop should succeed even when one tool call fails");
 
@@ -292,8 +290,7 @@ async fn agent_loop_accepts_protocol_prefix_with_colon() {
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "请读取 Cargo.toml"))
+    let output = run_simple_turn(&loop_runner, input, "system", "请读取 Cargo.toml")
         .await
         .expect("loop should succeed");
 
@@ -319,8 +316,7 @@ async fn agent_loop_emits_response_before_tool_call_when_both_exist() {
     );
     let (input, outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "请读取 Cargo.toml"))
+    let output = run_simple_turn(&loop_runner, input, "system", "请读取 Cargo.toml")
         .await
         .expect("loop should succeed");
     let outgoing = collect_outgoing(outgoing_rx, 4).await;
@@ -354,8 +350,7 @@ async fn agent_loop_executes_all_tool_calls_in_one_response() {
     );
     let (input, outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "读取两个文件"))
+    let output = run_simple_turn(&loop_runner, input, "system", "读取两个文件")
         .await
         .expect("loop should succeed");
     let outgoing = collect_outgoing(outgoing_rx, 5).await;
@@ -405,8 +400,7 @@ async fn agent_loop_executes_namespaced_mcp_tool_calls() {
     );
     let (input, outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "调用 demo MCP"))
+    let output = run_simple_turn(&loop_runner, input, "system", "调用 demo MCP")
         .await
         .expect("loop should succeed");
     let outgoing = collect_outgoing(outgoing_rx, 5).await;
@@ -462,13 +456,14 @@ async fn agent_loop_refreshes_tools_after_load_and_hides_them_after_unload_in_sa
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(
-            input,
-            &build_context("system", "load demo toolset, use it, then unload it"),
-        )
-        .await
-        .expect("loop should succeed");
+    let output = run_simple_turn(
+        &loop_runner,
+        input,
+        "system",
+        "load demo toolset, use it, then unload it",
+    )
+    .await
+    .expect("loop should succeed");
 
     let captured_requests = requests.lock().await;
     let first_tools = captured_requests[0]
@@ -589,8 +584,7 @@ async fn agent_loop_does_not_inject_skill_prompt_or_tool_when_no_local_skills_ex
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "普通问题"))
+    let output = run_simple_turn(&loop_runner, input, "system", "普通问题")
         .await
         .expect("loop should succeed");
 
@@ -650,8 +644,7 @@ Read `guide.md` before replying.
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "请处理 demo 工作流"))
+    let output = run_simple_turn(&loop_runner, input, "system", "请处理 demo 工作流")
         .await
         .expect("loop should succeed");
 
@@ -694,6 +687,128 @@ Read `guide.md` before replying.
             .any(|content| content.contains("guide content")),
         "referenced skill file content was not propagated: {second_messages:?}"
     );
+}
+
+#[tokio::test]
+async fn agent_loop_rebuilds_fixed_feature_slots_before_persisted_history() {
+    // 测试场景: loop 发起请求前应先 rebuild `features_system_prompt`，
+    // 再通过 ThreadContext.messages() 导出 persisted snapshot -> features_system_prompt
+    // -> live system -> live memory -> history -> live chat。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    auto_compact: true
+    runtime_threshold_ratio: 1.0
+    tool_visible_threshold_ratio: 0.95
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 20000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("auto compact config should parse");
+    let fixture = SkillFixture::new("openjarvis-agent-loop-feature-order");
+    fixture.write_skill(
+        "demo_skill",
+        r#"---
+name: demo_skill
+description: help with ordered feature prompt tests
+---
+Read `guide.md` before replying.
+"#,
+    );
+    fixture.write_skill_file("demo_skill", "guide.md", "guide content");
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(ToolRegistry::with_skill_roots(vec![
+        fixture.skills_root().to_path_buf(),
+    ]));
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo toolset for feature order"),
+            vec![Arc::new(DemoLoopTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+    let runtime = AgentRuntime::with_parts(Arc::new(HookRegistry::new()), registry);
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![text_response("按顺序完成")])),
+        }),
+        runtime,
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let now = chrono::Utc::now();
+    let mut thread_context = ThreadContext::new(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_1", "thread_1"),
+        now,
+    );
+    assert!(thread_context.ensure_system_prompt_snapshot("system", now));
+    assert!(thread_context.load_toolset("demo"));
+    thread_context.enable_auto_compact();
+    thread_context.store_turn(
+        None,
+        vec![ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "persisted history",
+            now,
+        )],
+        now,
+        now,
+    );
+    let mut context = build_context("system", "当前问题");
+    context.push_memory("transient memory only");
+
+    let output = loop_runner
+        .run_with_thread_context(input, &context, thread_context)
+        .await
+        .expect("loop should rebuild fixed feature slots before request");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 1);
+    let request_messages = captured_requests[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    let find_contains_index = |needle: &str| {
+        request_messages
+            .iter()
+            .position(|content| content.contains(needle))
+            .expect("expected request message should exist")
+    };
+    let find_exact_index = |needle: &str| {
+        request_messages
+            .iter()
+            .position(|content| *content == needle)
+            .expect("expected exact request message should exist")
+    };
+
+    let snapshot_index = find_exact_index("system");
+    let tool_mode_index = find_contains_index("OpenJarvis tool-use mode");
+    let toolset_index = find_contains_index("Demo toolset for feature order");
+    let skill_index = find_contains_index("Available local skills");
+    let auto_stable_index = find_contains_index("Auto-compact 已开启");
+    let auto_dynamic_index = find_contains_index("<context capacity");
+    let memory_index = find_exact_index("transient memory only");
+    let history_index = find_exact_index("persisted history");
+    let user_index = find_exact_index("当前问题");
+
+    assert!(snapshot_index < tool_mode_index);
+    assert!(tool_mode_index < toolset_index);
+    assert!(toolset_index < skill_index);
+    assert!(skill_index < auto_stable_index);
+    assert!(auto_stable_index < auto_dynamic_index);
+    assert!(auto_dynamic_index < memory_index);
+    assert!(memory_index < history_index);
+    assert!(history_index < user_index);
+    assert_eq!(output.reply, "按顺序完成");
 }
 
 #[tokio::test]
@@ -742,10 +857,10 @@ llm:
         ),
     ]);
 
-    let output = loop_runner
-        .run_with_thread(input, &build_context("system", "新的问题"), active_thread)
-        .await
-        .expect("loop should compact history before the final request");
+    let output =
+        run_turn_with_active_thread(&loop_runner, input, "system", "新的问题", active_thread)
+            .await
+            .expect("loop should compact history before the final request");
 
     let captured_requests = requests.lock().await;
     assert_eq!(captured_requests.len(), 2);
@@ -772,6 +887,100 @@ llm:
     assert_eq!(output.events[1].kind, AgentLoopEventKind::TextOutput);
     assert!(!output.prepend_incoming_user);
     assert_eq!(output.active_thread.turns.len(), 1);
+}
+
+#[tokio::test]
+async fn agent_loop_run_turn_keeps_request_memory_transient_across_compact() {
+    // 测试场景: request-time memory 只影响当前请求；它不能进入线程持久状态，也不能被作为 compact source history。
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+agent:
+  compact:
+    enabled: true
+    runtime_threshold_ratio: 0.25
+    tool_visible_threshold_ratio: 0.9
+    reserved_output_tokens: 16
+llm:
+  provider: "mock"
+  context_window_tokens: 1000
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("compact config should parse");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![
+                text_response("{\"compacted_assistant\":\"这是压缩后的上下文，请继续当前任务。\"}"),
+                text_response("带 memory 的压缩后继续"),
+            ])),
+        }),
+        runtime_without_skills(),
+        config.llm_config().clone(),
+        config.agent_config().compact_config().clone(),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let now = chrono::Utc::now();
+    let mut thread_context = ThreadContext::new(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_1", "thread_1"),
+        now,
+    );
+    assert!(thread_context.ensure_system_prompt_snapshot("system", now));
+    thread_context.store_turn(
+        None,
+        vec![
+            ChatMessage::new(
+                ChatMessageRole::User,
+                "这是一段很长的历史问题，需要被压缩。".repeat(40),
+                now,
+            ),
+            ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "这是一段很长的历史回答，也需要被压缩。".repeat(40),
+                now,
+            ),
+        ],
+        now,
+        now,
+    );
+
+    let mut context = build_context("system", "新的问题");
+    context.push_memory("transient memory only");
+    let output = loop_runner
+        .run_with_thread_context(input, &context, thread_context)
+        .await
+        .expect("loop should keep request memory transient");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 2);
+    assert!(
+        !captured_requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("transient memory only"))
+    );
+    assert!(
+        captured_requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content == "transient memory only")
+    );
+    assert!(
+        !output
+            .thread_context
+            .request_context_system_messages()
+            .iter()
+            .any(|message| message.content == "transient memory only")
+    );
+    assert!(
+        !output
+            .thread_context
+            .load_messages()
+            .iter()
+            .any(|message| message.content == "transient memory only")
+    );
+    assert_eq!(output.reply, "带 memory 的压缩后继续");
 }
 
 #[tokio::test]
@@ -818,10 +1027,10 @@ llm:
         ),
     ]);
 
-    let output = loop_runner
-        .run_with_thread(input, &build_context("system", "新的问题"), active_thread)
-        .await
-        .expect("loop should compact history with static mock summary");
+    let output =
+        run_turn_with_active_thread(&loop_runner, input, "system", "新的问题", active_thread)
+            .await
+            .expect("loop should compact history with static mock summary");
 
     let captured_requests = requests.lock().await;
     assert_eq!(captured_requests.len(), 1);
@@ -867,8 +1076,7 @@ llm:
     );
     let (input, _outgoing_rx) = build_input();
 
-    let output = loop_runner
-        .run(input, &build_context("system", "短消息"))
+    let output = run_simple_turn(&loop_runner, input, "system", "短消息")
         .await
         .expect("loop should expose compact tool before threshold");
 
@@ -1075,10 +1283,10 @@ llm:
         ),
     ]);
 
-    let output = loop_runner
-        .run_with_thread(input, &build_context("system", "请继续"), active_thread)
-        .await
-        .expect("loop should expose the compact tool");
+    let output =
+        run_turn_with_active_thread(&loop_runner, input, "system", "请继续", active_thread)
+            .await
+            .expect("loop should expose the compact tool");
 
     let captured_requests = requests.lock().await;
     assert_eq!(captured_requests.len(), 3);
@@ -1139,6 +1347,73 @@ fn build_context(system_prompt: &str, user_message: &str) -> MessageContext {
         chrono::Utc::now(),
     ));
     context
+}
+
+async fn run_simple_turn(
+    loop_runner: &AgentLoop,
+    input: InfoContext,
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<openjarvis::agent::AgentLoopOutput> {
+    let thread_context = build_thread_context_for_input(&input, system_prompt);
+    let incoming = build_incoming_for_input(&input, user_message);
+    loop_runner
+        .run_v1(input.event_tx, &incoming, thread_context)
+        .await
+}
+
+async fn run_turn_with_active_thread(
+    loop_runner: &AgentLoop,
+    input: InfoContext,
+    system_prompt: &str,
+    user_message: &str,
+    active_thread: ConversationThread,
+) -> Result<openjarvis::agent::AgentLoopOutput> {
+    let mut thread_context = ThreadContext::from_conversation_thread(
+        thread_context_locator_for_input(&input),
+        active_thread,
+    );
+    let _ = thread_context.ensure_system_prompt_snapshot(system_prompt, chrono::Utc::now());
+    let incoming = build_incoming_for_input(&input, user_message);
+    loop_runner
+        .run_v1(input.event_tx, &incoming, thread_context)
+        .await
+}
+
+fn build_incoming_for_input(input: &InfoContext, user_message: &str) -> IncomingMessage {
+    IncomingMessage {
+        id: uuid::Uuid::new_v4(),
+        external_message_id: Some("msg_1".to_string()),
+        channel: input.channel.clone(),
+        user_id: input.user_id.clone(),
+        user_name: None,
+        content: user_message.to_string(),
+        external_thread_id: Some(input.compact_scope_key.external_thread_id.clone()),
+        received_at: chrono::Utc::now(),
+        metadata: serde_json::json!({}),
+        attachments: Vec::new(),
+        reply_target: ReplyTarget {
+            receive_id: "oc_xxx".to_string(),
+            receive_id_type: "chat_id".to_string(),
+        },
+    }
+}
+
+fn build_thread_context_for_input(input: &InfoContext, system_prompt: &str) -> ThreadContext {
+    let now = chrono::Utc::now();
+    let mut thread_context = ThreadContext::new(thread_context_locator_for_input(input), now);
+    let _ = thread_context.ensure_system_prompt_snapshot(system_prompt, now);
+    thread_context
+}
+
+fn thread_context_locator_for_input(input: &InfoContext) -> ThreadContextLocator {
+    ThreadContextLocator::new(
+        None,
+        input.channel.clone(),
+        input.user_id.clone(),
+        input.compact_scope_key.external_thread_id.clone(),
+        input.thread_id.clone(),
+    )
 }
 
 fn runtime_without_skills() -> AgentRuntime {

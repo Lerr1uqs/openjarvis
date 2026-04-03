@@ -413,6 +413,72 @@ pub struct ThreadToolState {
     pub compact_tool_projection: Option<ThreadCompactToolProjection>,
 }
 
+/// Thread-scoped request context snapshot that remains stable across turns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ThreadRequestContext {
+    #[serde(default)]
+    pub system: Vec<ChatMessage>,
+}
+
+/// Fixed feature system-prompt slots exported ahead of persisted conversation history.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThreadFeaturesSystemPrompt {
+    pub toolset_catalog: Vec<ChatMessage>,
+    pub skill_catalog: Vec<ChatMessage>,
+    pub auto_compact: Vec<ChatMessage>,
+}
+
+impl ThreadFeaturesSystemPrompt {
+    /// Export the fixed feature system-prompt slots in stable request order.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::ThreadFeaturesSystemPrompt,
+    /// };
+    ///
+    /// let mut slots = ThreadFeaturesSystemPrompt::default();
+    /// slots.toolset_catalog.push(ChatMessage::new(
+    ///     ChatMessageRole::System,
+    ///     "toolset",
+    ///     Utc::now(),
+    /// ));
+    /// slots.auto_compact.push(ChatMessage::new(
+    ///     ChatMessageRole::System,
+    ///     "auto-compact",
+    ///     Utc::now(),
+    /// ));
+    ///
+    /// assert_eq!(
+    ///     slots
+    ///         .ordered_messages()
+    ///         .into_iter()
+    ///         .map(|message| message.content)
+    ///         .collect::<Vec<_>>(),
+    ///     vec!["toolset".to_string(), "auto-compact".to_string()]
+    /// );
+    /// ```
+    pub fn ordered_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = Vec::with_capacity(self.message_count());
+        messages.extend(self.toolset_catalog.iter().cloned());
+        messages.extend(self.skill_catalog.iter().cloned());
+        messages.extend(self.auto_compact.iter().cloned());
+        messages
+    }
+
+    pub(crate) fn message_count(&self) -> usize {
+        self.toolset_catalog.len() + self.skill_catalog.len() + self.auto_compact.len()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThreadLiveFeatureInputs {
+    runtime_system: Vec<ChatMessage>,
+    memory: Vec<ChatMessage>,
+}
+
 /// One pending approval request reserved for future thread-scoped policy flows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThreadApprovalRequest {
@@ -448,6 +514,8 @@ pub struct ThreadState {
     #[serde(default)]
     pub features: ThreadFeatureState,
     #[serde(default)]
+    pub request_context: ThreadRequestContext,
+    #[serde(default)]
     pub tools: ThreadToolState,
     #[serde(default)]
     pub approval: ThreadApprovalState,
@@ -462,6 +530,16 @@ pub struct ThreadContext {
     pub state: ThreadState,
     #[serde(default, skip_serializing, skip_deserializing)]
     revision: u64,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    live_feature_inputs: ThreadLiveFeatureInputs,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    features_system_prompt: ThreadFeaturesSystemPrompt,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    live_system_messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    live_memory_messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    live_chat_messages: Vec<ChatMessage>,
     #[serde(default, skip_serializing, skip_deserializing)]
     pending_tool_events: Vec<ThreadToolEvent>,
 }
@@ -494,6 +572,11 @@ impl ThreadContext {
             conversation: ThreadConversation::new(external_thread_id, now),
             state: ThreadState::default(),
             revision: 0,
+            live_feature_inputs: ThreadLiveFeatureInputs::default(),
+            features_system_prompt: ThreadFeaturesSystemPrompt::default(),
+            live_system_messages: Vec::new(),
+            live_memory_messages: Vec::new(),
+            live_chat_messages: Vec::new(),
             pending_tool_events: Vec::new(),
         }
     }
@@ -529,6 +612,7 @@ impl ThreadContext {
             conversation: ThreadConversation::from(thread),
             state: ThreadState {
                 features: ThreadFeatureState::default(),
+                request_context: ThreadRequestContext::default(),
                 tools: ThreadToolState {
                     loaded_toolsets: normalize_loaded_toolsets(loaded_toolsets),
                     compact_tool_projection: None,
@@ -536,6 +620,11 @@ impl ThreadContext {
                 approval: ThreadApprovalState::default(),
             },
             revision: 0,
+            live_feature_inputs: ThreadLiveFeatureInputs::default(),
+            features_system_prompt: ThreadFeaturesSystemPrompt::default(),
+            live_system_messages: Vec::new(),
+            live_memory_messages: Vec::new(),
+            live_chat_messages: Vec::new(),
             pending_tool_events: Vec::new(),
         }
     }
@@ -558,9 +647,102 @@ impl ThreadContext {
         self.conversation.load_messages()
     }
 
+    /// Export one LLM-facing message sequence from the current thread.
+    ///
+    /// This keeps persisted request context, fixed feature system prompt, transient runtime
+    /// messages, and the current working chat assembled behind the thread boundary instead of
+    /// rebuilding them in the agent loop.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// let _ = context.ensure_system_prompt_snapshot("system prompt", now);
+    /// context.push_message(ChatMessage::new(ChatMessageRole::Memory, "transient", now));
+    /// context.push_message(ChatMessage::new(ChatMessageRole::User, "hello", now));
+    ///
+    /// let exported = context.messages();
+    ///
+    /// assert_eq!(exported[0].content, "system prompt");
+    /// assert_eq!(exported[1].content, "transient");
+    /// assert_eq!(exported[2].content, "hello");
+    /// ```
+    pub fn messages(&self) -> Vec<ChatMessage> {
+        let mut messages = Vec::with_capacity(
+            self.state.request_context.system.len()
+                + self.features_system_prompt.message_count()
+                + self.live_system_messages.len()
+                + self.live_memory_messages.len()
+                + self
+                    .conversation
+                    .turns
+                    .iter()
+                    .map(|turn| turn.messages.len())
+                    .sum::<usize>()
+                + self.live_chat_messages.len(),
+        );
+        messages.extend(self.state.request_context.system.iter().cloned());
+        messages.extend(self.features_system_prompt.ordered_messages());
+        messages.extend(self.live_system_messages.iter().cloned());
+        messages.extend(self.live_memory_messages.iter().cloned());
+        messages.extend(self.conversation.load_messages());
+        messages.extend(self.live_chat_messages.iter().cloned());
+        messages
+    }
+
+    /// Push one live chat message into the current thread working set.
+    ///
+    /// System/memory messages are treated as request-time transient inputs. User/assistant/tool
+    /// messages are appended to the live chat area and can participate in compaction.
+    pub fn push_message(&mut self, message: ChatMessage) {
+        match message.role {
+            ChatMessageRole::System => {
+                self.live_feature_inputs
+                    .runtime_system
+                    .push(message.clone());
+                self.live_system_messages.push(message);
+            }
+            ChatMessageRole::Memory => {
+                self.live_feature_inputs.memory.push(message.clone());
+                self.live_memory_messages.push(message);
+            }
+            _ => {
+                self.live_chat_messages.push(message);
+            }
+        }
+    }
+
     /// Return the persisted loaded toolsets for the thread.
     pub fn load_toolsets(&self) -> Vec<String> {
         self.state.tools.loaded_toolsets.clone()
+    }
+
+    /// Return the persisted thread-scoped system prompt snapshot.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{ThreadContext, ThreadContextLocator};
+    ///
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// context.ensure_system_prompt_snapshot("system prompt", Utc::now());
+    ///
+    /// assert_eq!(context.request_context_system_messages().len(), 1);
+    /// ```
+    pub fn request_context_system_messages(&self) -> &[ChatMessage] {
+        &self.state.request_context.system
     }
 
     /// Return the persisted structured tool event history.
@@ -573,14 +755,151 @@ impl ThreadContext {
         &self.pending_tool_events
     }
 
+    /// Return the request-time memory inputs that a memory feature provider can materialize.
+    pub fn request_memory_messages(&self) -> &[ChatMessage] {
+        &self.live_feature_inputs.memory
+    }
+
+    /// Return the current fixed feature system-prompt slots.
+    pub fn features_system_prompt(&self) -> &ThreadFeaturesSystemPrompt {
+        &self.features_system_prompt
+    }
+
     /// Record one thread-scoped tool event on the current runtime context.
     pub fn record_tool_event(&mut self, event: ThreadToolEvent) {
         self.pending_tool_events.push(event);
     }
 
+    /// Initialize the thread-scoped system prompt snapshot on first use.
+    ///
+    /// Existing threads keep the first persisted snapshot; later calls are ignored so restored
+    /// threads continue using the same stable prefix.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{ThreadContext, ThreadContextLocator};
+    ///
+    /// let now = Utc::now();
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    ///
+    /// assert!(context.ensure_system_prompt_snapshot("system prompt", now));
+    /// assert!(!context.ensure_system_prompt_snapshot("new prompt", now));
+    /// assert_eq!(
+    ///     context.request_context_system_messages()[0].content,
+    ///     "system prompt"
+    /// );
+    /// ```
+    pub fn ensure_system_prompt_snapshot(
+        &mut self,
+        system_prompt: impl AsRef<str>,
+        created_at: DateTime<Utc>,
+    ) -> bool {
+        let system_prompt = system_prompt.as_ref().trim();
+        if system_prompt.is_empty() || !self.state.request_context.system.is_empty() {
+            return false;
+        }
+
+        self.initialize_request_context_system_messages(
+            vec![ChatMessage::new(
+                ChatMessageRole::System,
+                system_prompt,
+                created_at,
+            )],
+            "system_prompt",
+        )
+    }
+
+    /// Backfill one legacy system snapshot into the thread-scoped request context when missing.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// let system_messages = vec![ChatMessage::new(ChatMessageRole::System, "system", now)];
+    ///
+    /// assert!(context.ensure_request_context_system_messages(&system_messages));
+    /// assert_eq!(
+    ///     context.request_context_system_messages()[0].content,
+    ///     "system"
+    /// );
+    /// ```
+    pub fn ensure_request_context_system_messages(
+        &mut self,
+        system_messages: &[ChatMessage],
+    ) -> bool {
+        if !self.state.request_context.system.is_empty() {
+            return false;
+        }
+
+        let normalized_messages = system_messages
+            .iter()
+            .filter(|message| !message.content.trim().is_empty())
+            .map(|message| {
+                ChatMessage::new(
+                    ChatMessageRole::System,
+                    message.content.clone(),
+                    message.created_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        if normalized_messages.is_empty() {
+            return false;
+        }
+
+        self.initialize_request_context_system_messages(normalized_messages, "legacy_context")
+    }
+
     /// Replace the thread's loaded toolset state with a normalized snapshot.
     pub fn replace_loaded_toolsets(&mut self, loaded_toolsets: Vec<String>) {
         self.state.tools.loaded_toolsets = normalize_loaded_toolsets(loaded_toolsets);
+    }
+
+    /// Replace the request-time transient memory inputs for the current turn.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// context.replace_request_memory_messages(vec![ChatMessage::new(
+    ///     ChatMessageRole::Memory,
+    ///     "remember this",
+    ///     now,
+    /// )]);
+    ///
+    /// assert_eq!(context.request_memory_messages()[0].content, "remember this");
+    /// ```
+    pub fn replace_request_memory_messages(&mut self, memory_messages: Vec<ChatMessage>) {
+        let normalized_messages = memory_messages
+            .into_iter()
+            .filter(|message| !message.content.trim().is_empty())
+            .map(|message| {
+                ChatMessage::new(ChatMessageRole::Memory, message.content, message.created_at)
+            })
+            .collect::<Vec<_>>();
+        self.live_feature_inputs.memory = normalized_messages.clone();
+        self.live_memory_messages = normalized_messages;
     }
 
     /// Mark one toolset as loaded for the current thread context.
@@ -657,6 +976,8 @@ impl ThreadContext {
         self.conversation
             .overwrite_active_history(&replacement.conversation);
         self.state = replacement.state.clone();
+        self.live_feature_inputs = replacement.live_feature_inputs.clone();
+        self.clear_live_turn_messages();
         self.pending_tool_events = replacement.pending_tool_events.clone();
     }
 
@@ -667,12 +988,14 @@ impl ThreadContext {
     ) {
         self.conversation = ThreadConversation::from(replacement);
         self.replace_loaded_toolsets(replacement.loaded_toolsets.clone());
+        self.clear_live_turn_messages();
     }
 
     /// Clear the current thread back to one empty initial state.
     ///
-    /// This drops all stored chat turns, tool events, loaded toolsets, feature overrides, approval
-    /// state, and pending runtime tool events while keeping the current thread identity.
+    /// This drops all stored chat turns, tool events, request-context snapshots, loaded toolsets,
+    /// feature overrides, approval state, and pending runtime tool events while keeping the
+    /// current thread identity.
     ///
     /// # 示例
     /// ```rust
@@ -705,6 +1028,11 @@ impl ThreadContext {
         );
         self.conversation = ThreadConversation::new(self.locator.external_thread_id.clone(), now);
         self.state = ThreadState::default();
+        self.live_feature_inputs = ThreadLiveFeatureInputs::default();
+        self.features_system_prompt = ThreadFeaturesSystemPrompt::default();
+        self.live_system_messages.clear();
+        self.live_memory_messages.clear();
+        self.live_chat_messages.clear();
         self.pending_tool_events.clear();
     }
 
@@ -763,6 +1091,100 @@ impl ThreadContext {
             resolve_internal_thread_id(&self.locator.thread_id),
             &self.state.tools.loaded_toolsets,
         )
+    }
+
+    /// Replace the current fixed feature system-prompt slots with one rebuilt snapshot.
+    ///
+    /// Existing persisted snapshot/history stay untouched; only request-time feature slots change.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{ThreadContext, ThreadContextLocator, ThreadFeaturesSystemPrompt},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// let mut slots = ThreadFeaturesSystemPrompt::default();
+    /// slots.toolset_catalog.push(ChatMessage::new(
+    ///     ChatMessageRole::System,
+    ///     "toolset catalog",
+    ///     now,
+    /// ));
+    /// context.rebuild_features_system_prompt(slots);
+    ///
+    /// assert_eq!(context.features_system_prompt().toolset_catalog.len(), 1);
+    /// ```
+    pub fn rebuild_features_system_prompt(
+        &mut self,
+        features_system_prompt: ThreadFeaturesSystemPrompt,
+    ) {
+        info!(
+            thread_id = %self.locator.thread_id,
+            toolset_catalog_count = features_system_prompt.toolset_catalog.len(),
+            skill_catalog_count = features_system_prompt.skill_catalog.len(),
+            auto_compact_count = features_system_prompt.auto_compact.len(),
+            "rebuilt thread features system prompt"
+        );
+        self.features_system_prompt = features_system_prompt;
+    }
+
+    /// Replace the current transient runtime system messages while preserving request-time inputs.
+    pub(crate) fn replace_live_system_messages(&mut self, system_messages: Vec<ChatMessage>) {
+        let mut normalized_messages = self.live_feature_inputs.runtime_system.clone();
+        normalized_messages.extend(system_messages.into_iter().filter(|message| {
+            message.role == ChatMessageRole::System && !message.content.trim().is_empty()
+        }));
+        self.live_system_messages = normalized_messages;
+    }
+
+    /// Replace the current transient live memory messages with one rebuilt snapshot.
+    pub(crate) fn rebuild_live_memory_messages(&mut self, memory_messages: Vec<ChatMessage>) {
+        self.live_memory_messages = memory_messages;
+    }
+
+    pub(crate) fn clear_live_messages(&mut self) {
+        self.live_feature_inputs = ThreadLiveFeatureInputs::default();
+        self.features_system_prompt = ThreadFeaturesSystemPrompt::default();
+        self.live_system_messages.clear();
+        self.live_memory_messages.clear();
+        self.live_chat_messages.clear();
+    }
+
+    pub(crate) fn clear_live_turn_messages(&mut self) {
+        self.features_system_prompt = ThreadFeaturesSystemPrompt::default();
+        self.live_system_messages.clear();
+        self.live_memory_messages.clear();
+        self.live_chat_messages.clear();
+    }
+
+    pub(crate) fn pending_chat_messages(&self) -> &[ChatMessage] {
+        &self.live_chat_messages
+    }
+
+    fn initialize_request_context_system_messages(
+        &mut self,
+        system_messages: Vec<ChatMessage>,
+        source: &str,
+    ) -> bool {
+        if system_messages.is_empty() || !self.state.request_context.system.is_empty() {
+            return false;
+        }
+
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            source,
+            system_message_count = system_messages.len(),
+            "initialized thread request context snapshot"
+        );
+        self.state.request_context.system = system_messages;
+        true
     }
 }
 

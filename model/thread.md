@@ -22,7 +22,13 @@
 - `ConversationTurn`
   一轮处理后的消息集合。
 - `ThreadState`
-  线程级运行时状态，当前拆成 `features / tools / approval`。
+  线程级持久状态，当前拆成 `features / request_context / tools / approval`。
+- `ThreadFeaturesSystemPrompt`
+  当前请求前临时重建的静态 feature system prompt 槽位，固定包含 `toolset_catalog / skill_catalog / auto_compact`。
+- `live_system_messages`
+  当前请求的瞬时 runtime system messages，例如 auto-compact 的动态容量提示。
+- `live_memory_messages`
+  当前请求的瞬时 memory messages，只参与本轮 request，不进入固定 system prompt 槽位。
 - `ThreadToolEvent`
   工具加载、卸载、执行的结构化审计事件。
 
@@ -30,6 +36,12 @@
 
 - 通过 `channel + user_id + external_thread_id` 生成稳定 `thread_key`，再派生 internal thread id。
 - 以 turn 为单位保存聊天历史。
+- 在线程初始化时固化 system prompt snapshot。
+- 通过零参 `messages()` 对外导出完整请求消息序列，固定顺序为 persisted snapshot -> features_system_prompt -> live_system_messages -> live_memory_messages -> persisted history -> live_chat。
+- 用固定的 `features_system_prompt` 槽位表达静态 feature system prompt，不在 loop 中临时拼 `Vec<ChatMessage>`。
+- 通过统一 rebuild 入口整体替换 `features_system_prompt`，不把 feature 状态变化写成一次性历史消息。
+- 通过 `AutoCompactor::notify_capacity(...)` 注入动态容量提示，这类 prompt 不占用固定 slot。
+- 通过 `push_message(...)` 接收本轮 live chat；兼容路径下的 system / memory 会先进入 request-time 输入，再重建成 live system / live memory messages。
 - 记录线程当前已加载 toolset。
 - 保存 compact / auto-compact 的线程级覆盖状态。
 - 在 turn 落盘前把 `pending_tool_events` 绑定到本轮 turn。
@@ -51,5 +63,10 @@
 ## 使用方式
 
 - AgentLoop 在整个单轮执行期间直接读写 `ThreadContext`。
+- Router 只负责把 `incoming` 和目标 `ThreadContext` 交给 AgentLoop，不直接操控 messages。
+- toolset / skill / auto-compact 的稳定 system prompt 通过固定 `FeaturePromptProvider` 重建后写入 `features_system_prompt`。
+- request-time memory 通过 memory provider 写入 `live_memory_messages`。
+- auto-compact 的动态容量信息通过 `AutoCompactor` 写入 `live_system_messages`。
+- 基础 system prompt 继续只在线程初始化时写入 persisted snapshot；后续 rebuild 不会覆盖它。
 - Command 修改线程开关或清空历史时，也直接修改 `ThreadContext`。
 - Session 持久化的对象不是零散状态，而是完整 `ThreadContext` 快照。

@@ -5,7 +5,8 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     thread::{
         ConversationThread, ThreadCompactToolProjection, ThreadContext, ThreadContextLocator,
-        ThreadToolEvent, ThreadToolEventKind, derive_internal_thread_id,
+        ThreadFeaturesSystemPrompt, ThreadToolEvent, ThreadToolEventKind,
+        derive_internal_thread_id,
     },
 };
 use serde_json::json;
@@ -100,6 +101,7 @@ fn clear_to_initial_state_resets_thread_context_layers() {
         ),
         now,
     );
+    assert!(context.ensure_system_prompt_snapshot("system prompt snapshot", now));
     let event = {
         let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
         event.toolset_name = Some("demo".to_string());
@@ -128,6 +130,7 @@ fn clear_to_initial_state_resets_thread_context_layers() {
     assert!(context.load_toolsets().is_empty());
     assert!(context.load_tool_events().is_empty());
     assert!(context.pending_tool_events().is_empty());
+    assert!(context.request_context_system_messages().is_empty());
     assert!(!context.compact_enabled(false));
     assert!(!context.auto_compact_enabled(false));
 }
@@ -284,4 +287,177 @@ fn thread_context_store_turn_binds_pending_tool_events_and_clears_compact_projec
     assert_eq!(stored_events.len(), 1);
     assert_eq!(stored_events[0].turn_id, Some(turn_id));
     assert_eq!(stored_events[0].tool_call_id.as_deref(), Some("call_1"));
+}
+
+#[test]
+fn request_context_snapshot_does_not_leak_into_conversation_history() {
+    // 测试场景: 线程级 request context 是线程元数据，不应混入 load_messages 或 legacy conversation history。
+    let now = Utc::now();
+    let thread_id = derive_internal_thread_id("ou_xxx:feishu:thread_request_context");
+    let mut context = ThreadContext::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_request_context",
+            thread_id.to_string(),
+        ),
+        now,
+    );
+    assert!(context.ensure_system_prompt_snapshot("stable system prompt", now));
+    context.store_turn(
+        Some("msg_request_context".to_string()),
+        vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
+        now,
+        now,
+    );
+
+    let flattened_messages = context.load_messages();
+    let legacy_thread = context.to_conversation_thread();
+
+    assert_eq!(
+        context.request_context_system_messages()[0].content,
+        "stable system prompt"
+    );
+    assert_eq!(flattened_messages.len(), 1);
+    assert!(
+        flattened_messages
+            .iter()
+            .all(|message| message.content != "stable system prompt")
+    );
+    assert!(
+        legacy_thread
+            .load_messages()
+            .iter()
+            .all(|message| message.content != "stable system prompt")
+    );
+}
+
+#[test]
+fn thread_context_messages_exports_llm_view_in_thread_order() {
+    // 测试场景: 对外导出的 LLM messages 必须由 ThreadContext 统一拼接，顺序固定为
+    // persisted snapshot -> features_system_prompt -> live system -> live memory
+    // -> persisted history -> live chat。
+    let now = Utc::now();
+    let thread_id = derive_internal_thread_id("ou_xxx:feishu:thread_export_messages");
+    let mut context = ThreadContext::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_export_messages",
+            thread_id.to_string(),
+        ),
+        now,
+    );
+    assert!(context.ensure_system_prompt_snapshot("stable system prompt", now));
+    context.store_turn(
+        Some("msg_export".to_string()),
+        vec![ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "persisted history",
+            now,
+        )],
+        now,
+        now,
+    );
+    let mut features_system_prompt = ThreadFeaturesSystemPrompt::default();
+    features_system_prompt
+        .toolset_catalog
+        .push(ChatMessage::new(
+            ChatMessageRole::System,
+            "toolset catalog",
+            now,
+        ));
+    features_system_prompt.skill_catalog.push(ChatMessage::new(
+        ChatMessageRole::System,
+        "skill catalog",
+        now,
+    ));
+    features_system_prompt.auto_compact.push(ChatMessage::new(
+        ChatMessageRole::System,
+        "auto compact stable",
+        now,
+    ));
+    context.rebuild_features_system_prompt(features_system_prompt);
+    context.push_message(ChatMessage::new(
+        ChatMessageRole::System,
+        "runtime capacity prompt",
+        now,
+    ));
+    context.replace_request_memory_messages(vec![ChatMessage::new(
+        ChatMessageRole::Memory,
+        "transient memory",
+        now,
+    )]);
+    context.push_message(ChatMessage::new(ChatMessageRole::User, "current user", now));
+    let exported = context.messages();
+
+    assert_eq!(
+        exported
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "stable system prompt".to_string(),
+            "toolset catalog".to_string(),
+            "skill catalog".to_string(),
+            "auto compact stable".to_string(),
+            "runtime capacity prompt".to_string(),
+            "transient memory".to_string(),
+            "persisted history".to_string(),
+            "current user".to_string(),
+        ]
+    );
+    assert_eq!(context.load_messages().len(), 1);
+}
+
+#[test]
+fn rebuild_features_system_prompt_replaces_old_slots_without_touching_snapshot() {
+    // 测试场景: features_system_prompt rebuild 只能替换静态 system prompt 槽位，不能改写初始化 snapshot。
+    let now = Utc::now();
+    let thread_id = derive_internal_thread_id("ou_xxx:feishu:thread_rebuild_features");
+    let mut context = ThreadContext::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_rebuild_features",
+            thread_id.to_string(),
+        ),
+        now,
+    );
+    assert!(context.ensure_system_prompt_snapshot("stable system prompt", now));
+
+    let mut first_slots = ThreadFeaturesSystemPrompt::default();
+    first_slots.toolset_catalog.push(ChatMessage::new(
+        ChatMessageRole::System,
+        "old toolset catalog",
+        now,
+    ));
+    first_slots.auto_compact.push(ChatMessage::new(
+        ChatMessageRole::System,
+        "old auto compact prompt",
+        now,
+    ));
+    context.rebuild_features_system_prompt(first_slots);
+
+    let mut second_slots = ThreadFeaturesSystemPrompt::default();
+    second_slots.skill_catalog.push(ChatMessage::new(
+        ChatMessageRole::System,
+        "new skill catalog",
+        now,
+    ));
+    context.rebuild_features_system_prompt(second_slots);
+
+    assert_eq!(
+        context.request_context_system_messages()[0].content,
+        "stable system prompt"
+    );
+    assert!(context.features_system_prompt().toolset_catalog.is_empty());
+    assert!(context.features_system_prompt().auto_compact.is_empty());
+    assert_eq!(
+        context.features_system_prompt().skill_catalog[0].content,
+        "new skill catalog"
+    );
 }

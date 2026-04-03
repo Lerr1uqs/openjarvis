@@ -2,13 +2,14 @@
 
 ## 定位
 
-- `MessageContext` 是送给 LLM 的统一消息组织层。
-- 它不关心消息从哪来，只关心这些消息在 prompt 里怎么排。
+- `context` 模块提供统一的消息基础类型。
+- `MessageContext` 仍然存在，但已经退化为兼容层，不再是主链路事实宿主。
 
 ## 边界
 
-- 负责组织 `system / memory / chat` 三段上下文。
+- 负责定义 `ChatMessage`、`ChatMessageRole`、`ChatToolCall` 这些统一消息协议。
 - 不负责持久化，不负责线程身份，不负责模型协议序列化。
+- 不负责在 Router 或 Worker 热路径里组装请求上下文。
 
 ## 关键概念
 
@@ -17,15 +18,15 @@
 - `ChatMessageRole`
   消息语义标签。
 - `MessageContext`
-  LLM 输入的三段式容器。
+  已废弃的兼容三段式容器。
 
 ## 核心能力
 
-- 累加 system prompt、memory 和 chat 历史。
-- 把 thread 历史展开成 LLM 可消费的消息序列。
-- 为协议兼容层提供统一消息顺序。
+- 提供 LLM、Tool、Thread 共享的统一消息结构。
+- 为兼容路径保留 `MessageContext` 的简单拼装和渲染能力。
 
 ## 使用方式
 
-- Worker 会把线程历史和当前用户输入装进 `MessageContext`。
-- AgentLoop 在真正请求模型前，再把它扩展成完整的 ReAct 请求消息。
+- 主链路里，Router 只负责转发 `incoming user message + ThreadContext`，不负责操控 message 上下文。
+- `ThreadContext.messages()` 才是对外导出的完整请求消息序列。
+- `MessageContext` 现在只保留给兼容路径、测试 helper 和辅助调用点，并已标记为 deprecated。

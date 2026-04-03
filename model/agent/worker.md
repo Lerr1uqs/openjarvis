@@ -23,6 +23,7 @@
 
 - 持有一个长生命周期 inbox。
 - 在请求进入 Loop 前把兼容态线程状态并回 `ThreadContext`。
+- 只把 `incoming + ThreadContext` 交给 `AgentLoop`，不在 worker 里拼装完整请求消息上下文。
 - 把 Agent 的流式事件转发给 Router。
 - 在成功和失败两条路径上都返回完整线程执行结果。
 

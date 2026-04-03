@@ -1,13 +1,13 @@
 //! Agent worker that owns the agent loop inbox and reports results back to the router.
 
 use super::{
-    agent_loop::{AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopOutput, InfoContext},
+    agent_loop::{AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopOutput},
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
 };
 use crate::compact::{CompactProvider, CompactScopeKey};
 use crate::config::{AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
-use crate::context::{ChatMessage, ChatMessageRole, MessageContext};
+use crate::context::ChatMessage;
 use crate::llm::{LLMProvider, build_provider};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
@@ -23,9 +23,6 @@ pub struct AgentRequest {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub thread_context: ThreadContext,
-    pub thread: ConversationThread,
-    pub history: Vec<ChatMessage>,
-    pub loaded_toolsets: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,7 +328,11 @@ impl AgentWorker {
         mut request: AgentRequest,
         event_tx: mpsc::Sender<AgentWorkerEvent>,
     ) -> Result<AgentLoopOutput> {
-        let internal_thread_id = request.locator.thread_id.to_string();
+        let compact_scope_key = CompactScopeKey::new(
+            request.thread_context.locator.channel.clone(),
+            request.thread_context.locator.user_id.clone(),
+            request.thread_context.locator.external_thread_id.clone(),
+        );
         self.agent_loop
             .runtime()
             .tools()
@@ -340,16 +341,11 @@ impl AgentWorker {
         self.agent_loop
             .runtime()
             .compact_runtime()
-            .merge_legacy_scope_overrides(
-                &CompactScopeKey::from_locator(&request.locator),
-                &mut request.thread_context,
-            )
+            .merge_legacy_scope_overrides(&compact_scope_key, &mut request.thread_context)
             .await;
-        let context = build_context(
-            &self.system_prompt,
-            &request.thread_context,
-            &request.incoming,
-        );
+        request
+            .thread_context
+            .ensure_system_prompt_snapshot(&self.system_prompt, request.incoming.received_at);
         let (dispatch_tx, mut dispatch_rx) = mpsc::channel(128);
         let forward_event_tx = event_tx.clone();
         let forward_dispatch_task = tokio::spawn(async move {
@@ -366,26 +362,13 @@ impl AgentWorker {
 
         let loop_output = self
             .agent_loop
-            .run_with_thread_context(
-                InfoContext {
-                    channel: request.incoming.channel.clone(),
-                    user_id: request.incoming.user_id.clone(),
-                    thread_id: internal_thread_id.clone(),
-                    compact_scope_key: CompactScopeKey::from_locator(&request.locator),
-                    event_tx: AgentEventSender::new(
-                        dispatch_tx,
-                        request.incoming.channel.clone(),
-                        request.incoming.external_thread_id.clone(),
-                        request.incoming.external_message_id.clone(),
-                        request.incoming.reply_target.clone(),
-                        request.locator.session_id.to_string(),
-                        request.locator.channel.clone(),
-                        request.locator.user_id.clone(),
-                        request.locator.external_thread_id.clone(),
-                        request.locator.thread_id.to_string(),
-                    ),
-                },
-                &context,
+            .run_v1(
+                AgentEventSender::from_incoming_and_locator(
+                    dispatch_tx,
+                    &request.incoming,
+                    &request.thread_context.locator,
+                ),
+                &request.incoming,
                 request.thread_context.clone(),
             )
             .await;
@@ -433,19 +416,4 @@ impl AgentWorker {
             }
         }
     }
-}
-
-fn build_context(
-    system_prompt: &str,
-    thread_context: &ThreadContext,
-    incoming: &IncomingMessage,
-) -> MessageContext {
-    let mut context = MessageContext::with_system_prompt(system_prompt.to_string());
-    context.extend_chat_messages(thread_context.load_messages());
-    context.chat.push(ChatMessage::new(
-        ChatMessageRole::User,
-        incoming.content.clone(),
-        incoming.received_at,
-    ));
-    context
 }

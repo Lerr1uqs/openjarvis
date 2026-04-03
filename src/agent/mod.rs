@@ -1,6 +1,7 @@
 //! Agent-layer modules for the loop, runtime, hooks, tools, and worker orchestration.
 
 pub mod agent_loop;
+pub mod feature;
 pub mod hook;
 pub mod runtime;
 pub mod sandbox;
@@ -10,6 +11,12 @@ pub mod worker;
 pub use agent_loop::{
     AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEvent, AgentLoopEventKind,
     AgentLoopOutput, InfoContext,
+};
+pub use feature::{
+    AutoCompactFeaturePromptProvider, AutoCompactor, FeaturePromptBuildContext,
+    FeaturePromptOutput, FeaturePromptProvider, FeaturePromptRebuilder,
+    MemoryFeaturePromptProvider, SkillCatalogFeaturePromptProvider,
+    ToolsetCatalogFeaturePromptProvider,
 };
 pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
 pub use runtime::AgentRuntime;

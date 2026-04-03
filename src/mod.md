@@ -21,7 +21,7 @@
 - `config.rs`
   配置加载层。负责应用配置、Agent 配置、Tool 配置、MCP 配置、Hook 配置、LLM 配置。
 - `context`
-  统一消息上下文层。负责 `system` / `memory` / `chat` 三段式上下文组织。
+  统一消息协议层。负责 `ChatMessage` 等基础类型，以及已废弃的 `MessageContext` 兼容层。
 - `llm.rs`
   LLM 适配层。负责统一请求结构，以及 OpenAI / Anthropic 协议序列化。
 - `model.rs`
@@ -48,7 +48,7 @@
 - `Turn`
   一次用户输入触发的一轮处理结果，通常包含 user / assistant / tool_call / tool_result 等一组消息。
 - `MessageContext`
-  给 LLM 的标准化上下文容器，拆成 `system`、`memory`、`chat` 三段。
+  已废弃的兼容上下文容器；主链路改由 `ThreadContext.messages()` 导出完整请求消息。
 - `AgentWorker`
   长生命周期执行体。负责接收路由层请求，并把单轮任务交给 `AgentLoop`。
 - `AgentLoop`

@@ -2,18 +2,27 @@
 
 mod demo;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use openjarvis::{
     agent::{McpServerState, ToolCallRequest, ToolRegistry, ToolSource},
     config::AppConfig,
 };
+use rmcp::{
+    model::ClientInfo,
+    serve_client,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
+};
 use serde_json::json;
 use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::{Child, Command},
-    time::sleep,
+    time::{sleep, timeout},
 };
+
+const DEMO_HTTP_READY_PREFIX: &str = "OPENJARVIS_DEMO_HTTP_READY=";
 
 pub(crate) fn openjarvis_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_openjarvis"))
@@ -66,24 +75,20 @@ pub(crate) struct DemoHttpServerProcess {
 
 impl DemoHttpServerProcess {
     pub(crate) async fn spawn() -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-
         let mut child = Command::new(openjarvis_bin())
-            .args(["internal-mcp", "demo-http", "--bind", &addr.to_string()])
+            .args(["internal-mcp", "demo-http", "--bind", "127.0.0.1:0"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("demo http mcp server stdout should be piped")?;
+        let base_url = wait_for_demo_http_server_ready(BufReader::new(stdout), &mut child).await?;
 
-        wait_for_tcp_server(&addr.to_string(), &mut child).await?;
-
-        Ok(Self {
-            base_url: format!("http://{addr}/mcp"),
-            child,
-        })
+        Ok(Self { base_url, child })
     }
 
     pub(crate) fn base_url(&self) -> &str {
@@ -97,20 +102,123 @@ impl Drop for DemoHttpServerProcess {
     }
 }
 
-async fn wait_for_tcp_server(addr: &str, child: &mut Child) -> Result<()> {
+async fn wait_for_demo_http_server_ready<T>(
+    mut stdout: BufReader<T>,
+    child: &mut Child,
+) -> Result<String>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let base_url = wait_for_demo_http_server_ready_line(&mut stdout, child).await?;
+
     for _ in 0..50 {
         if let Some(status) = child.try_wait()? {
-            bail!("demo http mcp server exited early with status {status}");
+            let stderr = read_child_stderr(child).await;
+            bail!(
+                "demo http mcp server exited early with status {status}{}",
+                format_child_stderr(&stderr)
+            );
         }
 
-        if TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
+        // TCP accept does not guarantee that the `/mcp` service has finished wiring up.
+        // Probe the real MCP handshake so registry startup probes do not race the demo server.
+        if timeout(
+            Duration::from_millis(500),
+            probe_demo_http_server(&base_url),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+        {
+            return Ok(base_url);
         }
 
         sleep(Duration::from_millis(100)).await;
     }
 
-    bail!("timed out waiting for demo http mcp server at {addr}")
+    bail!("timed out waiting for demo http mcp server at {base_url}")
+}
+
+async fn wait_for_demo_http_server_ready_line<T>(
+    stdout: &mut BufReader<T>,
+    child: &mut Child,
+) -> Result<String>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    for _ in 0..50 {
+        if let Some(status) = child.try_wait()? {
+            let stderr = read_child_stderr(child).await;
+            bail!(
+                "demo http mcp server exited before announcing readiness with status {status}{}",
+                format_child_stderr(&stderr)
+            );
+        }
+
+        let mut line = String::new();
+        match timeout(Duration::from_millis(100), stdout.read_line(&mut line)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(_)) => {
+                if let Some(base_url) = line.trim().strip_prefix(DEMO_HTTP_READY_PREFIX) {
+                    return Ok(base_url.to_string());
+                }
+            }
+            Ok(Err(error)) => {
+                return Err(error).context("failed to read demo http mcp server ready line");
+            }
+            Err(_) => {}
+        }
+    }
+
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+    let stderr = read_child_stderr(child).await;
+    bail!(
+        "timed out waiting for demo http mcp server ready line{}",
+        format_child_stderr(&stderr)
+    )
+}
+
+async fn probe_demo_http_server(base_url: &str) -> Result<()> {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(base_url.to_string()),
+    );
+    let mut client = serve_client(ClientInfo::default(), transport).await?;
+    match client.peer().list_all_tools().await {
+        Ok(_) => {
+            let _ = client.close().await;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = client.close().await;
+            Err(error.into())
+        }
+    }
+}
+
+async fn read_child_stderr(child: &mut Child) -> String {
+    let Some(stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut stderr_reader = BufReader::new(stderr);
+    let mut output = String::new();
+    match timeout(
+        Duration::from_secs(1),
+        stderr_reader.read_to_string(&mut output),
+    )
+    .await
+    {
+        Ok(Ok(_)) => output.trim().to_string(),
+        Ok(Err(error)) => format!("failed to read child stderr: {error}"),
+        Err(_) => "timed out while reading child stderr".to_string(),
+    }
+}
+
+fn format_child_stderr(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {stderr}")
+    }
 }
 
 #[tokio::test]

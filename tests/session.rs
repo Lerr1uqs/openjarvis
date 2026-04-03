@@ -373,6 +373,7 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
         event
     };
     let mut thread_context = ThreadContext::new(ThreadContextLocator::from(&locator), now);
+    assert!(thread_context.ensure_system_prompt_snapshot("session system snapshot", now));
     thread_context.enable_auto_compact();
     thread_context.store_turn_state(
         incoming.external_message_id.clone(),
@@ -403,12 +404,99 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
         .expect("thread state should load");
 
     assert_eq!(loaded.locator, ThreadContextLocator::from(&locator));
+    assert_eq!(
+        loaded.request_context_system_messages()[0].content,
+        "session system snapshot"
+    );
     assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
     assert!(loaded.compact_enabled(false));
     assert!(loaded.auto_compact_enabled(false));
     assert_eq!(loaded.load_tool_events().len(), 1);
     assert!(thread_state.thread_context.is_some());
     assert_eq!(thread_state.loaded_toolsets, vec!["demo".to_string()]);
+}
+
+#[tokio::test]
+async fn lock_thread_context_allows_live_mutation_and_explicit_persist() {
+    // 测试场景: 外部调用方应能通过 locator 锁定 live ThreadContext，
+    // 直接修改内存态，再显式持久化到 session store。
+    let manager = SessionManager::new();
+    let incoming = build_incoming("msg_lock_thread_context", "lock thread context");
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+    let now = Utc::now();
+
+    {
+        let mut thread_context = manager
+            .lock_thread_context(&locator, now)
+            .await
+            .expect("thread context should lock");
+        assert!(thread_context.ensure_system_prompt_snapshot("locked system snapshot", now));
+        thread_context.enable_auto_compact();
+    }
+
+    manager
+        .persist_thread_context(&locator, now)
+        .await
+        .expect("locked thread context should persist");
+
+    let loaded = manager
+        .load_thread_context(&locator)
+        .await
+        .expect("thread context should load")
+        .expect("thread context should exist");
+
+    assert_eq!(
+        loaded.request_context_system_messages()[0].content,
+        "locked system snapshot"
+    );
+    assert!(loaded.auto_compact_enabled(false));
+}
+
+#[tokio::test]
+async fn mutate_thread_context_persists_changes_without_manual_snapshot_roundtrip() {
+    // 测试场景: mutate API 应在 thread 级锁下直接修改并持久化，
+    // 不要求调用方自己 load clone 再 store。
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let manager_a = SessionManager::with_store(Arc::clone(&store))
+        .await
+        .expect("manager A should build");
+    let manager_b = SessionManager::with_store(Arc::clone(&store))
+        .await
+        .expect("manager B should build");
+    let incoming = build_incoming("msg_mutate_thread_context", "mutate thread context");
+    let locator = manager_a
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+    let now = Utc::now();
+
+    manager_a
+        .mutate_thread_context(&locator, now, |thread_context| {
+            assert!(thread_context.ensure_system_prompt_snapshot("mutated snapshot", now));
+            thread_context.enable_auto_compact();
+            Ok(())
+        })
+        .await
+        .expect("thread context should mutate and persist");
+
+    let locator_b = manager_b
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("manager B should resolve thread");
+    let loaded = manager_b
+        .load_thread_context(&locator_b)
+        .await
+        .expect("thread context should load")
+        .expect("thread context should exist");
+
+    assert_eq!(
+        loaded.request_context_system_messages()[0].content,
+        "mutated snapshot"
+    );
+    assert!(loaded.auto_compact_enabled(false));
 }
 
 #[tokio::test]
@@ -697,6 +785,7 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
         .expect("manager A should resolve thread");
     let now = Utc::now();
     let mut thread_context = ThreadContext::new(ThreadContextLocator::from(&locator_a), now);
+    assert!(thread_context.ensure_system_prompt_snapshot("sqlite system snapshot", now));
     thread_context.enable_auto_compact();
     thread_context.store_turn_state(
         None,
@@ -733,6 +822,10 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
         .expect("restored thread context should exist");
 
     assert_eq!(restored.turns.len(), 1);
+    assert_eq!(
+        restored.request_context_system_messages()[0].content,
+        "sqlite system snapshot"
+    );
     assert_eq!(restored.turns[0].messages[0].content, "这是压缩后的上下文");
     assert_eq!(restored.turns[0].messages[1].content, "继续");
     assert_eq!(restored.load_toolsets(), vec!["demo".to_string()]);

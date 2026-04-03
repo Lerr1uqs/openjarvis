@@ -58,7 +58,8 @@ pub struct IncomingMessage {
 
 当前 SessionManager 是 “内存热缓存 + SessionStore 持久化后端” 模型：
 
-- 进程内只缓存当前命中过的 Session / ThreadContext
+- 进程内缓存当前命中过的 Session 索引，以及每个 thread 对应的 live `ThreadContext`
+- 每个 live `ThreadContext` 都有独立 thread-level mutex，允许按 locator 锁定并修改线程运行态
 - cache miss 时会从 `SessionStore` 懒加载恢复 `ThreadContext`
 - 线程写入走 write-through，会先完成 `ThreadContext` 快照持久化，再更新热缓存
 - `ThreadContext` 快照写入带 revision/CAS，避免旧快照覆盖新状态

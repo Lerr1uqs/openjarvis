@@ -1,9 +1,10 @@
 //! Session cache and persistent thread-context storage orchestration.
 //!
 //! `SessionManager` owns the hot in-process cache for active sessions and delegates durable
-//! persistence to a pluggable `SessionStore` backend. The runtime only reads and writes
-//! `ThreadContext` snapshots through this boundary so thread recovery, tool state restoration,
-//! and external-message deduplication stay consistent across restarts.
+//! persistence to a pluggable `SessionStore` backend. The cache keeps one thread-level mutex for
+//! each live `ThreadContext`, while the store still persists detached snapshots so thread
+//! recovery, tool state restoration, and external-message deduplication stay consistent across
+//! restarts.
 
 pub mod store;
 
@@ -15,7 +16,7 @@ use crate::thread::{
 };
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::info;
 use uuid::Uuid;
 
@@ -167,7 +168,7 @@ pub struct Session {
     pub id: Uuid,
     pub key: SessionKey,
     pub threads: HashMap<Uuid, ThreadContext>,
-    created_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -184,16 +185,6 @@ impl Session {
             threads: HashMap::new(),
             created_at: now,
             updated_at: now,
-        }
-    }
-
-    fn from_record(record: StoredSessionRecord) -> Self {
-        Self {
-            id: record.id,
-            key: record.key,
-            threads: HashMap::new(),
-            created_at: record.created_at,
-            updated_at: record.updated_at,
         }
     }
 
@@ -268,8 +259,31 @@ pub struct StoredThreadState {
     pub tool_events: Vec<ThreadToolEvent>,
 }
 
+type SharedThreadContext = Arc<Mutex<ThreadContext>>;
+
+#[derive(Debug, Clone)]
+struct CachedSession {
+    id: Uuid,
+    key: SessionKey,
+    threads: HashMap<Uuid, SharedThreadContext>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl CachedSession {
+    fn from_record(record: StoredSessionRecord) -> Self {
+        Self {
+            id: record.id,
+            key: record.key,
+            threads: HashMap::new(),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
 pub struct SessionManager {
-    sessions: Mutex<HashMap<SessionKey, Session>>,
+    sessions: Mutex<HashMap<SessionKey, CachedSession>>,
     store: Arc<dyn SessionStore>,
 }
 
@@ -356,28 +370,13 @@ impl SessionManager {
             "resolved incoming thread identity"
         );
 
+        let _ = self
+            .ensure_thread_handle(&locator, Some(session_record.clone()), now)
+            .await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .entry(session_key.clone())
-            .or_insert_with(|| Session::from_record(session_record.clone()));
-        if !session.threads.contains_key(&locator.thread_id) {
-            if let Some(mut stored_thread) = self.store.load_thread_context(&locator).await? {
-                stored_thread.rebind_locator(ThreadContextLocator::from(&locator));
-                session.threads.insert(locator.thread_id, stored_thread);
-                info!(
-                    session_id = %locator.session_id,
-                    thread_id = %locator.thread_id,
-                    "restored thread context from session store"
-                );
-            } else {
-                let _ = session.load_or_create_thread(ThreadContextLocator::from(&locator), now);
-                info!(
-                    session_id = %locator.session_id,
-                    thread_id = %locator.thread_id,
-                    "created new thread context in session cache"
-                );
-            }
-        }
+            .or_insert_with(|| CachedSession::from_record(session_record.clone()));
         session.updated_at = now;
 
         Ok(locator)
@@ -410,38 +409,123 @@ impl SessionManager {
         &self,
         locator: &ThreadLocator,
     ) -> SessionStoreResult<Option<ThreadContext>> {
-        let session_key = locator.session_key();
-        let mut sessions = self.sessions.lock().await;
-        if let Some(thread_context) = sessions
-            .get(&session_key)
-            .and_then(|session| session.threads.get(&locator.thread_id))
-            .cloned()
-        {
-            return Ok(Some(thread_context));
+        if let Some(handle) = self.cached_thread_handle(locator).await {
+            return Ok(Some(handle.lock().await.clone()));
         }
 
-        if !sessions.contains_key(&session_key) {
-            let Some(session_record) = self.store.load_session(&session_key).await? else {
-                return Ok(None);
-            };
-            sessions.insert(session_key.clone(), Session::from_record(session_record));
-        }
-
-        let session = sessions
-            .get_mut(&session_key)
-            .expect("session should exist after store load");
-        if let Some(thread_context) = session.threads.get(&locator.thread_id).cloned() {
-            return Ok(Some(thread_context));
-        }
-
-        let Some(mut stored_thread) = self.store.load_thread_context(locator).await? else {
+        let Some((session_record, stored_thread)) =
+            self.fetch_thread_context_from_store(locator).await?
+        else {
             return Ok(None);
         };
-        stored_thread.rebind_locator(ThreadContextLocator::from(locator));
-        session
-            .threads
-            .insert(locator.thread_id, stored_thread.clone());
-        Ok(Some(stored_thread))
+        let cached = self
+            .cache_thread_handle_if_absent(
+                &locator.session_key(),
+                session_record,
+                locator.thread_id,
+                Arc::new(Mutex::new(stored_thread)),
+                Utc::now(),
+            )
+            .await;
+        Ok(Some(cached.lock().await.clone()))
+    }
+
+    /// Lock one live thread context for in-process mutation.
+    ///
+    /// Cache miss 会先从 store 恢复；store miss 会创建一个新的空线程上下文。
+    /// 调用方拿到 guard 后可以直接修改线程；如果需要持久化，应在释放 guard 后调用
+    /// `persist_thread_context(...)`，或者直接使用 `mutate_thread_context(...)`。
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     model::{IncomingMessage, ReplyTarget},
+    ///     session::SessionManager,
+    /// };
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn demo() -> openjarvis::session::SessionStoreResult<()> {
+    /// let manager = SessionManager::new();
+    /// let incoming = IncomingMessage {
+    ///     id: Uuid::new_v4(),
+    ///     external_message_id: Some("msg_1".to_string()),
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    ///     user_name: None,
+    ///     content: "hello".to_string(),
+    ///     external_thread_id: None,
+    ///     received_at: Utc::now(),
+    ///     metadata: json!({}),
+    ///     attachments: Vec::new(),
+    ///     reply_target: ReplyTarget {
+    ///         receive_id: "oc_xxx".to_string(),
+    ///         receive_id_type: "chat_id".to_string(),
+    ///     },
+    /// };
+    ///
+    /// let locator = manager.load_or_create_thread(&incoming).await?;
+    /// let mut thread_context = manager.lock_thread_context(&locator, incoming.received_at).await?;
+    /// thread_context.enable_auto_compact();
+    ///
+    /// assert!(thread_context.auto_compact_enabled(false));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn lock_thread_context(
+        &self,
+        locator: &ThreadLocator,
+        now: DateTime<Utc>,
+    ) -> SessionStoreResult<OwnedMutexGuard<ThreadContext>> {
+        let handle = self.ensure_thread_handle(locator, None, now).await?;
+        Ok(handle.lock_owned().await)
+    }
+
+    /// Persist the current cached thread context without appending a new turn.
+    ///
+    /// 这个入口适合配合 `lock_thread_context(...)` 使用: 调用方先拿到 guard 修改内存态，
+    /// 释放 guard 后再调用这里把当前缓存里的最新线程快照写回 store。
+    pub async fn persist_thread_context(
+        &self,
+        locator: &ThreadLocator,
+        updated_at: DateTime<Utc>,
+    ) -> SessionStoreResult<()> {
+        let handle = self.ensure_thread_handle(locator, None, updated_at).await?;
+        let snapshot = handle.lock().await.clone();
+        let persisted = self
+            .persist_thread_context_snapshot(locator, snapshot, updated_at)
+            .await?;
+        self.sync_thread_context_to_cache(&locator.session_key(), locator, &persisted, updated_at)
+            .await;
+        Ok(())
+    }
+
+    /// Mutate and persist one thread context in a single manager-owned critical section.
+    ///
+    /// 这个入口是对外推荐的修改方式: 它持有目标 thread 的锁，执行调用方的变更逻辑，
+    /// 然后把同一份线程快照写回 store 并更新 revision，避免“改完忘记持久化”。
+    pub async fn mutate_thread_context<R, F>(
+        &self,
+        locator: &ThreadLocator,
+        updated_at: DateTime<Utc>,
+        mutate: F,
+    ) -> SessionStoreResult<R>
+    where
+        F: FnOnce(&mut ThreadContext) -> SessionStoreResult<R>,
+    {
+        let mut thread_context = self.lock_thread_context(locator, updated_at).await?;
+        let result = mutate(&mut thread_context)?;
+        let persisted = self
+            .persist_thread_context_snapshot(locator, thread_context.clone(), updated_at)
+            .await?;
+        *thread_context = persisted;
+        info!(
+            thread_id = %locator.thread_id,
+            updated_at = %updated_at,
+            "mutated and persisted thread context through session manager"
+        );
+        Ok(result)
     }
 
     /// Load the current thread state snapshot, including persisted toolset metadata.
@@ -567,47 +651,15 @@ impl SessionManager {
     pub async fn store_thread_context(
         &self,
         locator: &ThreadLocator,
-        mut thread_context: ThreadContext,
+        thread_context: ThreadContext,
         updated_at: DateTime<Utc>,
     ) -> SessionStoreResult<()> {
         let session_key = locator.session_key();
-        let session_record = self
-            .store
-            .resolve_or_create_session(&session_key, updated_at)
+        let persisted = self
+            .persist_thread_context_snapshot(locator, thread_context, updated_at)
             .await?;
-        thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        match self
-            .store
-            .save_thread_context(&thread_context, updated_at, None)
-            .await
-        {
-            Ok(new_revision) => {
-                thread_context.set_revision(new_revision);
-            }
-            Err(SessionStoreError::RevisionConflict(_)) => {
-                let Some(latest) = self.reload_thread_context_from_store(locator).await? else {
-                    return Err(SessionStoreError::Other(anyhow::anyhow!(
-                        "thread `{}` disappeared during conflict recovery",
-                        locator.thread_id
-                    )));
-                };
-                let mut merged = merge_state_only_conflict_resolution(latest, &thread_context);
-                let new_revision = self
-                    .store
-                    .save_thread_context(&merged, updated_at, None)
-                    .await?;
-                merged.set_revision(new_revision);
-                thread_context = merged;
-            }
-            Err(error) => return Err(error),
-        }
-
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .entry(session_key)
-            .or_insert_with(|| Session::from_record(session_record));
-        session.threads.insert(locator.thread_id, thread_context);
-        session.updated_at = updated_at;
+        self.sync_thread_context_to_cache(&session_key, locator, &persisted, updated_at)
+            .await;
         Ok(())
     }
 
@@ -622,7 +674,7 @@ impl SessionManager {
         completed_at: DateTime<Utc>,
     ) -> SessionStoreResult<Uuid> {
         let session_key = locator.session_key();
-        let session_record = self
+        let _ = self
             .store
             .resolve_or_create_session(&session_key, completed_at)
             .await?;
@@ -657,12 +709,8 @@ impl SessionManager {
             )
             .await?;
 
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .entry(session_key)
-            .or_insert_with(|| Session::from_record(session_record));
-        session.threads.insert(locator.thread_id, thread_context);
-        session.updated_at = completed_at;
+        self.sync_thread_context_to_cache(&session_key, locator, &thread_context, completed_at)
+            .await;
         Ok(turn_id)
     }
 
@@ -679,7 +727,7 @@ impl SessionManager {
         tool_events: Vec<ThreadToolEvent>,
     ) -> SessionStoreResult<Uuid> {
         let session_key = locator.session_key();
-        let session_record = self
+        let _ = self
             .store
             .resolve_or_create_session(&session_key, completed_at)
             .await?;
@@ -720,50 +768,28 @@ impl SessionManager {
             )
             .await?;
 
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .entry(session_key)
-            .or_insert_with(|| Session::from_record(session_record));
-        session.threads.insert(locator.thread_id, thread_context);
-        session.updated_at = completed_at;
+        self.sync_thread_context_to_cache(&session_key, locator, &thread_context, completed_at)
+            .await;
         Ok(turn_id)
     }
 
     /// Return a cloned session snapshot for debugging or tests.
     pub async fn get_session(&self, key: &SessionKey) -> Option<Session> {
-        let sessions = self.sessions.lock().await;
-        sessions.get(key).map(|session| {
-            let mut session = session.clone();
-            session.updated_at = session.updated_at.max(session.created_at);
-            session
-        })
-    }
-
-    async fn reload_thread_context_from_store(
-        &self,
-        locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<ThreadContext>> {
-        let session_key = locator.session_key();
-        let mut sessions = self.sessions.lock().await;
-        if !sessions.contains_key(&session_key) {
-            if let Some(session_record) = self.store.load_session(&session_key).await? {
-                sessions.insert(session_key.clone(), Session::from_record(session_record));
-            } else {
-                return Ok(None);
-            }
+        let session = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(key).cloned()
+        }?;
+        let mut threads = HashMap::with_capacity(session.threads.len());
+        for (thread_id, thread_context) in session.threads {
+            threads.insert(thread_id, thread_context.lock().await.clone());
         }
-
-        let Some(mut thread_context) = self.store.load_thread_context(locator).await? else {
-            return Ok(None);
-        };
-        thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        let session = sessions
-            .get_mut(&session_key)
-            .expect("session should exist before store reload");
-        session
-            .threads
-            .insert(locator.thread_id, thread_context.clone());
-        Ok(Some(thread_context))
+        Some(Session {
+            id: session.id,
+            key: session.key,
+            threads,
+            created_at: session.created_at,
+            updated_at: session.updated_at.max(session.created_at),
+        })
     }
 
     async fn save_turn_snapshot_with_retry(
@@ -784,7 +810,7 @@ impl SessionManager {
                 Ok(thread_context)
             }
             Err(SessionStoreError::RevisionConflict(_)) => {
-                let Some(latest) = self.reload_thread_context_from_store(locator).await? else {
+                let Some(latest) = self.fetch_thread_context_from_store_only(locator).await? else {
                     return Err(SessionStoreError::Other(anyhow::anyhow!(
                         "thread `{}` disappeared during turn conflict recovery",
                         locator.thread_id
@@ -794,6 +820,186 @@ impl SessionManager {
                 let new_revision = self
                     .store
                     .save_thread_context(&merged, updated_at, dedup_record)
+                    .await?;
+                merged.set_revision(new_revision);
+                Ok(merged)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cached_thread_handle(&self, locator: &ThreadLocator) -> Option<SharedThreadContext> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(&locator.session_key())
+            .and_then(|session| session.threads.get(&locator.thread_id))
+            .cloned()
+    }
+
+    async fn ensure_thread_handle(
+        &self,
+        locator: &ThreadLocator,
+        session_record: Option<StoredSessionRecord>,
+        now: DateTime<Utc>,
+    ) -> SessionStoreResult<SharedThreadContext> {
+        if let Some(handle) = self.cached_thread_handle(locator).await {
+            return Ok(handle);
+        }
+
+        let session_key = locator.session_key();
+        let session_record = match session_record {
+            Some(record) => record,
+            None => {
+                self.store
+                    .resolve_or_create_session(&session_key, now)
+                    .await?
+            }
+        };
+        let persisted_thread = self.fetch_thread_context_from_store_only(locator).await?;
+        let restored_from_store = persisted_thread.is_some();
+        let thread_context = persisted_thread
+            .unwrap_or_else(|| ThreadContext::new(ThreadContextLocator::from(locator), now));
+        let handle = self
+            .cache_thread_handle_if_absent(
+                &session_key,
+                session_record,
+                locator.thread_id,
+                Arc::new(Mutex::new(thread_context)),
+                now,
+            )
+            .await;
+        info!(
+            session_id = %locator.session_id,
+            thread_id = %locator.thread_id,
+            restored_from_store,
+            "ensured thread context handle in session cache"
+        );
+        Ok(handle)
+    }
+
+    async fn cache_thread_handle_if_absent(
+        &self,
+        session_key: &SessionKey,
+        session_record: StoredSessionRecord,
+        thread_id: Uuid,
+        thread_context: SharedThreadContext,
+        updated_at: DateTime<Utc>,
+    ) -> SharedThreadContext {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .entry(session_key.clone())
+            .or_insert_with(|| CachedSession::from_record(session_record));
+        session.updated_at = updated_at;
+        Arc::clone(
+            session
+                .threads
+                .entry(thread_id)
+                .or_insert_with(|| thread_context),
+        )
+    }
+
+    async fn sync_thread_context_to_cache(
+        &self,
+        session_key: &SessionKey,
+        locator: &ThreadLocator,
+        thread_context: &ThreadContext,
+        updated_at: DateTime<Utc>,
+    ) {
+        let existing_handle = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .entry(session_key.clone())
+                .or_insert_with(|| CachedSession {
+                    id: locator.session_id,
+                    key: session_key.clone(),
+                    threads: HashMap::new(),
+                    created_at: updated_at,
+                    updated_at,
+                });
+            session.updated_at = updated_at;
+            session.threads.get(&locator.thread_id).cloned()
+        };
+
+        if let Some(handle) = existing_handle {
+            let mut cached_thread = handle.lock().await;
+            *cached_thread = thread_context.clone();
+            return;
+        }
+
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .entry(session_key.clone())
+            .or_insert_with(|| CachedSession {
+                id: locator.session_id,
+                key: session_key.clone(),
+                threads: HashMap::new(),
+                created_at: updated_at,
+                updated_at,
+            });
+        session.updated_at = updated_at;
+        session
+            .threads
+            .entry(locator.thread_id)
+            .or_insert_with(|| Arc::new(Mutex::new(thread_context.clone())));
+    }
+
+    async fn fetch_thread_context_from_store(
+        &self,
+        locator: &ThreadLocator,
+    ) -> SessionStoreResult<Option<(StoredSessionRecord, ThreadContext)>> {
+        let session_key = locator.session_key();
+        let Some(session_record) = self.store.load_session(&session_key).await? else {
+            return Ok(None);
+        };
+        let Some(thread_context) = self.fetch_thread_context_from_store_only(locator).await? else {
+            return Ok(None);
+        };
+        Ok(Some((session_record, thread_context)))
+    }
+
+    async fn fetch_thread_context_from_store_only(
+        &self,
+        locator: &ThreadLocator,
+    ) -> SessionStoreResult<Option<ThreadContext>> {
+        let Some(mut thread_context) = self.store.load_thread_context(locator).await? else {
+            return Ok(None);
+        };
+        thread_context.rebind_locator(ThreadContextLocator::from(locator));
+        Ok(Some(thread_context))
+    }
+
+    async fn persist_thread_context_snapshot(
+        &self,
+        locator: &ThreadLocator,
+        mut thread_context: ThreadContext,
+        updated_at: DateTime<Utc>,
+    ) -> SessionStoreResult<ThreadContext> {
+        let session_key = locator.session_key();
+        let _ = self
+            .store
+            .resolve_or_create_session(&session_key, updated_at)
+            .await?;
+        thread_context.rebind_locator(ThreadContextLocator::from(locator));
+        match self
+            .store
+            .save_thread_context(&thread_context, updated_at, None)
+            .await
+        {
+            Ok(new_revision) => {
+                thread_context.set_revision(new_revision);
+                Ok(thread_context)
+            }
+            Err(SessionStoreError::RevisionConflict(_)) => {
+                let Some(latest) = self.fetch_thread_context_from_store_only(locator).await? else {
+                    return Err(SessionStoreError::Other(anyhow::anyhow!(
+                        "thread `{}` disappeared during conflict recovery",
+                        locator.thread_id
+                    )));
+                };
+                let mut merged = merge_state_only_conflict_resolution(latest, &thread_context);
+                let new_revision = self
+                    .store
+                    .save_thread_context(&merged, updated_at, None)
                     .await?;
                 merged.set_revision(new_revision);
                 Ok(merged)
@@ -812,6 +1018,9 @@ fn merge_state_only_conflict_resolution(
     {
         latest.state.features = desired.state.features.clone();
     }
+    if !desired.request_context_system_messages().is_empty() {
+        latest.state.request_context = desired.state.request_context.clone();
+    }
     if !desired.state.approval.pending.is_empty() || !desired.state.approval.decisions.is_empty() {
         latest.state.approval = desired.state.approval.clone();
     }
@@ -824,6 +1033,12 @@ fn merge_turn_conflict_resolution(
     mut pending_turn_snapshot: ThreadContext,
 ) -> ThreadContext {
     pending_turn_snapshot.state.features = latest.state.features.clone();
+    if pending_turn_snapshot
+        .request_context_system_messages()
+        .is_empty()
+    {
+        pending_turn_snapshot.state.request_context = latest.state.request_context.clone();
+    }
     pending_turn_snapshot.state.approval = latest.state.approval.clone();
     pending_turn_snapshot.set_revision(latest.revision());
     pending_turn_snapshot

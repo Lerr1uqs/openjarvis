@@ -18,7 +18,7 @@
 - `ChatToolCall`
   assistant 发起的一次工具调用描述。
 - `MessageContext`
-  LLM 上下文容器，按 `system`、`memory`、`chat` 三段组织消息。
+  已废弃的兼容 LLM 上下文容器，按 `system`、`memory`、`chat` 三段组织消息。
 - `RenderedPrompt`
   面向兼容层的简化渲染结果。
 - `ContextTokenKind`
@@ -29,3 +29,4 @@
 - 这里负责“消息和预算概念如何表示”。
 - 这里不负责“预算如何估算”，那是 `compact/budget.rs` 的职责。
 - 这里也不负责“消息如何落盘到 thread/session”，那是 `thread.rs` 和 `session.rs` 的职责。
+- Router 和 Worker 主链路不再从这里组装 `MessageContext`。

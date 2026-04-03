@@ -686,11 +686,17 @@ async fn router_preserves_large_history_before_next_turn() {
     let recorded = sent.lock().await.clone();
 
     assert_eq!(observed_requests.len(), 2);
-    assert!(observed_requests[0].history.is_empty());
-    assert_eq!(observed_requests[1].history.len(), 7);
+    assert!(
+        observed_requests[0]
+            .thread_context
+            .load_messages()
+            .is_empty()
+    );
+    assert_eq!(observed_requests[1].thread_context.load_messages().len(), 7);
     assert_eq!(
         observed_requests[1]
-            .history
+            .thread_context
+            .load_messages()
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
@@ -1658,7 +1664,7 @@ fn spawn_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread.clone(),
+                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: vec![ChatMessage::new(
@@ -1720,7 +1726,7 @@ fn spawn_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread.clone(),
+                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: vec![
@@ -1792,7 +1798,7 @@ fn spawn_truncation_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread.clone(),
+                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: turn_messages,
@@ -1821,7 +1827,7 @@ fn spawn_truncation_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread.clone(),
+                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             messages: vec![ChatMessage::new(
@@ -1871,7 +1877,7 @@ fn spawn_single_turn_mock_agent_loop(
         event_tx
             .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
                 thread_context: request.thread_context.clone(),
-                active_thread: request.thread.clone(),
+                active_thread: request.thread_context.to_conversation_thread(),
                 locator: request.locator,
                 incoming: request.incoming,
                 messages: vec![ChatMessage::new(
@@ -1898,7 +1904,7 @@ fn spawn_compact_mock_agent_loop(
             .recv()
             .await
             .expect("compact mock agent should receive one request");
-        let mut active_thread = request.thread.clone();
+        let mut active_thread = request.thread_context.to_conversation_thread();
         active_thread.turns = vec![openjarvis::thread::ConversationTurn::new(
             None,
             vec![

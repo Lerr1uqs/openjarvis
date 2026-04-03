@@ -41,9 +41,6 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
                 ThreadContextLocator::from(&locator),
                 ConversationThread::with_id(locator.thread_id, "default", incoming.received_at),
             ),
-            thread: ConversationThread::with_id(locator.thread_id, "default", incoming.received_at),
-            history: Vec::new(),
-            loaded_toolsets: Vec::new(),
         })
         .await
         .expect("request should be accepted");
@@ -160,13 +157,6 @@ async fn worker_builds_context_from_history_and_current_user_message() {
             ),
             locator,
             incoming,
-            thread,
-            history: vec![ChatMessage::new(
-                ChatMessageRole::Assistant,
-                "previous reply",
-                Utc::now(),
-            )],
-            loaded_toolsets: Vec::new(),
         })
         .await
         .expect("request should be accepted");
@@ -230,9 +220,6 @@ async fn worker_failed_turn_preserves_provider_error_chain() {
                 ThreadContextLocator::from(&locator),
                 ConversationThread::with_id(locator.thread_id, "default", Utc::now()),
             ),
-            thread: ConversationThread::with_id(locator.thread_id, "default", Utc::now()),
-            history: Vec::new(),
-            loaded_toolsets: Vec::new(),
         })
         .await
         .expect("request should be accepted");
@@ -250,6 +237,105 @@ async fn worker_failed_turn_preserves_provider_error_chain() {
         }
         other => panic!("unexpected first event: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn worker_preserves_existing_thread_system_prompt_snapshot() {
+    // 测试场景: 旧线程首次补齐 system prompt snapshot 后，后续轮次即使 worker 配置变化，也必须继续使用原快照。
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let first_worker = AgentWorker::builder()
+        .llm(Arc::new(RecordingProvider {
+            requests: Arc::clone(&first_requests),
+        }))
+        .system_prompt("system prompt A")
+        .build()
+        .expect("first worker should build");
+    let first_handle = first_worker.spawn();
+    let first_incoming = build_incoming("hello");
+    let locator = SessionManager::new()
+        .load_or_create_thread(&first_incoming)
+        .await
+        .expect("thread should resolve");
+
+    first_handle
+        .request_tx
+        .send(AgentRequest {
+            locator: locator.clone(),
+            incoming: first_incoming.clone(),
+            thread_context: ThreadContext::from_conversation_thread(
+                ThreadContextLocator::from(&locator),
+                ConversationThread::with_id(
+                    locator.thread_id,
+                    "default",
+                    first_incoming.received_at,
+                ),
+            ),
+        })
+        .await
+        .expect("first request should be accepted");
+
+    let first_events = collect_events(first_handle.event_rx, 2).await;
+    let preserved_thread_context = match &first_events[1] {
+        AgentWorkerEvent::TurnCompleted(turn) => {
+            assert_eq!(
+                turn.thread_context.request_context_system_messages()[0].content,
+                "system prompt A"
+            );
+            turn.thread_context.clone()
+        }
+        other => panic!("unexpected first worker completion event: {other:?}"),
+    };
+    let first_captured_requests = first_requests.lock().await;
+    assert_eq!(
+        first_captured_requests[0].messages[0].content,
+        "system prompt A"
+    );
+    drop(first_captured_requests);
+
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let second_worker = AgentWorker::builder()
+        .llm(Arc::new(RecordingProvider {
+            requests: Arc::clone(&second_requests),
+        }))
+        .system_prompt("system prompt B")
+        .build()
+        .expect("second worker should build");
+    let second_handle = second_worker.spawn();
+    let second_incoming = build_incoming("follow up");
+
+    second_handle
+        .request_tx
+        .send(AgentRequest {
+            locator,
+            incoming: second_incoming.clone(),
+            thread_context: preserved_thread_context.clone(),
+        })
+        .await
+        .expect("second request should be accepted");
+
+    let second_events = collect_events(second_handle.event_rx, 2).await;
+    match &second_events[1] {
+        AgentWorkerEvent::TurnCompleted(turn) => {
+            assert_eq!(
+                turn.thread_context.request_context_system_messages()[0].content,
+                "system prompt A"
+            );
+        }
+        other => panic!("unexpected second worker completion event: {other:?}"),
+    }
+
+    let second_captured_requests = second_requests.lock().await;
+    assert_eq!(
+        second_captured_requests[0].messages[0].content,
+        "system prompt A"
+    );
+    assert_eq!(
+        second_captured_requests[0]
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("follow up")
+    );
 }
 
 async fn collect_events(

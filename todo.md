@@ -19,6 +19,7 @@
 - [ ] 旧的 CompactRuntimeManager 兼容缓存 取出
 - [ ] /clear 会把该线程的 ChatMessages、tool events、loaded toolsets、/auto-compact 等线程级状态 ??? events是什么？
 - [ ] mcp server as toolset?
+codex resume 019d511c-18c5-70a1-9636-87c66f63bbb5
 
 # clean
 - [ ] sidecar

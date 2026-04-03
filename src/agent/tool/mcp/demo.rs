@@ -15,6 +15,10 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
+use tracing::info;
+
+const DEMO_HTTP_READY_PREFIX: &str = "OPENJARVIS_DEMO_HTTP_READY=";
 
 /// Run one internal demo MCP subcommand.
 pub async fn run_internal_demo_command(command: &InternalMcpCommand) -> Result<()> {
@@ -50,10 +54,24 @@ pub async fn run_demo_http_server(bind: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind demo http mcp server to {bind}"))?;
+    let base_url = format!("http://{}/mcp", listener.local_addr()?);
+
+    announce_demo_http_server_ready(&base_url)?;
+    info!(%base_url, "demo http mcp server ready");
 
     axum::serve(listener, router)
         .await
         .context("demo http mcp server exited unexpectedly")
+}
+
+fn announce_demo_http_server_ready(base_url: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{DEMO_HTTP_READY_PREFIX}{base_url}")
+        .context("failed to write demo http mcp server ready line")?;
+    stdout
+        .flush()
+        .context("failed to flush demo http mcp server ready line")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]

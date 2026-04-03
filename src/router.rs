@@ -629,18 +629,16 @@ impl ChannelRouter {
         locator: ThreadLocator,
         message: IncomingMessage,
     ) -> Result<()> {
-        let thread_state = self.sessions.load_thread_state(&locator).await?;
-        let thread_context = thread_state
-            .thread_context
+        let thread_context = self
+            .sessions
+            .load_thread_context(&locator)
+            .await?
             .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
         if let Err(error) = self
             .agent_tx
             .send(AgentRequest {
                 locator: locator.clone(),
                 incoming: message.clone(),
-                thread: thread_context.to_conversation_thread(),
-                history: thread_context.load_messages(),
-                loaded_toolsets: thread_context.load_toolsets(),
                 thread_context,
             })
             .await

@@ -8,7 +8,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChatMessageRole {
     System,
-    Memory,
+    Memory, // TODO: 没有这个东西
     User,
     Assistant,
     Toolcall,
@@ -40,7 +40,7 @@ pub struct ChatToolCall {
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: ChatMessageRole,
     pub content: String,
@@ -81,8 +81,10 @@ impl ChatMessage {
 }
 
 pub type Messages = Vec<ChatMessage>;
+#[deprecated(note = "use ThreadContext and AgentLoop::run_v1 instead")]
 pub type ContextMessage = MessageContext;
 
+#[deprecated(note = "use ThreadContext and AgentLoop::run_v1 instead")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageContext {
     pub system: Vec<ChatMessage>,
@@ -96,6 +98,7 @@ pub struct RenderedPrompt {
     pub user_message: String,
 }
 
+#[allow(deprecated)]
 impl MessageContext {
     /// Create a context initialized with one system prompt message.
     pub fn with_system_prompt(system_prompt: impl Into<String>) -> Self {
