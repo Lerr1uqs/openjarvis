@@ -5,7 +5,7 @@ use clap::Parser;
 use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentLoopEventKind, AgentRequest, AgentRuntime, AgentWorker,
-        AgentWorkerEvent, AgentWorkerHandle, CompletedAgentTurn, FailedAgentTurn,
+        AgentWorkerEvent, AgentWorkerHandle, CompletedAgentCommit, FailedAgentCommit,
     },
     channels::{Channel, ChannelRegistration},
     cli::OpenJarvisCli,
@@ -519,7 +519,7 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
     let locator = observed_requests[0].locator.clone();
     let history = router
         .sessions()
-        .load_turn(&locator)
+        .load_messages(&locator)
         .await
         .expect("history should load");
     let session = router
@@ -668,7 +668,7 @@ async fn router_preserves_large_history_before_next_turn() {
     let locator = observed_requests[0].locator.clone();
     let history = router
         .sessions()
-        .load_turn(&locator)
+        .load_messages(&locator)
         .await
         .expect("history should load");
     let session = router
@@ -1257,7 +1257,7 @@ async fn router_failed_turn_replies_with_full_error_chain() {
     let send_task = tokio::spawn(async move {
         let active_thread = empty_thread(locator.thread_id, &locator.external_thread_id);
         event_tx
-            .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
+            .send(AgentWorkerEvent::CommitFailed(FailedAgentCommit {
                 thread_context: thread_context_from_locator(&locator, active_thread.clone()),
                 active_thread,
                 locator,
@@ -1267,7 +1267,7 @@ async fn router_failed_turn_replies_with_full_error_chain() {
                 completed_at: Utc::now(),
             }))
             .await
-            .expect("failed turn should be sent");
+            .expect("failed commit should be sent");
     });
 
     let driver = async {
@@ -1325,7 +1325,7 @@ async fn router_failed_turn_replies_with_full_error_chain() {
         .threads
         .values()
         .next()
-        .expect("thread should exist after failed turn");
+        .expect("thread should exist after failed commit");
     assert_eq!(thread.turns.len(), 1);
     assert!(
         thread.turns[0].messages[1]
@@ -1417,7 +1417,7 @@ async fn router_command_message_does_not_enter_existing_session() {
     let locator = observed_requests[0].locator.clone();
     let history = router
         .sessions()
-        .load_turn(&locator)
+        .load_messages(&locator)
         .await
         .expect("history should load");
     let session = router
@@ -1662,23 +1662,23 @@ fn spawn_mock_agent_loop(
                         .await
                         .expect("first dispatch should be sent");
                     event_tx
-                        .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                        .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
                             active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
-                            messages: vec![ChatMessage::new(
+                            commit_messages: vec![ChatMessage::new(
                                 ChatMessageRole::Assistant,
                                 "reply-first",
                                 Utc::now(),
                             )],
-                            prepend_incoming_user: true,
+                            persist_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
-                        .expect("first completed turn should be sent");
+                        .expect("first completed commit should be sent");
                 }
                 1 => {
                     event_tx
@@ -1724,12 +1724,12 @@ fn spawn_mock_agent_loop(
                         .await
                         .expect("final text dispatch should be sent");
                     event_tx
-                        .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                        .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
                             active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
-                            messages: vec![
+                            commit_messages: vec![
                                 ChatMessage::new(ChatMessageRole::Assistant, "", Utc::now())
                                     .with_tool_calls(vec![ChatToolCall {
                                         id: "call_mock_1".to_string(),
@@ -1744,13 +1744,13 @@ fn spawn_mock_agent_loop(
                                     Utc::now(),
                                 ),
                             ],
-                            prepend_incoming_user: true,
+                            persist_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
-                        .expect("second completed turn should be sent");
+                        .expect("second completed commit should be sent");
                 }
                 _ => unreachable!("mock agent only scripts two requests"),
             }
@@ -1773,7 +1773,7 @@ fn spawn_truncation_mock_agent_loop(
 
             match step {
                 0 => {
-                    let mut turn_messages = Vec::new();
+                    let mut commit_messages = Vec::new();
                     for index in 1..=6 {
                         let content = format!("message_{index}");
                         event_tx
@@ -1789,26 +1789,26 @@ fn spawn_truncation_mock_agent_loop(
                             )))
                             .await
                             .expect("truncation dispatch should be sent");
-                        turn_messages.push(ChatMessage::new(
+                        commit_messages.push(ChatMessage::new(
                             ChatMessageRole::Assistant,
                             content,
                             Utc::now(),
                         ));
                     }
                     event_tx
-                        .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                        .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
                             active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
-                            messages: turn_messages,
-                            prepend_incoming_user: true,
+                            commit_messages,
+                            persist_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
-                        .expect("truncation completed turn should be sent");
+                        .expect("truncation completed commit should be sent");
                 }
                 1 => {
                     event_tx
@@ -1825,23 +1825,23 @@ fn spawn_truncation_mock_agent_loop(
                         .await
                         .expect("final truncation dispatch should be sent");
                     event_tx
-                        .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                        .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
                             active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
-                            messages: vec![ChatMessage::new(
+                            commit_messages: vec![ChatMessage::new(
                                 ChatMessageRole::Assistant,
                                 "final-after-truncation",
                                 Utc::now(),
                             )],
-                            prepend_incoming_user: true,
+                            persist_incoming_user: true,
                             loaded_toolsets: Vec::new(),
                             tool_events: Vec::new(),
                             completed_at: Utc::now(),
                         }))
                         .await
-                        .expect("final truncation completed turn should be sent");
+                        .expect("final truncation completed commit should be sent");
                 }
                 _ => unreachable!("truncation mock agent only scripts two requests"),
             }
@@ -1858,7 +1858,7 @@ fn spawn_single_turn_mock_agent_loop(
         let request = request_rx
             .recv()
             .await
-            .expect("single-turn mock agent should receive one request");
+            .expect("single-commit mock agent should receive one request");
         observed_requests.lock().await.push(request.clone());
 
         event_tx
@@ -1873,25 +1873,25 @@ fn spawn_single_turn_mock_agent_loop(
                 true,
             )))
             .await
-            .expect("single-turn dispatch should be sent");
+            .expect("single-commit dispatch should be sent");
         event_tx
-            .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+            .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                 thread_context: request.thread_context.clone(),
                 active_thread: request.thread_context.to_conversation_thread(),
                 locator: request.locator,
                 incoming: request.incoming,
-                messages: vec![ChatMessage::new(
+                commit_messages: vec![ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "reply-single",
                     Utc::now(),
                 )],
-                prepend_incoming_user: true,
+                persist_incoming_user: true,
                 loaded_toolsets: Vec::new(),
                 tool_events: Vec::new(),
                 completed_at: Utc::now(),
             }))
             .await
-            .expect("single-turn completed turn should be sent");
+            .expect("single-commit completed commit should be sent");
     })
 }
 
@@ -1929,7 +1929,7 @@ fn spawn_compact_mock_agent_loop(
             .await
             .expect("compact dispatch should be sent");
         event_tx
-            .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+            .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                 thread_context: thread_context_from_locator(
                     &request.locator,
                     active_thread.clone(),
@@ -1937,18 +1937,18 @@ fn spawn_compact_mock_agent_loop(
                 active_thread,
                 locator: request.locator,
                 incoming: request.incoming,
-                messages: vec![ChatMessage::new(
+                commit_messages: vec![ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "reply-after-compact",
                     Utc::now(),
                 )],
-                prepend_incoming_user: false,
+                persist_incoming_user: false,
                 loaded_toolsets: Vec::new(),
                 tool_events: Vec::new(),
                 completed_at: Utc::now(),
             }))
             .await
-            .expect("compact completed turn should be sent");
+            .expect("compact completed commit should be sent");
     })
 }
 

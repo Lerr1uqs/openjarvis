@@ -3,15 +3,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        CompactToolProjection, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
-        ToolRegistry, ToolsetCatalogEntry, empty_tool_input_schema,
+        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
+        ToolsetCatalogEntry, empty_tool_input_schema,
     },
-    compact::ContextBudgetReport,
-    context::ContextTokenKind,
     thread::{ThreadContext, ThreadContextLocator},
 };
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 struct DemoRegistryTool;
@@ -55,42 +52,34 @@ async fn builtin_tools_can_be_registered_together() {
 }
 
 #[tokio::test]
-async fn compact_tool_visibility_is_projected_per_thread() {
+async fn compact_tool_visibility_is_controlled_by_request_state() {
     let registry = ToolRegistry::with_skill_roots(Vec::new());
     registry
         .register_builtin_tools()
         .await
         .expect("builtin tools should register");
 
+    let thread_context = ThreadContext::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_registry_compact",
+            "thread_registry_compact",
+        ),
+        Utc::now(),
+    );
     let without_compact = registry
-        .list_for_thread("thread_registry_compact")
+        .list_for_context_with_compact(&thread_context, false)
         .await
         .expect("tool listing should succeed");
     assert!(!without_compact.iter().any(|tool| tool.name == "compact"));
 
-    // 测试场景: 只有在 auto-compact projection 可见时，compact tool 才对当前线程暴露。
-    registry
-        .set_compact_tool_projection(
-            "thread_registry_compact",
-            Some(CompactToolProjection {
-                auto_compact: true,
-                visible: true,
-                budget_report: ContextBudgetReport::new(
-                    HashMap::from([
-                        (ContextTokenKind::System, 10),
-                        (ContextTokenKind::Chat, 80),
-                        (ContextTokenKind::VisibleTool, 20),
-                        (ContextTokenKind::ReservedOutput, 32),
-                    ]),
-                    200,
-                ),
-            }),
-        )
-        .await;
+    // 测试场景: 只有在当前 request state 显式要求暴露时，compact tool 才对模型可见。
     let with_compact = registry
-        .list_for_thread("thread_registry_compact")
-        .await
-        .expect("tool listing should succeed after projection");
+        .list_for_context_with_compact(&thread_context, true)
+        .await;
+    let with_compact = with_compact.expect("tool listing should succeed after request expose");
 
     assert!(with_compact.iter().any(|tool| tool.name == "compact"));
 }

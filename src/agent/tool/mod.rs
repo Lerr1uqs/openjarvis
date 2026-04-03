@@ -9,9 +9,8 @@ pub mod skill;
 pub mod toolset;
 pub mod write;
 
-use crate::compact::ContextBudgetReport;
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
-use crate::thread::{ThreadCompactToolProjection, ThreadContext, ThreadContextLocator};
+use crate::thread::{ThreadContext, ThreadContextLocator};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -196,38 +195,10 @@ enum RegisteredToolset {
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct CompactToolProjection {
-    pub auto_compact: bool,
-    pub visible: bool,
-    pub budget_report: ContextBudgetReport,
-}
-
-impl From<CompactToolProjection> for ThreadCompactToolProjection {
-    fn from(value: CompactToolProjection) -> Self {
-        Self {
-            auto_compact: value.auto_compact,
-            visible: value.visible,
-            budget_report: value.budget_report,
-        }
-    }
-}
-
-impl From<ThreadCompactToolProjection> for CompactToolProjection {
-    fn from(value: ThreadCompactToolProjection) -> Self {
-        Self {
-            auto_compact: value.auto_compact,
-            visible: value.visible,
-            budget_report: value.budget_report,
-        }
-    }
-}
-
 pub struct ToolRegistry {
     // AGENT-TODO: 对String起别名
     always_visible_handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
     toolsets: RwLock<HashMap<String, RegisteredToolset>>,
-    compact_tool_projections: RwLock<HashMap<String, CompactToolProjection>>,
     thread_runtimes: Arc<toolset::ThreadToolRuntimeManager>,
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
@@ -271,7 +242,6 @@ impl ToolRegistry {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
-            compact_tool_projections: RwLock::new(HashMap::new()),
             thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::new()),
@@ -295,7 +265,6 @@ impl ToolRegistry {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
-            compact_tool_projections: RwLock::new(HashMap::new()),
             thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
@@ -462,11 +431,18 @@ impl ToolRegistry {
         &self,
         thread_context: &ThreadContext,
     ) -> Result<Vec<ToolDefinition>> {
+        self.list_for_context_with_compact(thread_context, false)
+            .await
+    }
+
+    /// Return the thread-scoped visible tool definitions and optionally expose `compact`.
+    pub async fn list_for_context_with_compact(
+        &self,
+        thread_context: &ThreadContext,
+        compact_visible: bool,
+    ) -> Result<Vec<ToolDefinition>> {
         let mut definitions = self.list_for_context_static(thread_context).await?;
-        if thread_context
-            .compact_tool_projection()
-            .is_some_and(|projection| projection.auto_compact && projection.visible)
-        {
+        if compact_visible {
             definitions.push(compact_tool_definition());
         }
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -534,6 +510,88 @@ impl ToolRegistry {
         }
     }
 
+    /// Open one optional tool entry for the current thread.
+    ///
+    /// At the moment this maps to loading one named toolset.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::ToolRegistry,
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let registry = ToolRegistry::new();
+    /// let mut thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// let _opened = registry.open_tool(&mut thread_context, "browser").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_tool(
+        &self,
+        thread_context: &mut ThreadContext,
+        tool_name: &str,
+    ) -> Result<bool> {
+        let tool_name = tool_name.trim();
+        if tool_name.is_empty() {
+            bail!("open_tool requires a non-empty tool name");
+        }
+
+        self.resolve_toolset_handlers(tool_name).await?;
+        Ok(thread_context.load_toolset(tool_name))
+    }
+
+    /// Close one optional tool entry for the current thread.
+    ///
+    /// At the moment this maps to unloading one named toolset.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::ToolRegistry,
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let registry = ToolRegistry::new();
+    /// let mut thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// let _closed = registry.close_tool(&mut thread_context, "browser").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn close_tool(
+        &self,
+        thread_context: &mut ThreadContext,
+        tool_name: &str,
+    ) -> Result<bool> {
+        let tool_name = tool_name.trim();
+        if tool_name.is_empty() {
+            bail!("close_tool requires a non-empty tool name");
+        }
+
+        let thread_id = thread_context.locator.thread_id.clone();
+        let is_loaded = thread_context
+            .load_toolsets()
+            .into_iter()
+            .any(|loaded_name| loaded_name == tool_name);
+        if is_loaded && let Ok(Some(runtime)) = self.resolve_toolset_runtime(tool_name).await {
+            runtime.on_unload(&thread_id).await?;
+        }
+
+        Ok(thread_context.unload_toolset(tool_name))
+    }
+
     /// Return the compact toolset catalog prompt for one thread context.
     pub async fn catalog_prompt_for_context(
         &self,
@@ -581,17 +639,6 @@ impl ToolRegistry {
         if !loaded_toolsets.is_empty() {
             thread_context.replace_loaded_toolsets(loaded_toolsets);
         }
-
-        let projection = self
-            .compact_tool_projections
-            .read()
-            .await
-            .get(&thread_id)
-            .cloned()
-            .map(Into::into);
-        if projection.is_some() {
-            thread_context.set_compact_tool_projection(projection);
-        }
     }
 
     /// Sync one `ThreadContext` back into the deprecated thread-id keyed compatibility caches.
@@ -600,16 +647,6 @@ impl ToolRegistry {
         self.thread_runtimes
             .replace_loaded_toolsets(&thread_id, &thread_context.load_toolsets())
             .await;
-
-        let mut projections = self.compact_tool_projections.write().await;
-        match thread_context.compact_tool_projection().cloned() {
-            Some(projection) => {
-                projections.insert(thread_id, projection.into());
-            }
-            None => {
-                projections.remove(&thread_context.locator.thread_id);
-            }
-        }
     }
 
     /// Replace one thread runtime from persisted thread metadata.
@@ -628,24 +665,6 @@ impl ToolRegistry {
     #[deprecated(note = "use ThreadContext::load_toolsets instead")]
     pub async fn loaded_toolsets_for_thread(&self, thread_id: &str) -> Vec<String> {
         self.thread_runtimes.loaded_toolsets(thread_id).await
-    }
-
-    /// Update one thread's dynamic compact-tool visibility projection.
-    #[deprecated(note = "use ThreadContext::set_compact_tool_projection instead")]
-    pub async fn set_compact_tool_projection(
-        &self,
-        thread_id: &str,
-        projection: Option<CompactToolProjection>,
-    ) {
-        let mut projections = self.compact_tool_projections.write().await;
-        match projection {
-            Some(projection) => {
-                projections.insert(thread_id.to_string(), projection);
-            }
-            None => {
-                projections.remove(thread_id);
-            }
-        }
     }
 
     /// Return the thread-scoped visible tool definitions for one internal thread id.
@@ -835,12 +854,7 @@ impl ToolRegistry {
     ) -> Result<ToolCallResult> {
         let args: ManageToolsetArguments = parse_tool_arguments(request, "load_toolset")?;
         let toolset_name = args.name.trim();
-        if toolset_name.is_empty() {
-            bail!("load_toolset requires a non-empty `name`");
-        }
-
-        self.resolve_toolset_handlers(toolset_name).await?;
-        let inserted = thread_context.load_toolset(toolset_name);
+        let inserted = self.open_tool(thread_context, toolset_name).await?;
         let loaded_toolsets = thread_context.load_toolsets();
 
         Ok(ToolCallResult {
@@ -868,20 +882,7 @@ impl ToolRegistry {
     ) -> Result<ToolCallResult> {
         let args: ManageToolsetArguments = parse_tool_arguments(request, "unload_toolset")?;
         let toolset_name = args.name.trim();
-        if toolset_name.is_empty() {
-            bail!("unload_toolset requires a non-empty `name`");
-        }
-
-        let thread_id = thread_context.locator.thread_id.clone();
-        let is_loaded = thread_context
-            .load_toolsets()
-            .into_iter()
-            .any(|loaded_name| loaded_name == toolset_name);
-        if is_loaded && let Ok(Some(runtime)) = self.resolve_toolset_runtime(toolset_name).await {
-            runtime.on_unload(&thread_id).await?;
-        }
-
-        let removed = thread_context.unload_toolset(toolset_name);
+        let removed = self.close_tool(thread_context, toolset_name).await?;
         let loaded_toolsets = thread_context.load_toolsets();
 
         Ok(ToolCallResult {

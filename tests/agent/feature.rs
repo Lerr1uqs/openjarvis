@@ -8,7 +8,7 @@ use openjarvis::{
     compact::ContextBudgetReport,
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
-    thread::{ThreadCompactToolProjection, ThreadContext, ThreadContextLocator},
+    thread::{ThreadContext, ThreadContextLocator},
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -38,7 +38,7 @@ impl ToolHandler for DemoFeatureTool {
 
 #[tokio::test]
 async fn feature_prompt_rebuilder_rebuilds_fixed_slots_from_all_providers() {
-    // 测试场景: rebuilder 只负责写入静态 features_system_prompt 和 live memory；
+    // 测试场景: rebuilder 只负责写入静态 features_system_prompt；
     // 动态 context capacity 由 AutoCompactor 单独注入 transient runtime system message。
     let fixture = SkillFixture::new("openjarvis-feature-rebuilder");
     fixture.write_skill(
@@ -76,31 +76,21 @@ Read `guide.md` before replying.
         now,
     );
     assert!(thread_context.load_toolset("demo"));
-    thread_context.replace_request_memory_messages(vec![ChatMessage::new(
-        ChatMessageRole::Memory,
-        "remember feature memory",
-        now,
-    )]);
-    thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-        auto_compact: true,
-        visible: true,
-        budget_report: ContextBudgetReport::new(
-            HashMap::from([
-                (ContextTokenKind::System, 24),
-                (ContextTokenKind::Memory, 8),
-                (ContextTokenKind::Chat, 180),
-                (ContextTokenKind::VisibleTool, 16),
-                (ContextTokenKind::ReservedOutput, 16),
-            ]),
-            256,
-        ),
-    }));
+    let budget_report = ContextBudgetReport::new(
+        HashMap::from([
+            (ContextTokenKind::System, 24),
+            (ContextTokenKind::Chat, 180),
+            (ContextTokenKind::VisibleTool, 16),
+            (ContextTokenKind::ReservedOutput, 16),
+        ]),
+        256,
+    );
 
     rebuilder
-        .rebuild(&mut thread_context)
+        .rebuild(&mut thread_context, true)
         .await
         .expect("feature prompts should rebuild");
-    auto_compactor.notify_capacity(&mut thread_context);
+    auto_compactor.notify_capacity(&mut thread_context, Some(&budget_report));
 
     let features_system_prompt = thread_context.features_system_prompt();
     assert!(
@@ -137,18 +127,13 @@ Read `guide.md` before replying.
         .iter()
         .position(|message| message.content.contains("<context capacity"))
         .expect("dynamic capacity prompt should exist");
-    let memory_index = exported_messages
-        .iter()
-        .position(|message| message.content == "remember feature memory")
-        .expect("memory prompt should exist");
 
     assert!(auto_compact_index < capacity_index);
-    assert!(capacity_index < memory_index);
 }
 
 #[tokio::test]
 async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
-    // 测试场景: provider rebuild 只能更新 features_system_prompt 和 live memory，不能改写 persisted history。
+    // 测试场景: provider rebuild 只能更新 features_system_prompt，不能改写 persisted history。
     let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
     registry
         .register_builtin_tools()
@@ -181,7 +166,7 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
     );
 
     rebuilder
-        .rebuild(&mut thread_context)
+        .rebuild(&mut thread_context, false)
         .await
         .expect("feature prompts should rebuild");
 
@@ -227,22 +212,18 @@ async fn auto_compactor_injects_capacity_as_transient_runtime_system_message() {
         ),
         now,
     );
-    thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-        auto_compact: true,
-        visible: true,
-        budget_report: ContextBudgetReport::new(
-            HashMap::from([
-                (ContextTokenKind::System, 32),
-                (ContextTokenKind::Memory, 8),
-                (ContextTokenKind::Chat, 160),
-                (ContextTokenKind::VisibleTool, 16),
-                (ContextTokenKind::ReservedOutput, 16),
-            ]),
-            256,
-        ),
-    }));
+    let budget_report = ContextBudgetReport::new(
+        HashMap::from([
+            (ContextTokenKind::System, 32),
+            (ContextTokenKind::Memory, 8),
+            (ContextTokenKind::Chat, 160),
+            (ContextTokenKind::VisibleTool, 16),
+            (ContextTokenKind::ReservedOutput, 16),
+        ]),
+        256,
+    );
 
-    auto_compactor.notify_capacity(&mut thread_context);
+    auto_compactor.notify_capacity(&mut thread_context, Some(&budget_report));
 
     assert!(
         thread_context

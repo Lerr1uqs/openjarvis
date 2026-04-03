@@ -17,15 +17,14 @@
 - `AgentWorkerHandle`
   Router 持有的 worker 通道句柄。
 - `AgentWorkerEvent`
-  Worker 回传事件，分为 `Dispatch / TurnCompleted / TurnFailed`。
+  Worker 回传事件，分为 `Dispatch / CommitCompleted / CommitFailed`。
 
 ## 核心能力
 
 - 持有一个长生命周期 inbox。
-- 在请求进入 Loop 前把兼容态线程状态并回 `ThreadContext`。
 - 只把 `incoming + ThreadContext` 交给 `AgentLoop`，不在 worker 里拼装完整请求消息上下文。
 - 把 Agent 的流式事件转发给 Router。
-- 在成功和失败两条路径上都返回完整线程执行结果。
+- 在成功和失败两条路径上都返回完整线程执行结果，以及本轮要持久化的 commit payload。
 
 ## 使用方式
 

@@ -39,9 +39,9 @@
   始终可见的基础工具，不需要额外加载即可给模型使用。
 - `Thread-scoped Toolset`
   只对当前 thread 生效的工具集，可按需加载、按需卸载。
-- `CompactToolProjection`
-  给模型展示的 compact 相关工具投影，携带线程当前上下文预算快照。
-  当 `auto_compact` 开启时，当前线程会始终暴露 `compact`，并在每次 generate 时配合预算提示一起提供给模型。
+- `compact request visibility`
+  `compact` 是否对模型可见由当前 request state 决定，不再持久化在线程状态里。
+  当 `auto_compact` 开启时，当前 request 会暴露 `compact`，并在每次 generate 时配合预算提示一起提供给模型。
 
 ## 工具分层
 

@@ -398,10 +398,19 @@ impl SessionManager {
     ///     thread_id: Uuid::new_v4(),
     /// };
     ///
-    /// let _future = manager.load_turn(&locator);
+    /// let _future = manager.load_messages(&locator);
     /// ```
-    pub async fn load_turn(&self, locator: &ThreadLocator) -> SessionStoreResult<Vec<ChatMessage>> {
+    pub async fn load_messages(
+        &self,
+        locator: &ThreadLocator,
+    ) -> SessionStoreResult<Vec<ChatMessage>> {
         Ok(self.load_thread_state(locator).await?.messages)
+    }
+
+    /// Backward-compatible alias for [`SessionManager::load_messages`].
+    #[deprecated(note = "use `load_messages` instead")]
+    pub async fn load_turn(&self, locator: &ThreadLocator) -> SessionStoreResult<Vec<ChatMessage>> {
+        self.load_messages(locator).await
     }
 
     /// Load the current thread context snapshot for one channel/user/thread tuple.
@@ -578,7 +587,7 @@ impl SessionManager {
             .await
     }
 
-    /// Store one completed turn for the provided channel/user/thread tuple.
+    /// Persist one completed message commit for the provided channel/user/thread tuple.
     ///
     /// # 示例
     /// ```rust
@@ -595,7 +604,7 @@ impl SessionManager {
     ///     external_thread_id: "default".to_string(),
     ///     thread_id: Uuid::new_v4(),
     /// };
-    /// let _future = manager.store_turn(
+    /// let _future = manager.commit_messages(
     ///     &locator,
     ///     Some("msg_1".to_string()),
     ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", Utc::now())],
@@ -603,7 +612,7 @@ impl SessionManager {
     ///     Utc::now(),
     /// );
     /// ```
-    pub async fn store_turn(
+    pub async fn commit_messages(
         &self,
         locator: &ThreadLocator,
         external_message_id: Option<String>,
@@ -611,7 +620,7 @@ impl SessionManager {
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     ) -> SessionStoreResult<Uuid> {
-        self.store_turn_with_state(
+        self.commit_messages_with_state(
             locator,
             external_message_id,
             messages,
@@ -623,8 +632,8 @@ impl SessionManager {
         .await
     }
 
-    /// Store one completed turn together with persisted thread tool runtime metadata.
-    pub async fn store_turn_with_state(
+    /// Persist one completed message commit together with thread runtime state.
+    pub async fn commit_messages_with_state(
         &self,
         locator: &ThreadLocator,
         external_message_id: Option<String>,
@@ -634,7 +643,7 @@ impl SessionManager {
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
     ) -> SessionStoreResult<Uuid> {
-        self.store_turn_with_active_thread(
+        self.commit_messages_with_active_thread(
             locator,
             None,
             external_message_id,
@@ -663,8 +672,8 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Store one completed turn after optionally replacing the current active thread context.
-    pub async fn store_turn_with_thread_context(
+    /// Persist one completed message commit after optionally replacing the active thread context.
+    pub async fn commit_messages_with_thread_context(
         &self,
         locator: &ThreadLocator,
         thread_context: Option<ThreadContext>,
@@ -685,7 +694,7 @@ impl SessionManager {
             }),
         };
         thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        let turn_id = thread_context.store_turn(
+        let commit_id = thread_context.store_turn(
             external_message_id.clone(),
             messages,
             started_at,
@@ -697,7 +706,7 @@ impl SessionManager {
                 .map(|message_id| ExternalMessageDedupRecord {
                     thread_id: locator.thread_id,
                     external_message_id: message_id.clone(),
-                    turn_id: Some(turn_id),
+                    turn_id: Some(commit_id),
                     completed_at,
                 });
         thread_context = self
@@ -711,11 +720,11 @@ impl SessionManager {
 
         self.sync_thread_context_to_cache(&session_key, locator, &thread_context, completed_at)
             .await;
-        Ok(turn_id)
+        Ok(commit_id)
     }
 
-    /// Store one completed turn after optionally replacing the current active thread history.
-    pub async fn store_turn_with_active_thread(
+    /// Persist one completed message commit after optionally replacing the active thread history.
+    pub async fn commit_messages_with_active_thread(
         &self,
         locator: &ThreadLocator,
         active_thread: Option<ConversationThread>,
@@ -738,11 +747,11 @@ impl SessionManager {
             info!(
                 thread_id = %locator.thread_id,
                 turn_count = active_thread.turns.len(),
-                "replacing active thread history before storing turn"
+                "replacing active thread history before persisting message commit"
             );
             thread_context.overwrite_active_history_from_conversation_thread(&active_thread);
         }
-        let turn_id = thread_context.store_turn_state(
+        let commit_id = thread_context.store_turn_state(
             external_message_id.clone(),
             messages,
             started_at,
@@ -756,7 +765,7 @@ impl SessionManager {
                 .map(|message_id| ExternalMessageDedupRecord {
                     thread_id: locator.thread_id,
                     external_message_id: message_id.clone(),
-                    turn_id: Some(turn_id),
+                    turn_id: Some(commit_id),
                     completed_at,
                 });
         thread_context = self
@@ -770,7 +779,99 @@ impl SessionManager {
 
         self.sync_thread_context_to_cache(&session_key, locator, &thread_context, completed_at)
             .await;
-        Ok(turn_id)
+        Ok(commit_id)
+    }
+
+    /// Backward-compatible alias for [`SessionManager::commit_messages`].
+    #[deprecated(note = "use `commit_messages` instead")]
+    pub async fn store_turn(
+        &self,
+        locator: &ThreadLocator,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    ) -> SessionStoreResult<Uuid> {
+        self.commit_messages(
+            locator,
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+        )
+        .await
+    }
+
+    /// Backward-compatible alias for [`SessionManager::commit_messages_with_state`].
+    #[deprecated(note = "use `commit_messages_with_state` instead")]
+    pub async fn store_turn_with_state(
+        &self,
+        locator: &ThreadLocator,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        loaded_toolsets: Vec<String>,
+        tool_events: Vec<ThreadToolEvent>,
+    ) -> SessionStoreResult<Uuid> {
+        self.commit_messages_with_state(
+            locator,
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+            loaded_toolsets,
+            tool_events,
+        )
+        .await
+    }
+
+    /// Backward-compatible alias for [`SessionManager::commit_messages_with_thread_context`].
+    #[deprecated(note = "use `commit_messages_with_thread_context` instead")]
+    pub async fn store_turn_with_thread_context(
+        &self,
+        locator: &ThreadLocator,
+        thread_context: Option<ThreadContext>,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    ) -> SessionStoreResult<Uuid> {
+        self.commit_messages_with_thread_context(
+            locator,
+            thread_context,
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+        )
+        .await
+    }
+
+    /// Backward-compatible alias for [`SessionManager::commit_messages_with_active_thread`].
+    #[deprecated(note = "use `commit_messages_with_active_thread` instead")]
+    pub async fn store_turn_with_active_thread(
+        &self,
+        locator: &ThreadLocator,
+        active_thread: Option<ConversationThread>,
+        external_message_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        loaded_toolsets: Vec<String>,
+        tool_events: Vec<ThreadToolEvent>,
+    ) -> SessionStoreResult<Uuid> {
+        self.commit_messages_with_active_thread(
+            locator,
+            active_thread,
+            external_message_id,
+            messages,
+            started_at,
+            completed_at,
+            loaded_toolsets,
+            tool_events,
+        )
+        .await
     }
 
     /// Return a cloned session snapshot for debugging or tests.

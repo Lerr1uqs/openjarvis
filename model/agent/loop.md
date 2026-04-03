@@ -19,23 +19,23 @@
 - `AgentLoopEvent`
   Router 可直接回发的结构化事件。
 - `AgentLoopOutput`
-  单轮最终结果，包含 turn messages、thread_context 和元数据。
+  单轮最终结果，包含 commit messages、thread_context 和元数据。
 - `FeaturePromptRebuilder`
-  loop 在请求前调用的固定 provider 编排器，负责把静态 feature system prompt 和 live memory 写回 `ThreadContext`。
+  loop 在请求前调用的固定 provider 编排器，负责把静态 feature system prompt 写回 `ThreadContext`。
 - `AutoCompactor`
   loop 在预算刷新后调用的动态容量注入器，负责把瞬时 context capacity 提示写入 `ThreadContext.live_system_messages`。
 
 ## 核心能力
 
 - 基于 `ThreadContext` 计算当前线程可见工具。
-- 在每次 generate 前先 rebuild `features_system_prompt` / live memory，再通过 `ThreadContext.messages()` 导出完整请求。
-- 通过 `FeaturePromptProvider` 注入 toolset catalog、skill catalog、auto-compact 稳定说明和 memory。
+- 在每次 generate 前先 rebuild `features_system_prompt`，再通过 `ThreadContext.messages()` 导出完整请求。
+- 通过 `FeaturePromptProvider` 注入 toolset catalog、skill catalog 和 auto-compact 稳定说明。
 - 通过 `AutoCompactor::notify_capacity(...)` 注入 auto-compact 的动态 context capacity 提示。
 - 通过 `thread.push_message(...)` 把当前轮 user / assistant / tool 消息并入 live chat。
 - 在每次 generate 前估算预算，并按需触发 runtime compact。
 - 支持模型主动调用 `compact`，也支持系统被动 compact。
 - 将文本输出、工具调用、工具结果实时事件化，而不是只在结尾返回一次结果。
-- 把工具审计事件先挂到 `pending_tool_events`，等 turn 落盘时再绑定。
+- 把工具审计事件先挂到 `pending_tool_events`，等 commit 落盘时再绑定。
 
 ## 使用方式
 

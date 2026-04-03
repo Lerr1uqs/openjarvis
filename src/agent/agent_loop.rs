@@ -9,22 +9,23 @@ use super::{
 #[allow(deprecated)]
 use crate::context::{ChatMessage, ChatMessageRole, ContextMessage, Messages};
 use crate::{
-    agent::{FeaturePromptBuildContext, FeaturePromptOutput}, compact::{
+    compact::{
         CompactAllChatStrategy, CompactManager, CompactProvider, CompactScopeKey, CompactSummary,
         CompactionOutcome, ContextBudgetEstimator, ContextBudgetReport, LLMCompactProvider,
         StaticCompactProvider,
-    }, config::{AgentCompactConfig, LLMConfig}, llm::{LLMProvider, LLMRequest}, model::{IncomingMessage, ReplyTarget}, session::ThreadLocator, thread::{
-        ConversationThread, ThreadCompactToolProjection, ThreadContext, ThreadToolEvent,
-        ThreadToolEventKind,
-    }
+    },
+    config::{AgentCompactConfig, LLMConfig},
+    llm::{LLMProvider, LLMRequest},
+    model::{IncomingMessage, ReplyTarget},
+    thread::{ConversationThread, ThreadContext, ThreadToolEvent, ThreadToolEventKind},
 };
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::{
+use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-}};
+};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -202,8 +203,8 @@ pub struct AgentLoopOutput {
     pub reply: String,
     pub metadata: Value,
     pub events: Vec<AgentLoopEvent>,
-    pub turn_messages: Vec<ChatMessage>,
-    pub prepend_incoming_user: bool,
+    pub commit_messages: Vec<ChatMessage>,
+    pub persist_incoming_user: bool,
     pub thread_context: ThreadContext,
     pub active_thread: ConversationThread,
     pub loaded_toolsets: Vec<String>,
@@ -218,19 +219,18 @@ pub struct AgentLoop {
     compact_manager: CompactManager,
     feature_prompts: FeaturePromptRebuilder,
     auto_compactor: AutoCompactor,
-
-    // ex 实验性质：判断thread有没有初始化
-    thread_inited_ex: HashMap<ThreadLocator, bool>,
+    thread_system_prompt: Option<String>,
 }
 
 impl AgentLoop {
     /// Create an agent loop bound to one LLM provider and runtime container.
     pub fn new(llm: Arc<dyn LLMProvider>, runtime: AgentRuntime) -> Self {
-        Self::with_compact_config(
+        Self::with_compact_config_and_system_prompt(
             llm,
             runtime,
             LLMConfig::default(),
             AgentCompactConfig::default(),
+            None::<String>,
         )
     }
 
@@ -241,8 +241,32 @@ impl AgentLoop {
         llm_config: LLMConfig,
         compact_config: AgentCompactConfig,
     ) -> Self {
+        Self::with_compact_config_and_system_prompt(
+            llm,
+            runtime,
+            llm_config,
+            compact_config,
+            None::<String>,
+        )
+    }
+
+    /// Create an agent loop with explicit compact config and one thread-init system prompt.
+    pub fn with_compact_config_and_system_prompt(
+        llm: Arc<dyn LLMProvider>,
+        runtime: AgentRuntime,
+        llm_config: LLMConfig,
+        compact_config: AgentCompactConfig,
+        thread_system_prompt: impl Into<Option<String>>,
+    ) -> Self {
         let compact_provider = build_compact_provider(&llm, &compact_config);
-        Self::with_compact_provider(llm, runtime, llm_config, compact_config, compact_provider)
+        Self::with_compact_provider_and_system_prompt(
+            llm,
+            runtime,
+            llm_config,
+            compact_config,
+            compact_provider,
+            thread_system_prompt,
+        )
     }
 
     /// Create an agent loop with an explicitly injected compact provider.
@@ -253,14 +277,30 @@ impl AgentLoop {
         compact_config: AgentCompactConfig,
         compact_provider: Arc<dyn CompactProvider>,
     ) -> Self {
+        Self::with_compact_provider_and_system_prompt(
+            llm,
+            runtime,
+            llm_config,
+            compact_config,
+            compact_provider,
+            None::<String>,
+        )
+    }
+
+    /// Create an agent loop with an explicitly injected compact provider and thread-init prompt.
+    pub fn with_compact_provider_and_system_prompt(
+        llm: Arc<dyn LLMProvider>,
+        runtime: AgentRuntime,
+        llm_config: LLMConfig,
+        compact_config: AgentCompactConfig,
+        compact_provider: Arc<dyn CompactProvider>,
+        thread_system_prompt: impl Into<Option<String>>,
+    ) -> Self {
         let budget_estimator = ContextBudgetEstimator::from_config(&llm_config, &compact_config);
         let compact_manager =
             CompactManager::new(compact_provider, Arc::new(CompactAllChatStrategy));
         let feature_prompts = FeaturePromptRebuilder::new(runtime.tools(), compact_config.clone());
         let auto_compactor = AutoCompactor::new(compact_config.clone());
-
-        // ex add
-        let thread_inited_ex: HashMap<ThreadLocator, bool> = HashMap::new();
 
         Self {
             llm,
@@ -270,7 +310,7 @@ impl AgentLoop {
             compact_manager,
             feature_prompts,
             auto_compactor,
-            thread_inited_ex,
+            thread_system_prompt: thread_system_prompt.into(),
         }
     }
 
@@ -288,9 +328,13 @@ impl AgentLoop {
         input: InfoContext,
         context: &ContextMessage,
     ) -> Result<AgentLoopOutput> {
-        let mut thread_context = build_thread_context_from_legacy_context(&input, context);
-        seed_legacy_live_messages(&mut thread_context, context)?;
-        self.run_live_thread(input.event_tx, thread_context).await
+        let thread_context = build_thread_context_from_legacy_context(&input, context);
+        self.run_live_thread(
+            input.event_tx,
+            thread_context,
+            current_user_message_from_context(context)?,
+        )
+        .await
     }
 
     /// ReAct contract:
@@ -303,438 +347,33 @@ impl AgentLoop {
         &self,
         event_tx: AgentEventSender,
         incoming: &IncomingMessage,
-        mut thread_context: ThreadContext,
+        thread_context: ThreadContext,
     ) -> Result<AgentLoopOutput> {
-        thread_context.clear_live_messages();
-        thread_context.push_message(ChatMessage::new(
-            ChatMessageRole::User,
-            incoming.content.clone(),
-            incoming.received_at,
-        ));
-        self.run_live_thread(event_tx, thread_context).await
+        self.run_live_thread(event_tx, thread_context, incoming_message(incoming))
+            .await
     }
 
     async fn run_live_thread(
         &self,
         event_tx: AgentEventSender,
         mut thread_context: ThreadContext,
+        current_message: ChatMessage,
     ) -> Result<AgentLoopOutput> {
         let compact_scope_key = CompactScopeKey::new(
             thread_context.locator.channel.clone(),
             thread_context.locator.user_id.clone(),
             thread_context.locator.external_thread_id.clone(),
         );
-        self.runtime.tools().register_builtin_tools().await?;
-        self.runtime
-            .tools()
-            .sync_legacy_thread_state(&thread_context)
-            .await;
-        self.runtime
-            .compact_runtime()
-            .sync_legacy_scope_overrides(&compact_scope_key, &thread_context)
-            .await;
-        let hooks = self.runtime.hooks();
-        let thread_locator = thread_context.locator.clone();
-        let thread_id = thread_locator.thread_id.clone();
-        hooks
-            .emit(HookEvent {
-                kind: HookEventKind::UserPromptSubmit,
-                payload: json!({
-                    "channel": thread_locator.channel,
-                    "user_id": thread_locator.user_id,
-                    "thread_id": thread_id,
-                }),
-            })
+        thread_context.clear_live_messages();
+        self.prepare_thread_runtime(&compact_scope_key, &mut thread_context)
             .await?;
-
-        let mut events = Vec::new();
-        let mut turn_messages = Vec::new();
-        let mut prepend_incoming_user = true;
-        let mut used_tool_names = Vec::new();
-        let mut last_visible_tools = Vec::new();
-        let mut last_budget_report = None;
-        let mut skip_next_runtime_compact = false;
-
-        let loop_result = async {
-            let reply = loop {
-                let request_state = self.prepare_request_state(&mut thread_context).await?;
-                last_visible_tools = request_state.tools.clone();
-                last_budget_report = Some(request_state.budget_report.clone());
-
-                if !skip_next_runtime_compact
-                    && self.should_runtime_compact(
-                        request_state.compact_enabled,
-                        &request_state.budget_report,
-                    )
-                {
-                    if let Some(outcome) = self
-                        .execute_working_chat_compaction(
-                            &hooks,
-                            &thread_id,
-                            &mut thread_context,
-                            &mut turn_messages,
-                            &mut prepend_incoming_user,
-                            "runtime_threshold",
-                            &request_state.budget_report,
-                        )
-                        .await?
-                    {
-                        let compact_event = build_compact_event(
-                            "runtime_threshold",
-                            false,
-                            false,
-                            &request_state.budget_report,
-                            Some(&outcome),
-                            None,
-                            None,
-                        );
-                        event_tx.send(compact_event.clone()).await?;
-                        events.push(compact_event);
-                        skip_next_runtime_compact = true;
-                        continue;
-                    }
-                }
-                skip_next_runtime_compact = false;
-
-                let RequestState {
-                    messages,
-                    tools,
-                    budget_report,
-                    compact_enabled,
-                } = request_state;
-
-                let response = self.llm.generate(LLMRequest { messages, tools }).await?;
-
-                if response.tool_calls.is_empty() {
-                    let assistant_message = response
-                        .message
-                        .context("llm response did not contain assistant text or tool calls")?;
-                    if assistant_message.content.trim().is_empty() {
-                        bail!("llm final response did not contain assistant text");
-                    }
-
-                    let text_event = AgentLoopEvent {
-                        kind: AgentLoopEventKind::TextOutput,
-                        content: assistant_message.content.clone(),
-                        metadata: json!({
-                            "source": "llm_response",
-                            "is_final": true,
-                        }),
-                    };
-                    event_tx.send(text_event.clone()).await?;
-                    events.push(text_event);
-                    thread_context.push_message(assistant_message.clone());
-                    turn_messages.push(assistant_message.clone());
-                    break assistant_message.content;
-                }
-
-                let assistant_tool_message = build_assistant_tool_call_message(
-                    response.message.as_ref(),
-                    &response.tool_calls,
-                );
-                if let Some(message) = response.message.as_ref()
-                    && !message.content.trim().is_empty()
-                {
-                    let text_event = AgentLoopEvent {
-                        kind: AgentLoopEventKind::TextOutput,
-                        content: message.content.clone(),
-                        metadata: json!({
-                            "source": "llm_response",
-                            "is_final": false,
-                        }),
-                    };
-                    event_tx.send(text_event.clone()).await?;
-                    events.push(text_event);
-                }
-
-                thread_context.push_message(assistant_tool_message.clone());
-                turn_messages.push(assistant_tool_message);
-
-                let mut restart_loop_after_compaction = false;
-                for provider_tool_call in response.tool_calls {
-                    let tool_call = ToolCallRequest {
-                        name: provider_tool_call.name.clone(),
-                        arguments: provider_tool_call.arguments.clone(),
-                    };
-                    let tool_call_event = AgentLoopEvent {
-                        kind: AgentLoopEventKind::ToolCall,
-                        content: format!(
-                            "[openjarvis][tool_call] {} {}",
-                            tool_call.name, tool_call.arguments
-                        ),
-                        metadata: json!({
-                            "tool": tool_call.name,
-                            "arguments": tool_call.arguments,
-                            "tool_call_id": provider_tool_call.id.clone(),
-                        }),
-                    };
-                    event_tx.send(tool_call_event.clone()).await?;
-                    events.push(tool_call_event.clone());
-                    hooks
-                        .emit(HookEvent {
-                            kind: HookEventKind::PreToolUse,
-                            payload: tool_call_event.metadata.clone(),
-                        })
-                        .await?;
-
-                    used_tool_names.push(tool_call.name.clone());
-                    if tool_call.name == "compact" {
-                        if !compact_enabled {
-                            let error_message = "compact runtime is disabled".to_string();
-                            hooks
-                                .emit(HookEvent {
-                                    kind: HookEventKind::PostToolUseFailure,
-                                    payload: json!({
-                                        "tool": tool_call.name.clone(),
-                                        "error": error_message.clone(),
-                                    }),
-                                })
-                                .await?;
-                            let compact_event = build_compact_event(
-                                "tool_requested",
-                                true,
-                                true,
-                                &budget_report,
-                                None,
-                                Some(&provider_tool_call.id),
-                                Some(&error_message),
-                            );
-                            event_tx.send(compact_event.clone()).await?;
-                            events.push(compact_event.clone());
-                            thread_context.record_tool_event(build_compact_thread_tool_event(
-                                &tool_call,
-                                &provider_tool_call.id,
-                                compact_event.metadata.clone(),
-                                true,
-                            ));
-                            continue;
-                        }
-
-                        match self
-                            .execute_working_chat_compaction(
-                                &hooks,
-                                &thread_id,
-                                &mut thread_context,
-                                &mut turn_messages,
-                                &mut prepend_incoming_user,
-                                "tool_requested",
-                                &budget_report,
-                            )
-                            .await
-                        {
-                            Ok(outcome) => {
-                                let compact_metadata = build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    false,
-                                    &budget_report,
-                                    outcome.as_ref(),
-                                    Some(&provider_tool_call.id),
-                                    None,
-                                )
-                                .metadata
-                                .clone();
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUse,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "result": compact_metadata,
-                                        }),
-                                    })
-                                    .await?;
-                                let compact_event = build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    false,
-                                    &budget_report,
-                                    outcome.as_ref(),
-                                    Some(&provider_tool_call.id),
-                                    None,
-                                );
-                                event_tx.send(compact_event.clone()).await?;
-                                events.push(compact_event.clone());
-                                thread_context.record_tool_event(build_compact_thread_tool_event(
-                                    &tool_call,
-                                    &provider_tool_call.id,
-                                    compact_event.metadata.clone(),
-                                    false,
-                                ));
-                                if outcome.is_some() {
-                                    skip_next_runtime_compact = true;
-                                    restart_loop_after_compaction = true;
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                let error_message = error.to_string();
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUseFailure,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "error": error_message.clone(),
-                                        }),
-                                    })
-                                    .await?;
-                                let compact_event = build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    true,
-                                    &budget_report,
-                                    None,
-                                    Some(&provider_tool_call.id),
-                                    Some(&error_message),
-                                );
-                                event_tx.send(compact_event.clone()).await?;
-                                events.push(compact_event.clone());
-                                thread_context.record_tool_event(build_compact_thread_tool_event(
-                                    &tool_call,
-                                    &provider_tool_call.id,
-                                    compact_event.metadata.clone(),
-                                    true,
-                                ));
-                            }
-                        }
-                        continue;
-                    }
-
-                    let tool_result =
-                        match self.call_thread_tool(&mut thread_context, &tool_call).await {
-                            Ok(result) => {
-                                let result_metadata = result.metadata.clone();
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUse,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "result": result_metadata,
-                                        }),
-                                    })
-                                    .await?;
-                                result
-                            }
-                            Err(error) => {
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUseFailure,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "error": error.to_string(),
-                                        }),
-                                    })
-                                    .await?;
-                                super::ToolCallResult {
-                                    content: error.to_string(),
-                                    metadata: json!({
-                                        "tool": tool_call.name.clone(),
-                                    }),
-                                    is_error: true,
-                                }
-                            }
-                        };
-                    thread_context.record_tool_event(build_thread_tool_event(
-                        &tool_call,
-                        &provider_tool_call.id,
-                        &tool_result,
-                    ));
-
-                    let tool_result_content =
-                        format_tool_result_content(&tool_result.content, tool_result.is_error);
-                    let tool_result_event = AgentLoopEvent {
-                        kind: AgentLoopEventKind::ToolResult,
-                        content: format!("[openjarvis][tool_result] {}", tool_result_content),
-                        metadata: json!({
-                            "tool": tool_call.name.clone(),
-                            "is_error": tool_result.is_error,
-                            "metadata": tool_result.metadata,
-                            "tool_call_id": provider_tool_call.id.clone(),
-                        }),
-                    };
-                    event_tx.send(tool_result_event.clone()).await?;
-                    events.push(tool_result_event);
-
-                    let tool_result_message = ChatMessage::new(
-                        ChatMessageRole::ToolResult,
-                        tool_result_content,
-                        Utc::now(),
-                    )
-                    .with_tool_call_id(provider_tool_call.id.clone());
-                    thread_context.push_message(tool_result_message.clone());
-                    turn_messages.push(tool_result_message);
-                }
-
-                if restart_loop_after_compaction {
-                    continue;
-                }
-            };
-
-            let mcp_server_count = self.runtime.tools().mcp().list_servers().await.len();
-            let hook_handler_count = hooks.len().await;
-            let metadata = json!({
-                "tool_count": last_visible_tools.len(),
-                "mcp_server_count": mcp_server_count,
-                "hook_handler_count": hook_handler_count,
-                "used_tool_name": used_tool_names.first().cloned(),
-                "used_tool_names": used_tool_names,
-                "loaded_toolsets": thread_context.load_toolsets(),
-                "event_count": events.len(),
-                "context_budget": last_budget_report,
-            });
-
-            hooks
-                .emit(HookEvent {
-                    kind: HookEventKind::Notification,
-                    payload: json!({
-                        "reply_preview": reply,
-                        "runtime": metadata,
-                    }),
-                })
-                .await?;
-
-            thread_context.clear_live_messages();
-
-            Ok(AgentLoopOutput {
-                reply,
-                metadata,
-                events,
-                turn_messages,
-                prepend_incoming_user,
-                active_thread: thread_context.to_conversation_thread(),
-                loaded_toolsets: thread_context.load_toolsets(),
-                tool_events: thread_context.pending_tool_events().to_vec(),
-                thread_context,
-            })
+        if !self.thread_is_initialized(&thread_context) {
+            self.thread_init(&mut thread_context).await?;
         }
-        .await;
-        loop_result
-    }
-
-    // 实验性改动
-    async fn run_ex(
-        &self,
-        event_tx: AgentEventSender,
-        mut thread_context: ThreadContext,
-    ) -> Result<AgentLoopOutput> {
-        let compact_scope_key = CompactScopeKey::new(
-            thread_context.locator.channel.clone(),
-            thread_context.locator.user_id.clone(),
-            thread_context.locator.external_thread_id.clone(),
-        );
-        self.runtime.tools().register_builtin_tools().await?;// TODO: 移动到init里面
-        // self.runtime
-            // .tools();
-            // .sync_legacy_thread_state(&thread_context)
-            // .await;
-        // self.runtime
-        //     .compact_runtime()
-        //     .sync_legacy_scope_overrides(&compact_scope_key, &thread_context)
-        //     .await;
-
+        thread_context.push_message(current_message);
         let hooks = self.runtime.hooks();
         let thread_locator = thread_context.locator.clone();
         let thread_id = thread_locator.thread_id.clone();
-
         hooks
             .emit(HookEvent {
                 kind: HookEventKind::UserPromptSubmit,
@@ -747,12 +386,11 @@ impl AgentLoop {
             .await?;
 
         let mut events = Vec::new();
-        let mut turn_messages = Vec::new();
-        let mut prepend_incoming_user = true;
+        let mut commit_messages = Vec::new();
+        let mut persist_incoming_user = true;
         let mut used_tool_names = Vec::new();
         let mut last_visible_tools = Vec::new();
         let mut last_budget_report = None;
-        let mut skip_next_runtime_compact = false;
 
         let loop_result = async {
             let reply = loop {
@@ -760,19 +398,18 @@ impl AgentLoop {
                 last_visible_tools = request_state.tools.clone();
                 last_budget_report = Some(request_state.budget_report.clone());
 
-                if !skip_next_runtime_compact
-                    && self.should_runtime_compact(
-                        request_state.compact_enabled,
-                        &request_state.budget_report,
-                    )
-                {
+                if self.should_runtime_compact(
+                    &thread_context,
+                    request_state.compact_enabled,
+                    &request_state.budget_report,
+                ) {
                     if let Some(outcome) = self
                         .execute_working_chat_compaction(
                             &hooks,
                             &thread_id,
                             &mut thread_context,
-                            &mut turn_messages,
-                            &mut prepend_incoming_user,
+                            &mut commit_messages,
+                            &mut persist_incoming_user,
                             "runtime_threshold",
                             &request_state.budget_report,
                         )
@@ -789,11 +426,9 @@ impl AgentLoop {
                         );
                         event_tx.send(compact_event.clone()).await?;
                         events.push(compact_event);
-                        skip_next_runtime_compact = true;
                         continue;
                     }
                 }
-                skip_next_runtime_compact = false;
 
                 let RequestState {
                     messages,
@@ -823,7 +458,7 @@ impl AgentLoop {
                     event_tx.send(text_event.clone()).await?;
                     events.push(text_event);
                     thread_context.push_message(assistant_message.clone());
-                    turn_messages.push(assistant_message.clone());
+                    commit_messages.push(assistant_message.clone());
                     break assistant_message.content;
                 }
 
@@ -847,7 +482,7 @@ impl AgentLoop {
                 }
 
                 thread_context.push_message(assistant_tool_message.clone());
-                turn_messages.push(assistant_tool_message);
+                commit_messages.push(assistant_tool_message);
 
                 let mut restart_loop_after_compaction = false;
                 for provider_tool_call in response.tool_calls {
@@ -914,8 +549,8 @@ impl AgentLoop {
                                 &hooks,
                                 &thread_id,
                                 &mut thread_context,
-                                &mut turn_messages,
-                                &mut prepend_incoming_user,
+                                &mut commit_messages,
+                                &mut persist_incoming_user,
                                 "tool_requested",
                                 &budget_report,
                             )
@@ -960,7 +595,6 @@ impl AgentLoop {
                                     false,
                                 ));
                                 if outcome.is_some() {
-                                    skip_next_runtime_compact = true;
                                     restart_loop_after_compaction = true;
                                     break;
                                 }
@@ -1060,7 +694,7 @@ impl AgentLoop {
                     )
                     .with_tool_call_id(provider_tool_call.id.clone());
                     thread_context.push_message(tool_result_message.clone());
-                    turn_messages.push(tool_result_message);
+                    commit_messages.push(tool_result_message);
                 }
 
                 if restart_loop_after_compaction {
@@ -1097,8 +731,8 @@ impl AgentLoop {
                 reply,
                 metadata,
                 events,
-                turn_messages,
-                prepend_incoming_user,
+                commit_messages,
+                persist_incoming_user,
                 active_thread: thread_context.to_conversation_thread(),
                 loaded_toolsets: thread_context.load_toolsets(),
                 tool_events: thread_context.pending_tool_events().to_vec(),
@@ -1129,8 +763,12 @@ impl AgentLoop {
         mut thread_context: ThreadContext,
     ) -> Result<AgentLoopOutput> {
         thread_context.ensure_request_context_system_messages(&context.system);
-        seed_legacy_live_messages(&mut thread_context, context)?;
-        self.run_live_thread(input.event_tx, thread_context).await
+        self.run_live_thread(
+            input.event_tx,
+            thread_context,
+            current_user_message_from_context(context)?,
+        )
+        .await
     }
 
     /// Run one agent turn with an explicit legacy `ConversationThread` snapshot.
@@ -1156,162 +794,151 @@ impl AgentLoop {
             .await
     }
 
-    async fn init_thread_ex(
+    fn thread_is_initialized(&self, thread_context: &ThreadContext) -> bool {
+        !thread_context.messages().is_empty()
+    }
+
+    fn auto_compact_enabled_for_thread(&self, thread_context: &ThreadContext) -> bool {
+        let compact_enabled = thread_context.compact_enabled(self.compact_config.enabled());
+        compact_enabled && thread_context.auto_compact_enabled(self.compact_config.auto_compact())
+    }
+
+    async fn prepare_thread_runtime(
         &self,
+        compact_scope_key: &CompactScopeKey,
         thread_context: &mut ThreadContext,
     ) -> Result<()> {
-        let mut system_prompts = vec![
-            ChatMessage::new(
-                ChatMessageRole::System,
-                // TODO: 这部分可以移到全局或者其他 system Prompt变量里面
-                "你是OpenJarvis，善于辅助他人的超级智能组手，你的角色设定是精通计算机的15岁天才萌妹黑客",
-                Utc::now()
+        self.runtime.tools().register_builtin_tools().await?;
+        self.runtime
+            .merge_thread_state(compact_scope_key, thread_context)
+            .await;
+        Ok(())
+    }
+
+    async fn thread_init(&self, thread_context: &mut ThreadContext) -> Result<()> {
+        let inserted = self
+            .thread_system_prompt
+            .as_ref()
+            .is_some_and(|system_prompt| {
+                thread_context.ensure_system_prompt_snapshot(system_prompt, Utc::now())
+            });
+        self.feature_prompts
+            .rebuild(
+                thread_context,
+                self.auto_compact_enabled_for_thread(thread_context),
             )
-        ];
-
-        let context = FeaturePromptBuildContext {
-            thread_context: thread_context,
-            created_at: Utc::now(),
-        };
-        
-        for feat in &self.feature_prompts.providers {
-
-            // TODO: 其实应该是 append system Message给一个就行了
-            // let output = feat.build(&context).await?;
-
-            system_prompts.extend(
-                {
-                    match feat.build(&context).await? {
-                        FeaturePromptOutput::ToolsetCatalog(v) | 
-                        FeaturePromptOutput::SkillCatalog(v) | 
-                        FeaturePromptOutput::Memory(v) => {
-                            v
-                        },
-                        FeaturePromptOutput::AutoCompact(v) => {
-                            self.compact_config
-                                .enabled()
-                                .then(|| v)
-                                .unwrap_or(Vec::new())
-                        }
-                    }
-                }
-
+            .await?;
+        if inserted {
+            info!(
+                thread_id = %thread_context.locator.thread_id,
+                "initialized thread system prompt snapshot in agent loop"
             );
         }
-        
-        // TOOD: 完成接下来的工作 写会thread
-        let Some(thread_context) = self
-            .session_manager
-            .load_thread_context(locator)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to load persisted thread `{}` before compact",
-                    locator.thread_id
-                )
-            })?
-        else {
-            warn!(
-                thread_id = %locator.thread_id,
-                external_thread_id = %locator.external_thread_id,
-                "skipping auto compactor v1 because persisted thread snapshot was not found"
-            );
-            return Ok(None);
+        Ok(())
+    }
+
+    async fn prepare_request_tools_ex(
+        &self,
+        thread_context: &mut ThreadContext,
+    ) -> Result<ThreadInitStateEx> {
+        let compact_enabled = thread_context.compact_enabled(self.compact_config.enabled());
+        let auto_compact_enabled = self.auto_compact_enabled_for_thread(thread_context);
+
+        self.feature_prompts
+            .rebuild(thread_context, auto_compact_enabled)
+            .await?;
+
+        let tools = if auto_compact_enabled {
+            self.runtime.list_tools(thread_context, true).await?
+        } else {
+            self.runtime.list_tools(thread_context, false).await?
         };
 
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            compact_enabled,
+            auto_compact_enabled,
+            tool_count = tools.len(),
+            "initialized experimental agent-loop thread request state"
+        );
 
-        Ok(())
+        // TODO: auto_compact 后续应改成只能在创建新 ThreadContext 时决定，
+        // 不再允许在已有 ctx 生命周期中途打开，避免 request-state 分支继续膨胀。
+        Ok(ThreadInitStateEx {
+            compact_enabled,
+            auto_compact_enabled,
+            tools,
+        })
     }
 
     async fn prepare_request_state(
         &self,
         thread_context: &mut ThreadContext,
     ) -> Result<RequestState> {
-        let tools = self.runtime.tools();
-        let compact_enabled = thread_context.compact_enabled(self.compact_config.enabled());
-        let auto_compact_enabled = compact_enabled
-            && thread_context.auto_compact_enabled(self.compact_config.auto_compact());
+        let init_state = self.prepare_request_tools_ex(thread_context).await?;
+        let ThreadInitStateEx {
+            compact_enabled,
+            auto_compact_enabled,
+            tools,
+        } = init_state;
 
-        thread_context.set_compact_tool_projection(None);
-        self.feature_prompts.rebuild(thread_context).await?;
-        self.auto_compactor.notify_capacity(thread_context);
-        let static_tools = tools.list_for_context_static(thread_context).await?;
-        let base_messages = thread_context.messages();
-        let base_budget_report = self
-            .budget_estimator
-            .estimate(&base_messages, &static_tools);
+        self.prepare_active_memory_ex(thread_context).await?;
+
+        let (messages, budget_report) = if auto_compact_enabled {
+            self.refresh_auto_compact_request_ex(thread_context, &tools)
+        } else {
+            self.auto_compactor.notify_capacity(thread_context, None);
+            let messages = thread_context.messages();
+            let budget_report = self.budget_estimator.estimate(&messages, &tools);
+            (messages, budget_report)
+        };
+
+        self.runtime
+            .tools()
+            .sync_legacy_thread_state(thread_context)
+            .await;
 
         if auto_compact_enabled {
-            // 规则: auto_compact 一旦开启，compact 工具就应始终对模型可见，
-            // 并且每次 generate 都要注入当前上下文容量提示，让模型自主决定是否提前 compact。
-            // tool_visible_threshold_ratio 在这里不控制“是否注入提示”，只控制提示语气是否升级为提前告警。
-            thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-                auto_compact: true,
-                visible: true,
-                budget_report: base_budget_report.clone(),
-            }));
-            let visible_tools = tools.list_for_context(thread_context).await?;
-            self.feature_prompts.rebuild(thread_context).await?;
-            self.auto_compactor.notify_capacity(thread_context);
-            let messages = thread_context.messages();
-            let budget_report = self.budget_estimator.estimate(&messages, &visible_tools);
-            thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-                auto_compact: true,
-                visible: true,
-                budget_report: budget_report.clone(),
-            }));
-            self.auto_compactor.notify_capacity(thread_context);
-            let messages = thread_context.messages();
-            let budget_report = self.budget_estimator.estimate(&messages, &visible_tools);
-            thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-                auto_compact: true,
-                visible: true,
-                budget_report: budget_report.clone(),
-            }));
-            tools.sync_legacy_thread_state(thread_context).await;
-
             info!(
                 thread_id = %thread_context.locator.thread_id,
                 total_estimated_tokens = budget_report.total_estimated_tokens,
                 utilization_ratio = budget_report.utilization_ratio,
-                tool_count = visible_tools.len(),
+                tool_count = tools.len(),
                 early_warning_reached =
                     budget_report.reaches_ratio(self.compact_config.tool_visible_threshold_ratio()),
                 "prepared auto-compact request budget"
             );
-
-            return Ok(RequestState {
-                messages,
-                tools: visible_tools,
-                budget_report,
-                compact_enabled,
-            });
+        } else {
+            info!(
+                thread_id = %thread_context.locator.thread_id,
+                total_estimated_tokens = budget_report.total_estimated_tokens,
+                utilization_ratio = budget_report.utilization_ratio,
+                tool_count = tools.len(),
+                "prepared request budget"
+            );
         }
 
-        thread_context.set_compact_tool_projection(None);
-        tools.sync_legacy_thread_state(thread_context).await;
-        info!(
-            thread_id = %thread_context.locator.thread_id,
-            total_estimated_tokens = base_budget_report.total_estimated_tokens,
-            utilization_ratio = base_budget_report.utilization_ratio,
-            tool_count = static_tools.len(),
-            "prepared request budget"
-        );
-
         Ok(RequestState {
-            messages: base_messages,
-            tools: static_tools,
-            budget_report: base_budget_report,
+            messages,
+            tools,
+            budget_report,
             compact_enabled,
         })
     }
 
+    async fn prepare_active_memory_ex(&self, _thread_context: &mut ThreadContext) -> Result<()> {
+        // TODO: active memory runtime 应在这里接入；当前保持占位，避免继续把职责堆回 prepare_request_state。
+        Ok(())
+    }
+
     fn should_runtime_compact(
         &self,
+        thread_context: &ThreadContext,
         compact_enabled: bool,
         budget_report: &ContextBudgetReport,
     ) -> bool {
         compact_enabled
+            && !thread_context.pending_chat_messages().is_empty()
             && budget_report.reaches_ratio(self.compact_config.runtime_threshold_ratio())
     }
 
@@ -1321,8 +948,7 @@ impl AgentLoop {
         tool_call: &ToolCallRequest,
     ) -> Result<super::ToolCallResult> {
         self.runtime
-            .tools()
-            .call_for_context(thread_context, tool_call.clone())
+            .call_tool(thread_context, tool_call.clone())
             .await
     }
 
@@ -1331,8 +957,8 @@ impl AgentLoop {
         hooks: &Arc<super::HookRegistry>,
         thread_id: &str,
         thread_context: &mut ThreadContext,
-        turn_messages: &mut Vec<ChatMessage>,
-        prepend_incoming_user: &mut bool,
+        commit_messages: &mut Vec<ChatMessage>,
+        persist_incoming_user: &mut bool,
         reason: &str,
         budget_report: &ContextBudgetReport,
     ) -> Result<Option<CompactionOutcome>> {
@@ -1374,8 +1000,8 @@ impl AgentLoop {
             return Ok(None);
         };
         thread_context.overwrite_active_history_from_conversation_thread(&outcome.compacted_thread);
-        turn_messages.clear();
-        *prepend_incoming_user = false;
+        commit_messages.clear();
+        *persist_incoming_user = false;
 
         info!(
             thread_id,
@@ -1386,6 +1012,30 @@ impl AgentLoop {
         );
 
         Ok(Some(outcome))
+    }
+    fn refresh_auto_compact_request_ex(
+        &self,
+        thread_context: &mut ThreadContext,
+        visible_tools: &[ToolDefinition],
+    ) -> (Messages, ContextBudgetReport) {
+        let mut budget_report = self
+            .budget_estimator
+            .estimate(&thread_context.messages(), visible_tools);
+
+        // 动态容量提示本身也会消耗上下文，所以这里固定进行两轮收敛，
+        // 让最终预算快照和最终请求消息尽量一致。
+        for _ in 0..2 {
+            self.auto_compactor
+                .notify_capacity(thread_context, Some(&budget_report));
+            budget_report = self
+                .budget_estimator
+                .estimate(&thread_context.messages(), visible_tools);
+        }
+
+        self.auto_compactor
+            .notify_capacity(thread_context, Some(&budget_report));
+
+        (thread_context.messages(), budget_report)
     }
 }
 
@@ -1521,14 +1171,12 @@ fn current_user_message_from_context(context: &ContextMessage) -> Result<ChatMes
 }
 
 #[allow(deprecated)]
-fn seed_legacy_live_messages(
-    thread_context: &mut ThreadContext,
-    context: &ContextMessage,
-) -> Result<()> {
-    thread_context.clear_live_messages();
-    thread_context.replace_request_memory_messages(context.memory.clone());
-    thread_context.push_message(current_user_message_from_context(context)?);
-    Ok(())
+fn incoming_message(incoming: &IncomingMessage) -> ChatMessage {
+    ChatMessage::new(
+        ChatMessageRole::User,
+        incoming.content.clone(),
+        incoming.received_at,
+    )
 }
 
 struct RequestState {
@@ -1536,6 +1184,12 @@ struct RequestState {
     tools: Vec<ToolDefinition>,
     budget_report: ContextBudgetReport,
     compact_enabled: bool,
+}
+
+struct ThreadInitStateEx {
+    compact_enabled: bool,
+    auto_compact_enabled: bool,
+    tools: Vec<ToolDefinition>,
 }
 
 fn build_thread_tool_event(

@@ -1,8 +1,13 @@
 //! Shared runtime container that holds hooks, tools, compact runtime switches, and MCP registries for one agent.
 
-use super::{hook::HookRegistry, tool::ToolRegistry};
-use crate::compact::CompactRuntimeManager;
+use super::{
+    ToolCallRequest, ToolCallResult, ToolDefinition, hook::HookRegistry, tool::ToolRegistry,
+};
 use crate::config::AgentConfig;
+use crate::{
+    compact::{CompactRuntimeManager, CompactScopeKey},
+    thread::ThreadContext,
+};
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
 
@@ -79,6 +84,173 @@ impl AgentRuntime {
     /// Return the shared compact runtime override manager.
     pub fn compact_runtime(&self) -> Arc<CompactRuntimeManager> {
         Arc::clone(&self.compact_runtime)
+    }
+
+    /// Merge runtime-managed thread state into one `ThreadContext`.
+    ///
+    /// This restores legacy tool runtime state and compact overrides before a loop turn starts.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::AgentRuntime,
+    ///     compact::CompactScopeKey,
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let runtime = AgentRuntime::new();
+    /// let mut thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// let scope = CompactScopeKey::new("feishu", "ou_xxx", "thread_ext");
+    ///
+    /// runtime.merge_thread_state(&scope, &mut thread_context).await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn merge_thread_state(
+        &self,
+        compact_scope_key: &CompactScopeKey,
+        thread_context: &mut ThreadContext,
+    ) {
+        self.tools.merge_legacy_thread_state(thread_context).await;
+        self.compact_runtime
+            .merge_legacy_scope_overrides(compact_scope_key, thread_context)
+            .await;
+    }
+
+    /// List visible tools for the current thread and request visibility mode.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::AgentRuntime,
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let runtime = AgentRuntime::new();
+    /// let thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// let _tools = runtime.list_tools(&thread_context, false).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_tools(
+        &self,
+        thread_context: &ThreadContext,
+        compact_visible: bool,
+    ) -> Result<Vec<ToolDefinition>> {
+        self.tools
+            .list_for_context_with_compact(thread_context, compact_visible)
+            .await
+    }
+
+    /// Open one optional tool entry for the current thread.
+    ///
+    /// At the moment this maps to loading one named toolset.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::AgentRuntime,
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let runtime = AgentRuntime::new();
+    /// let mut thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// let _opened = runtime.open_tool(&mut thread_context, "browser").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_tool(
+        &self,
+        thread_context: &mut ThreadContext,
+        tool_name: &str,
+    ) -> Result<bool> {
+        self.tools.open_tool(thread_context, tool_name).await
+    }
+
+    /// Close one optional tool entry for the current thread.
+    ///
+    /// At the moment this maps to unloading one named toolset.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::AgentRuntime,
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    ///
+    /// let runtime = AgentRuntime::new();
+    /// let mut thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// let _closed = runtime.close_tool(&mut thread_context, "browser").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn close_tool(
+        &self,
+        thread_context: &mut ThreadContext,
+        tool_name: &str,
+    ) -> Result<bool> {
+        self.tools.close_tool(thread_context, tool_name).await
+    }
+
+    /// Execute one runtime-managed tool call inside the current thread.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::{AgentRuntime, ToolCallRequest},
+    ///     thread::{ThreadContext, ThreadContextLocator},
+    /// };
+    /// use serde_json::json;
+    ///
+    /// let runtime = AgentRuntime::new();
+    /// let mut thread_context = ThreadContext::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// let _ = runtime
+    ///     .call_tool(
+    ///         &mut thread_context,
+    ///         ToolCallRequest {
+    ///             name: "load_toolset".to_string(),
+    ///             arguments: json!({ "name": "browser" }),
+    ///         },
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn call_tool(
+        &self,
+        thread_context: &mut ThreadContext,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        self.tools.call_for_context(thread_context, request).await
     }
 }
 

@@ -15,21 +15,20 @@ pub use agent_loop::{
 pub use feature::{
     AutoCompactFeaturePromptProvider, AutoCompactor, FeaturePromptBuildContext,
     FeaturePromptOutput, FeaturePromptProvider, FeaturePromptRebuilder,
-    MemoryFeaturePromptProvider, SkillCatalogFeaturePromptProvider,
-    ToolsetCatalogFeaturePromptProvider,
+    SkillCatalogFeaturePromptProvider, ToolsetCatalogFeaturePromptProvider,
 };
 pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
 pub use runtime::AgentRuntime;
 pub use sandbox::DummySandboxContainer;
 pub use tool::{
-    CompactToolProjection, EditTool, LoadSkillTool, LoadedSkill, LoadedSkillFile,
-    McpServerDefinition, McpServerSnapshot, McpServerState, McpToolSnapshot, McpTransport,
-    ReadTool, ShellTool, SkillManifest, SkillRegistry, ThreadToolRuntimeManager,
-    ThreadToolRuntimeSnapshot, ToolCallContext, ToolCallRequest, ToolCallResult, ToolDefinition,
-    ToolHandler, ToolInputSchema, ToolRegistry, ToolSchemaProtocol, ToolSource, ToolSourceMcp,
-    ToolsetCatalogEntry, ToolsetRuntime, WriteTool, empty_tool_input_schema,
+    EditTool, LoadSkillTool, LoadedSkill, LoadedSkillFile, McpServerDefinition, McpServerSnapshot,
+    McpServerState, McpToolSnapshot, McpTransport, ReadTool, ShellTool, SkillManifest,
+    SkillRegistry, ThreadToolRuntimeManager, ThreadToolRuntimeSnapshot, ToolCallContext,
+    ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolInputSchema, ToolRegistry,
+    ToolSchemaProtocol, ToolSource, ToolSourceMcp, ToolsetCatalogEntry, ToolsetRuntime, WriteTool,
+    empty_tool_input_schema,
 };
 pub use worker::{
     AgentRequest, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent, AgentWorkerHandle,
-    CompletedAgentTurn, FailedAgentTurn,
+    CompletedAgentCommit, FailedAgentCommit,
 };

@@ -70,7 +70,7 @@ impl ToolHandler for DemoSessionTool {
 }
 
 #[tokio::test]
-async fn store_and_load_turn_creates_session_state() {
+async fn commit_messages_and_load_messages_creates_session_state() {
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_1", "hello");
     let locator = manager
@@ -79,7 +79,7 @@ async fn store_and_load_turn_creates_session_state() {
         .expect("thread should resolve");
 
     manager
-        .store_turn(
+        .commit_messages(
             &locator,
             incoming.external_message_id.clone(),
             vec![
@@ -90,10 +90,10 @@ async fn store_and_load_turn_creates_session_state() {
             Utc::now(),
         )
         .await
-        .expect("turn should store");
+        .expect("message commit should store");
 
     let history = manager
-        .load_turn(&locator)
+        .load_messages(&locator)
         .await
         .expect("history should load");
     let session = manager
@@ -126,7 +126,7 @@ async fn load_turn_keeps_tool_call_id_history() {
         .expect("thread should resolve");
 
     manager
-        .store_turn(
+        .commit_messages(
             &locator,
             incoming.external_message_id.clone(),
             vec![
@@ -146,10 +146,10 @@ async fn load_turn_keeps_tool_call_id_history() {
             Utc::now(),
         )
         .await
-        .expect("turn should store");
+        .expect("message commit should store");
 
     let history = manager
-        .load_turn(&locator)
+        .load_messages(&locator)
         .await
         .expect("history should load");
 
@@ -166,7 +166,7 @@ async fn load_turn_keeps_tool_call_id_history() {
 }
 
 #[tokio::test]
-async fn large_turn_history_keeps_tool_calls_and_results_intact() {
+async fn large_commit_history_keeps_tool_calls_and_results_intact() {
     // 测试场景: 长串 tool call 历史写回 session 后，不能再发生按 message 数裁剪，
     // 否则后续请求会留下悬空 tool_result 并触发 provider 侧 Invalid tool_call_id。
     let manager = SessionManager::new();
@@ -178,7 +178,7 @@ async fn large_turn_history_keeps_tool_calls_and_results_intact() {
 
     let now = Utc::now();
     manager
-        .store_turn(
+        .commit_messages(
             &locator,
             incoming.external_message_id.clone(),
             vec![
@@ -249,7 +249,7 @@ async fn large_turn_history_keeps_tool_calls_and_results_intact() {
         .expect("large tool turn should store");
 
     let history = manager
-        .load_turn(&locator)
+        .load_messages(&locator)
         .await
         .expect("history should load");
     let session = manager
@@ -311,7 +311,7 @@ async fn load_or_create_thread_reuses_internal_uuid_for_same_external_thread() {
 }
 
 #[tokio::test]
-async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
+async fn commit_messages_with_state_persists_loaded_toolsets_and_tool_events() {
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_tool_state", "hello tool state");
     let locator = manager
@@ -326,7 +326,7 @@ async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
     };
 
     manager
-        .store_turn_with_state(
+        .commit_messages_with_state(
             &locator,
             incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -340,7 +340,7 @@ async fn store_turn_with_state_persists_loaded_toolsets_and_tool_events() {
             vec![tool_event],
         )
         .await
-        .expect("turn state should store");
+        .expect("commit state should store");
 
     let thread_state = manager
         .load_thread_state(&locator)
@@ -509,7 +509,7 @@ async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
         .expect("thread should resolve");
 
     manager
-        .store_turn_with_state(
+        .commit_messages_with_state(
             &locator,
             incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -523,7 +523,7 @@ async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
             Vec::new(),
         )
         .await
-        .expect("turn state should store");
+        .expect("commit state should store");
 
     let registry = ToolRegistry::new();
     registry
@@ -567,7 +567,7 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
         .expect("second thread should resolve");
 
     manager
-        .store_turn_with_state(
+        .commit_messages_with_state(
             &first_locator,
             first_incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -583,7 +583,7 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
         .await
         .expect("first thread state should store");
     manager
-        .store_turn_with_state(
+        .commit_messages_with_state(
             &second_locator,
             second_incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -613,7 +613,7 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
 }
 
 #[tokio::test]
-async fn store_turn_with_active_thread_replaces_old_history_before_appending_new_turn() {
+async fn commit_messages_with_active_thread_replaces_old_history_before_appending_new_commit() {
     // 测试场景: compact 已经替换 active history 后，session 应写回 compacted turn，再追加本轮新 turn。
     let manager = SessionManager::new();
     let first_incoming = build_incoming("msg_compact_1", "before compact");
@@ -622,7 +622,7 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
         .await
         .expect("thread should resolve");
     manager
-        .store_turn(
+        .commit_messages(
             &locator,
             first_incoming.external_message_id.clone(),
             vec![
@@ -637,7 +637,7 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
             Utc::now(),
         )
         .await
-        .expect("initial turn should store");
+        .expect("initial commit should store");
 
     let mut compacted_thread = manager
         .load_thread_state(&locator)
@@ -656,7 +656,7 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
     )];
 
     manager
-        .store_turn_with_active_thread(
+        .commit_messages_with_active_thread(
             &locator,
             Some(compacted_thread),
             Some("msg_compact_2".to_string()),
@@ -670,7 +670,7 @@ async fn store_turn_with_active_thread_replaces_old_history_before_appending_new
             Vec::new(),
         )
         .await
-        .expect("compacted turn should store");
+        .expect("compacted commit should store");
 
     let session = manager
         .get_session(&SessionKey::from_incoming(&first_incoming))
@@ -736,7 +736,7 @@ async fn shared_store_merges_stale_state_updates_and_restores_external_message_d
     assert!(merged.auto_compact_enabled(false));
 
     manager_a
-        .store_turn(
+        .commit_messages(
             &locator_a,
             Some("msg_conflict_2".to_string()),
             vec![
@@ -747,7 +747,7 @@ async fn shared_store_merges_stale_state_updates_and_restores_external_message_d
             Utc::now(),
         )
         .await
-        .expect("dedup turn should store");
+        .expect("dedup commit should store");
 
     let manager_c = SessionManager::with_store(Arc::clone(&store))
         .await
@@ -766,7 +766,7 @@ async fn shared_store_merges_stale_state_updates_and_restores_external_message_d
 }
 
 #[tokio::test]
-async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow_up_turns() {
+async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_follow_up_commits() {
     // 测试场景: SQLite 持久化后的线程在“重启”后要恢复 compact turn、loaded toolsets、/auto-compact 状态，并继续同线程追加新 turn。
     let fixture = SessionSqliteFixture::new("openjarvis-session-restart");
     let store_a: Arc<dyn SessionStore> = Arc::new(
@@ -832,7 +832,7 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
     assert!(restored.auto_compact_enabled(false));
 
     manager_b
-        .store_turn(
+        .commit_messages(
             &locator_b,
             Some("msg_restart_2".to_string()),
             vec![
@@ -847,9 +847,9 @@ async fn sqlite_backed_session_manager_restores_compact_turn_toolsets_and_follow
             Utc::now(),
         )
         .await
-        .expect("follow-up turn should store after restart");
+        .expect("follow-up commit should store after restart");
     let history = manager_b
-        .load_turn(&locator_b)
+        .load_messages(&locator_b)
         .await
         .expect("history should load after restart");
 

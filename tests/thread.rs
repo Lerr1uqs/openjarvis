@@ -1,16 +1,12 @@
 use chrono::Utc;
 use openjarvis::{
-    compact::ContextBudgetReport,
-    context::ContextTokenKind,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     thread::{
-        ConversationThread, ThreadCompactToolProjection, ThreadContext, ThreadContextLocator,
-        ThreadFeaturesSystemPrompt, ThreadToolEvent, ThreadToolEventKind,
-        derive_internal_thread_id,
+        ConversationThread, ThreadContext, ThreadContextLocator, ThreadFeaturesSystemPrompt,
+        ThreadToolEvent, ThreadToolEventKind, derive_internal_thread_id,
     },
 };
 use serde_json::json;
-use std::collections::HashMap;
 use uuid::Uuid;
 
 #[test]
@@ -239,8 +235,8 @@ fn thread_context_roundtrips_legacy_thread_and_preserves_runtime_layers() {
 }
 
 #[test]
-fn thread_context_store_turn_binds_pending_tool_events_and_clears_compact_projection() {
-    // 测试场景: 当前轮累计的 pending tool event 必须在落 turn 时绑定 turn_id，同时清空本轮 compact projection。
+fn thread_context_store_turn_binds_pending_tool_events() {
+    // 测试场景: 当前轮累计的 pending tool event 必须在落 turn 时绑定 turn_id。
     let now = Utc::now();
     let thread_id = derive_internal_thread_id("ou_xxx:feishu:thread_ext");
     let mut context = ThreadContext::new(
@@ -253,19 +249,6 @@ fn thread_context_store_turn_binds_pending_tool_events_and_clears_compact_projec
         ),
         now,
     );
-    context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-        auto_compact: true,
-        visible: true,
-        budget_report: ContextBudgetReport::new(
-            HashMap::from([
-                (ContextTokenKind::System, 12),
-                (ContextTokenKind::Chat, 64),
-                (ContextTokenKind::VisibleTool, 20),
-                (ContextTokenKind::ReservedOutput, 16),
-            ]),
-            256,
-        ),
-    }));
     let event = {
         let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now);
         event.tool_name = Some("demo__echo".to_string());
@@ -283,7 +266,6 @@ fn thread_context_store_turn_binds_pending_tool_events_and_clears_compact_projec
     let stored_events = context.load_tool_events();
 
     assert!(context.pending_tool_events().is_empty());
-    assert!(context.compact_tool_projection().is_none());
     assert_eq!(stored_events.len(), 1);
     assert_eq!(stored_events[0].turn_id, Some(turn_id));
     assert_eq!(stored_events[0].tool_call_id.as_deref(), Some("call_1"));

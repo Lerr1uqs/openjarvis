@@ -10,7 +10,7 @@ use openjarvis::{
         empty_tool_input_schema,
     },
     compact::CompactScopeKey,
-    config::AppConfig,
+    config::{AgentCompactConfig, AppConfig, LLMConfig},
     context::{ChatMessage, ChatMessageRole, MessageContext},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
@@ -74,8 +74,8 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
     assert_eq!(output.reply, "loop-reply");
     assert_eq!(output.metadata["tool_count"], 6);
     assert_eq!(output.events.len(), 1);
-    assert_eq!(output.turn_messages.len(), 1);
-    assert_eq!(output.turn_messages[0].content, "loop-reply");
+    assert_eq!(output.commit_messages.len(), 1);
+    assert_eq!(output.commit_messages[0].content, "loop-reply");
     assert_eq!(outgoing[0].content, "loop-reply");
     assert_eq!(format!("{:?}", outgoing[0].kind), "TextOutput");
     assert_eq!(
@@ -84,6 +84,51 @@ async fn agent_loop_emits_hooks_and_returns_reply() {
     );
     assert_eq!(emitted_payloads[0]["channel"], "feishu");
     assert_eq!(output.metadata["hook_handler_count"], 1);
+}
+
+#[tokio::test]
+async fn agent_loop_initializes_empty_thread_before_appending_current_user_message() {
+    // 测试场景: run_v1 对空 thread 应先执行 thread_is_initialized 判空与 thread_init，
+    // 再把当前用户消息放入 live chat，避免用户输入污染初始化判断。
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let loop_runner = AgentLoop::with_compact_config_and_system_prompt(
+        Arc::new(RecordingSequenceProvider {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(vec![text_response("初始化完成")])),
+        }),
+        runtime_without_skills(),
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+        Some("thread system prompt".to_string()),
+    );
+    let (input, _outgoing_rx) = build_input();
+    let thread_context =
+        ThreadContext::new(thread_context_locator_for_input(&input), chrono::Utc::now());
+    let incoming = build_incoming_for_input(&input, "当前问题");
+
+    let output = loop_runner
+        .run_v1(input.event_tx, &incoming, thread_context)
+        .await
+        .expect("loop should initialize empty thread before first request");
+
+    let captured_requests = requests.lock().await;
+    assert_eq!(captured_requests.len(), 1);
+    assert_eq!(
+        captured_requests[0].messages[0].content,
+        "thread system prompt"
+    );
+    assert_eq!(
+        captured_requests[0]
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("当前问题")
+    );
+    assert_eq!(
+        output.thread_context.request_context_system_messages()[0].content,
+        "thread system prompt"
+    );
+    assert_eq!(output.reply, "初始化完成");
 }
 
 struct SequenceProvider {
@@ -156,13 +201,13 @@ async fn agent_loop_runs_single_tool_round_and_returns_final_answer() {
     assert_eq!(output.reply, "读取完成");
     assert_eq!(output.metadata["used_tool_name"], "read");
     assert_eq!(output.events.len(), 3);
-    assert_eq!(output.turn_messages.len(), 3);
-    assert_eq!(output.turn_messages[0].tool_calls[0].id, "call_test_1");
+    assert_eq!(output.commit_messages.len(), 3);
+    assert_eq!(output.commit_messages[0].tool_calls[0].id, "call_test_1");
     assert_eq!(
-        output.turn_messages[1].tool_call_id.as_deref(),
+        output.commit_messages[1].tool_call_id.as_deref(),
         Some("call_test_1")
     );
-    assert_eq!(output.turn_messages[2].content, "读取完成");
+    assert_eq!(output.commit_messages[2].content, "读取完成");
     assert_eq!(output.events[0].kind, AgentLoopEventKind::ToolCall);
     assert_eq!(output.events[1].kind, AgentLoopEventKind::ToolResult);
     assert_eq!(output.events[2].kind, AgentLoopEventKind::TextOutput);
@@ -327,8 +372,8 @@ async fn agent_loop_emits_response_before_tool_call_when_both_exist() {
     assert_eq!(output.events[1].kind, AgentLoopEventKind::ToolCall);
     assert_eq!(output.events[2].kind, AgentLoopEventKind::ToolResult);
     assert_eq!(output.events[3].kind, AgentLoopEventKind::TextOutput);
-    assert_eq!(output.turn_messages[0].content, "我先看看文件内容");
-    assert_eq!(output.turn_messages[0].tool_calls[0].id, "call_test_1");
+    assert_eq!(output.commit_messages[0].content, "我先看看文件内容");
+    assert_eq!(output.commit_messages[0].tool_calls[0].id, "call_test_1");
     assert_eq!(outgoing[0].content, "我先看看文件内容");
     assert_eq!(outgoing[3].content, "读取完成");
 }
@@ -425,7 +470,7 @@ async fn agent_loop_executes_namespaced_mcp_tool_calls() {
     assert_eq!(output.loaded_toolsets, vec!["demo_stdio".to_string()]);
     assert_eq!(output.tool_events.len(), 2);
     assert_eq!(
-        output.turn_messages[3].content,
+        output.commit_messages[3].content,
         "[demo:stdio] 来自 agent loop"
     );
 }
@@ -762,8 +807,7 @@ Read `guide.md` before replying.
         now,
         now,
     );
-    let mut context = build_context("system", "当前问题");
-    context.push_memory("transient memory only");
+    let context = build_context("system", "当前问题");
 
     let output = loop_runner
         .run_with_thread_context(input, &context, thread_context)
@@ -796,7 +840,6 @@ Read `guide.md` before replying.
     let skill_index = find_contains_index("Available local skills");
     let auto_stable_index = find_contains_index("Auto-compact 已开启");
     let auto_dynamic_index = find_contains_index("<context capacity");
-    let memory_index = find_exact_index("transient memory only");
     let history_index = find_exact_index("persisted history");
     let user_index = find_exact_index("当前问题");
 
@@ -805,8 +848,7 @@ Read `guide.md` before replying.
     assert!(toolset_index < skill_index);
     assert!(skill_index < auto_stable_index);
     assert!(auto_stable_index < auto_dynamic_index);
-    assert!(auto_dynamic_index < memory_index);
-    assert!(memory_index < history_index);
+    assert!(auto_dynamic_index < history_index);
     assert!(history_index < user_index);
     assert_eq!(output.reply, "按顺序完成");
 }
@@ -885,13 +927,14 @@ llm:
     assert_eq!(output.reply, "压缩后继续");
     assert_eq!(output.events[0].kind, AgentLoopEventKind::Compact);
     assert_eq!(output.events[1].kind, AgentLoopEventKind::TextOutput);
-    assert!(!output.prepend_incoming_user);
+    assert!(!output.persist_incoming_user);
     assert_eq!(output.active_thread.turns.len(), 1);
 }
 
 #[tokio::test]
-async fn agent_loop_run_turn_keeps_request_memory_transient_across_compact() {
-    // 测试场景: request-time memory 只影响当前请求；它不能进入线程持久状态，也不能被作为 compact source history。
+async fn agent_loop_run_turn_ignores_legacy_request_memory_inputs_across_compact() {
+    // 测试场景: loop 入口现在只消费一个当前 message；
+    // 旧的 ContextMessage.memory 即使存在，也不能进入请求、线程持久状态或 compact 结果。
     let config: AppConfig = serde_yaml::from_str(
         r#"
 agent:
@@ -950,7 +993,7 @@ llm:
     let output = loop_runner
         .run_with_thread_context(input, &context, thread_context)
         .await
-        .expect("loop should keep request memory transient");
+        .expect("loop should ignore legacy request memory inputs");
 
     let captured_requests = requests.lock().await;
     assert_eq!(captured_requests.len(), 2);
@@ -961,7 +1004,7 @@ llm:
             .any(|message| message.content.contains("transient memory only"))
     );
     assert!(
-        captured_requests[1]
+        !captured_requests[1]
             .messages
             .iter()
             .any(|message| message.content == "transient memory only")
@@ -1333,7 +1376,7 @@ llm:
             .any(|message| message.content == "请继续")
     );
     assert_eq!(output.metadata["used_tool_name"], "compact");
-    assert!(!output.prepend_incoming_user);
+    assert!(!output.persist_incoming_user);
     assert_eq!(output.reply, "继续完成");
 }
 

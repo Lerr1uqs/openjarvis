@@ -175,7 +175,6 @@ Alternative considered:
 - `ToolRegistry::catalog_prompt(thread_id)`
 - `ToolRegistry::rehydrate_thread(...)`
 - `ToolRegistry::loaded_toolsets_for_thread(...)`
-- `ToolRegistry::set_compact_tool_projection(...)`
 - `CompactRuntimeManager` 中与线程 override 相关的旧入口
 
 这些 API 在兼容期内可以转发到 `ThreadContext` 新实现，确保：

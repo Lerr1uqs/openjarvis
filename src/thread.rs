@@ -1,9 +1,6 @@
 //! Conversation-thread persistence types used by the session manager.
 
-use crate::{
-    compact::ContextBudgetReport,
-    context::{ChatMessage, ChatMessageRole},
-};
+use crate::context::{ChatMessage, ChatMessageRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -387,14 +384,6 @@ impl From<&ConversationThread> for ThreadConversation {
     }
 }
 
-/// Thread-scoped compact visibility projection derived from the current request budget.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ThreadCompactToolProjection {
-    pub auto_compact: bool,
-    pub visible: bool,
-    pub budget_report: ContextBudgetReport,
-}
-
 /// Thread feature flags and runtime feature overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadFeatureState {
@@ -409,8 +398,6 @@ pub struct ThreadFeatureState {
 pub struct ThreadToolState {
     #[serde(default)]
     pub loaded_toolsets: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compact_tool_projection: Option<ThreadCompactToolProjection>,
 }
 
 /// Thread-scoped request context snapshot that remains stable across turns.
@@ -615,7 +602,6 @@ impl ThreadContext {
                 request_context: ThreadRequestContext::default(),
                 tools: ThreadToolState {
                     loaded_toolsets: normalize_loaded_toolsets(loaded_toolsets),
-                    compact_tool_projection: None,
                 },
                 approval: ThreadApprovalState::default(),
             },
@@ -952,7 +938,6 @@ impl ThreadContext {
             completed_at,
             tool_events,
         );
-        self.state.tools.compact_tool_projection = None;
         turn_id
     }
 
@@ -1072,17 +1057,6 @@ impl ThreadContext {
     pub fn disable_auto_compact(&mut self) {
         self.set_compact_enabled_override(None);
         self.set_auto_compact_override(Some(false));
-        self.state.tools.compact_tool_projection = None;
-    }
-
-    /// Replace the current compact-tool visibility projection.
-    pub fn set_compact_tool_projection(&mut self, projection: Option<ThreadCompactToolProjection>) {
-        self.state.tools.compact_tool_projection = projection;
-    }
-
-    /// Return the current compact-tool visibility projection when present.
-    pub fn compact_tool_projection(&self) -> Option<&ThreadCompactToolProjection> {
-        self.state.tools.compact_tool_projection.as_ref()
     }
 
     /// Project the thread context back into the legacy `ConversationThread` compatibility shape.
@@ -1144,6 +1118,7 @@ impl ThreadContext {
     }
 
     /// Replace the current transient live memory messages with one rebuilt snapshot.
+    #[allow(dead_code)] // `auto_compactor_ex` 实验分支接回主链前，这个入口先保留。
     pub(crate) fn rebuild_live_memory_messages(&mut self, memory_messages: Vec<ChatMessage>) {
         self.live_memory_messages = memory_messages;
     }

@@ -19,7 +19,7 @@ use tokio::{
 use uuid::Uuid;
 
 #[tokio::test]
-async fn worker_spawn_emits_outgoing_and_completed_turn() {
+async fn worker_spawn_emits_outgoing_and_completed_commit() {
     let worker = AgentWorker::builder()
         .llm(Arc::new(MockLLMProvider::new("mock-reply")))
         .system_prompt("system prompt")
@@ -60,10 +60,10 @@ async fn worker_spawn_emits_outgoing_and_completed_turn() {
     }
 
     match &events[1] {
-        AgentWorkerEvent::TurnCompleted(turn) => {
-            assert_eq!(turn.locator.thread_id, locator.thread_id);
-            assert_eq!(turn.messages.len(), 1);
-            assert_eq!(turn.messages[0].content, "mock-reply");
+        AgentWorkerEvent::CommitCompleted(commit) => {
+            assert_eq!(commit.locator.thread_id, locator.thread_id);
+            assert_eq!(commit.commit_messages.len(), 1);
+            assert_eq!(commit.commit_messages[0].content, "mock-reply");
         }
         other => panic!("unexpected second event: {other:?}"),
     }
@@ -147,14 +147,18 @@ async fn worker_builds_context_from_history_and_current_user_message() {
             Utc::now(),
         )],
     );
+    let mut thread_context = ThreadContext::from_conversation_thread(
+        ThreadContextLocator::from(&locator),
+        thread.clone(),
+    );
+    let _ = thread_context.ensure_system_prompt_snapshot("system prompt", Utc::now());
 
     handle
         .request_tx
         .send(AgentRequest {
-            thread_context: ThreadContext::from_conversation_thread(
-                ThreadContextLocator::from(&locator),
-                thread.clone(),
-            ),
+            // 测试场景: 非空 thread 在进入 worker 前应已带上持久化 system prompt snapshot，
+            // loop 不再对这类线程做补初始化。
+            thread_context,
             locator,
             incoming,
         })
@@ -198,7 +202,7 @@ llm:
 }
 
 #[tokio::test]
-async fn worker_failed_turn_preserves_provider_error_chain() {
+async fn worker_failed_commit_preserves_provider_error_chain() {
     let worker = AgentWorker::builder()
         .llm(Arc::new(FailingProvider))
         .system_prompt("system prompt")
@@ -227,11 +231,12 @@ async fn worker_failed_turn_preserves_provider_error_chain() {
     let events = collect_events(handle.event_rx, 1).await;
 
     match &events[0] {
-        AgentWorkerEvent::TurnFailed(turn) => {
-            assert!(turn.error.contains("failed to call llm provider"));
-            assert!(turn.error.contains("demo-model"));
+        AgentWorkerEvent::CommitFailed(commit) => {
+            assert!(commit.error.contains("failed to call llm provider"));
+            assert!(commit.error.contains("demo-model"));
             assert!(
-                turn.error
+                commit
+                    .error
                     .contains("provider said 429: rate limit exceeded")
             );
         }
@@ -276,12 +281,12 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
 
     let first_events = collect_events(first_handle.event_rx, 2).await;
     let preserved_thread_context = match &first_events[1] {
-        AgentWorkerEvent::TurnCompleted(turn) => {
+        AgentWorkerEvent::CommitCompleted(commit) => {
             assert_eq!(
-                turn.thread_context.request_context_system_messages()[0].content,
+                commit.thread_context.request_context_system_messages()[0].content,
                 "system prompt A"
             );
-            turn.thread_context.clone()
+            commit.thread_context.clone()
         }
         other => panic!("unexpected first worker completion event: {other:?}"),
     };
@@ -315,9 +320,9 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
 
     let second_events = collect_events(second_handle.event_rx, 2).await;
     match &second_events[1] {
-        AgentWorkerEvent::TurnCompleted(turn) => {
+        AgentWorkerEvent::CommitCompleted(commit) => {
             assert_eq!(
-                turn.thread_context.request_context_system_messages()[0].content,
+                commit.thread_context.request_context_system_messages()[0].content,
                 "system prompt A"
             );
         }

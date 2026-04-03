@@ -45,7 +45,7 @@ pub struct IncomingMessage {
     - Session: 一个用户的上下文回话空间
         - ThreadContext: 一个用户和一个agent在单条 internal thread 上的统一运行时宿主
             - ThreadConversation: 当前线程的全部聊天记录
-                - Turn: 用户输入 + AgentLoop循环完成的一轮Message
+                - Commit批次: 用户输入驱动的一轮原子消息提交，底层历史仍按 turn 边界保存
             - ThreadState: 当前线程的 feature / tool / approval 等运行时状态
 
 这里没有单独的 conversation ID。
@@ -95,9 +95,9 @@ pub struct IncomingMessage {
 - compact turn 必须按 `ConversationTurn` 原样保存，不能只存扁平 messages 再反推 turn 边界
 - `external_message_id` 去重记录会单独落盘，保证重启后仍能识别重复消息
 
-session message实现两个接口：一个是 load_turn，一个是 store_turn。
+session message实现两个接口：一个是 `load_messages`，一个是 `commit_messages`。
 
-1. store：存储新增的消息。
+1. commit：存储新增的消息批次。
 2. load：加载当前传入的 history。
 
 - 如果启用了 `compact`，runtime 会在真正请求 LLM 前基于完整请求预算判断是否压缩 `chat`

@@ -19,6 +19,7 @@ const TOOL_USE_MODE_PROMPT: &str = "You are running in OpenJarvis tool-use mode.
 pub struct FeaturePromptBuildContext<'a> {
     pub thread_context: &'a ThreadContext,
     pub created_at: DateTime<Utc>,
+    pub auto_compact_enabled: bool,
 }
 
 /// Fixed provider contract for one thread-scoped dynamic feature prompt.
@@ -36,15 +37,10 @@ pub enum FeaturePromptOutput {
     ToolsetCatalog(Vec<ChatMessage>),
     SkillCatalog(Vec<ChatMessage>),
     AutoCompact(Vec<ChatMessage>),
-    Memory(Vec<ChatMessage>),
 }
 
 impl FeaturePromptOutput {
-    fn write_into(
-        self,
-        features_system_prompt: &mut ThreadFeaturesSystemPrompt,
-        live_memory_messages: &mut Vec<ChatMessage>,
-    ) {
+    fn write_into(self, features_system_prompt: &mut ThreadFeaturesSystemPrompt) {
         match self {
             Self::ToolsetCatalog(messages) => {
                 features_system_prompt.toolset_catalog = messages;
@@ -54,9 +50,6 @@ impl FeaturePromptOutput {
             }
             Self::AutoCompact(messages) => {
                 features_system_prompt.auto_compact = messages;
-            }
-            Self::Memory(messages) => {
-                *live_memory_messages = messages;
             }
         }
     }
@@ -79,24 +72,27 @@ impl FeaturePromptRebuilder {
                     &tool_registry,
                 ))),
                 Box::new(AutoCompactFeaturePromptProvider::new(compact_config)),
-                Box::new(MemoryFeaturePromptProvider::new()),
             ],
         }
     }
 
     /// Rebuild the current thread feature system prompt in fixed provider order.
-    pub async fn rebuild(&self, thread_context: &mut ThreadContext) -> Result<()> {
+    pub async fn rebuild(
+        &self,
+        thread_context: &mut ThreadContext,
+        auto_compact_enabled: bool,
+    ) -> Result<()> {
         let created_at = Utc::now();
         let context = FeaturePromptBuildContext {
             thread_context,
             created_at,
+            auto_compact_enabled,
         };
         let mut features_system_prompt = ThreadFeaturesSystemPrompt::default();
-        let mut live_memory_messages = Vec::new();
 
         for provider in &self.providers {
             let output = provider.build(&context).await?;
-            output.write_into(&mut features_system_prompt, &mut live_memory_messages);
+            output.write_into(&mut features_system_prompt);
         }
 
         info!(
@@ -105,7 +101,6 @@ impl FeaturePromptRebuilder {
             "rebuilding fixed feature prompt providers for thread"
         );
         thread_context.rebuild_features_system_prompt(features_system_prompt);
-        thread_context.rebuild_live_memory_messages(live_memory_messages);
         Ok(())
     }
 }
@@ -201,10 +196,7 @@ impl FeaturePromptProvider for AutoCompactFeaturePromptProvider {
     }
 
     async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<FeaturePromptOutput> {
-        let Some(projection) = context.thread_context.compact_tool_projection() else {
-            return Ok(FeaturePromptOutput::AutoCompact(Vec::new()));
-        };
-        if !projection.auto_compact {
+        if !context.auto_compact_enabled {
             return Ok(FeaturePromptOutput::AutoCompact(Vec::new()));
         }
 
@@ -238,7 +230,7 @@ impl AutoCompactor {
     ///     compact::ContextBudgetReport,
     ///     config::AgentCompactConfig,
     ///     context::ContextTokenKind,
-    ///     thread::{ThreadCompactToolProjection, ThreadContext, ThreadContextLocator},
+    ///     thread::{ThreadContext, ThreadContextLocator},
     /// };
     ///
     /// let now = Utc::now();
@@ -246,79 +238,43 @@ impl AutoCompactor {
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     now,
     /// );
-    /// thread_context.set_compact_tool_projection(Some(ThreadCompactToolProjection {
-    ///     auto_compact: true,
-    ///     visible: true,
-    ///     budget_report: ContextBudgetReport::new(
-    ///         HashMap::from([
-    ///             (ContextTokenKind::System, 32),
-    ///             (ContextTokenKind::Chat, 128),
-    ///             (ContextTokenKind::VisibleTool, 16),
-    ///             (ContextTokenKind::ReservedOutput, 16),
-    ///         ]),
-    ///         256,
-    ///     ),
-    /// }));
+    /// let budget_report = ContextBudgetReport::new(
+    ///     HashMap::from([
+    ///         (ContextTokenKind::System, 32),
+    ///         (ContextTokenKind::Chat, 128),
+    ///         (ContextTokenKind::VisibleTool, 16),
+    ///         (ContextTokenKind::ReservedOutput, 16),
+    ///     ]),
+    ///     256,
+    /// );
     ///
-    /// AutoCompactor::new(AgentCompactConfig::default()).notify_capacity(&mut thread_context);
+    /// AutoCompactor::new(AgentCompactConfig::default())
+    ///     .notify_capacity(&mut thread_context, Some(&budget_report));
     ///
     /// assert!(thread_context
     ///     .messages()
     ///     .iter()
     ///     .any(|message| message.content.contains("<context capacity")));
     /// ```
-    pub fn notify_capacity(&self, thread_context: &mut ThreadContext) {
-        let Some(projection) = thread_context.compact_tool_projection() else {
+    pub fn notify_capacity(
+        &self,
+        thread_context: &mut ThreadContext,
+        budget_report: Option<&ContextBudgetReport>,
+    ) {
+        let Some(budget_report) = budget_report else {
             thread_context.replace_live_system_messages(Vec::new());
             return;
         };
-        if !projection.auto_compact {
-            thread_context.replace_live_system_messages(Vec::new());
-            return;
-        }
 
         thread_context.replace_live_system_messages(vec![ChatMessage::new(
             ChatMessageRole::System,
             build_auto_compact_dynamic_prompt(
-                &projection.budget_report,
+                budget_report,
                 self.compact_config.tool_visible_threshold_ratio(),
                 self.compact_config.runtime_threshold_ratio(),
             ),
             Utc::now(),
         )]);
-    }
-}
-
-/// Request-time memory provider for the current live memory layer.
-pub struct MemoryFeaturePromptProvider;
-
-impl MemoryFeaturePromptProvider {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl FeaturePromptProvider for MemoryFeaturePromptProvider {
-    fn name(&self) -> &'static str {
-        "memory"
-    }
-
-    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<FeaturePromptOutput> {
-        let messages = context
-            .thread_context
-            .request_memory_messages()
-            .iter()
-            .filter(|message| !message.content.trim().is_empty())
-            .map(|message| {
-                ChatMessage::new(
-                    ChatMessageRole::Memory,
-                    message.content.clone(),
-                    message.created_at,
-                )
-            })
-            .collect::<Vec<_>>();
-        Ok(FeaturePromptOutput::Memory(messages))
     }
 }
 

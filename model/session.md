@@ -37,4 +37,5 @@
 - Router 先调用 `load_or_create_thread` 得到 `ThreadLocator`。
 - 线程执行前调用 `load_thread_context` 或 `load_thread_state`。
 - 需要直接改 live 线程态时，调用 `lock_thread_context` 或 `mutate_thread_context`。
-- turn 完成后调用 `store_turn_with_thread_context`；只改线程状态时调用 `store_thread_context`。
+- 单轮执行完成后调用 `commit_messages_with_thread_context`；只改线程状态时调用 `store_thread_context`。
+- `store_turn*` 仍然保留为兼容别名，但新的调用路径应统一使用 `commit_messages*`。

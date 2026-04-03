@@ -5,7 +5,7 @@ use super::{
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
 };
-use crate::compact::{CompactProvider, CompactScopeKey};
+use crate::compact::CompactProvider;
 use crate::config::{AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
 use crate::context::ChatMessage;
 use crate::llm::{LLMProvider, build_provider};
@@ -26,20 +26,20 @@ pub struct AgentRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct CompletedAgentTurn {
+pub struct CompletedAgentCommit {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub thread_context: ThreadContext,
     pub active_thread: ConversationThread,
-    pub messages: Vec<ChatMessage>,
-    pub prepend_incoming_user: bool,
+    pub commit_messages: Vec<ChatMessage>,
+    pub persist_incoming_user: bool,
     pub loaded_toolsets: Vec<String>,
     pub tool_events: Vec<ThreadToolEvent>,
     pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FailedAgentTurn {
+pub struct FailedAgentCommit {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub error: String,
@@ -52,8 +52,8 @@ pub struct FailedAgentTurn {
 #[derive(Debug, Clone)]
 pub enum AgentWorkerEvent {
     Dispatch(AgentDispatchEvent),
-    TurnCompleted(CompletedAgentTurn),
-    TurnFailed(FailedAgentTurn),
+    CommitCompleted(CompletedAgentCommit),
+    CommitFailed(FailedAgentCommit),
 }
 
 pub struct AgentWorkerHandle {
@@ -64,7 +64,6 @@ pub struct AgentWorkerHandle {
 pub struct AgentWorker {
     agent_loop: AgentLoop,
     sandbox: DummySandboxContainer,
-    system_prompt: String,
 }
 
 /// Builder for assembling one [`AgentWorker`] with explicit runtime and compact settings.
@@ -152,25 +151,26 @@ impl AgentWorkerBuilder {
             bail!("agent worker builder requires an llm provider");
         };
         let agent_loop = match self.compact_provider {
-            Some(compact_provider) => AgentLoop::with_compact_provider(
+            Some(compact_provider) => AgentLoop::with_compact_provider_and_system_prompt(
                 llm,
                 self.runtime,
                 self.llm_config,
                 self.compact_config,
                 compact_provider,
+                Some(self.system_prompt.clone()),
             ),
-            None => AgentLoop::with_compact_config(
+            None => AgentLoop::with_compact_config_and_system_prompt(
                 llm,
                 self.runtime,
                 self.llm_config,
                 self.compact_config,
+                Some(self.system_prompt.clone()),
             ),
         };
 
         Ok(AgentWorker {
             agent_loop,
             sandbox: DummySandboxContainer::new(),
-            system_prompt: self.system_prompt,
         })
     }
 }
@@ -325,27 +325,9 @@ impl AgentWorker {
 
     async fn handle_request(
         &self,
-        mut request: AgentRequest,
+        request: AgentRequest,
         event_tx: mpsc::Sender<AgentWorkerEvent>,
     ) -> Result<AgentLoopOutput> {
-        let compact_scope_key = CompactScopeKey::new(
-            request.thread_context.locator.channel.clone(),
-            request.thread_context.locator.user_id.clone(),
-            request.thread_context.locator.external_thread_id.clone(),
-        );
-        self.agent_loop
-            .runtime()
-            .tools()
-            .merge_legacy_thread_state(&mut request.thread_context)
-            .await;
-        self.agent_loop
-            .runtime()
-            .compact_runtime()
-            .merge_legacy_scope_overrides(&compact_scope_key, &mut request.thread_context)
-            .await;
-        request
-            .thread_context
-            .ensure_system_prompt_snapshot(&self.system_prompt, request.incoming.received_at);
         let (dispatch_tx, mut dispatch_rx) = mpsc::channel(128);
         let forward_event_tx = event_tx.clone();
         let forward_dispatch_task = tokio::spawn(async move {
@@ -380,26 +362,28 @@ impl AgentWorker {
             Ok(loop_output) => {
                 let completed_at = Utc::now();
                 event_tx // TODO: 需要重构
-                    .send(AgentWorkerEvent::TurnCompleted(CompletedAgentTurn {
+                    .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                         locator: request.locator,
                         incoming: request.incoming,
                         thread_context: loop_output.thread_context.clone(),
                         active_thread: loop_output.thread_context.to_conversation_thread(),
-                        messages: loop_output.turn_messages.clone(),
-                        prepend_incoming_user: loop_output.prepend_incoming_user,
+                        commit_messages: loop_output.commit_messages.clone(),
+                        persist_incoming_user: loop_output.persist_incoming_user,
                         loaded_toolsets: loop_output.loaded_toolsets.clone(),
                         tool_events: loop_output.tool_events.clone(),
                         completed_at,
                     }))
                     .await
-                    .map_err(|error| anyhow::anyhow!("failed to report completed turn: {error}"))?;
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to report completed commit: {error}")
+                    })?;
                 Ok(loop_output)
             }
             Err(error) => {
                 let completed_at = Utc::now();
                 let error_message = format!("{error:#}");
                 event_tx
-                    .send(AgentWorkerEvent::TurnFailed(FailedAgentTurn {
+                    .send(AgentWorkerEvent::CommitFailed(FailedAgentCommit {
                         locator: request.locator,
                         incoming: request.incoming,
                         error: error_message.clone(),
@@ -410,7 +394,7 @@ impl AgentWorker {
                     }))
                     .await
                     .map_err(|send_error| {
-                        anyhow::anyhow!("failed to report failed turn: {send_error}")
+                        anyhow::anyhow!("failed to report failed commit: {send_error}")
                     })?;
                 Err(error)
             }
