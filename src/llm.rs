@@ -2,7 +2,7 @@
 
 use crate::{
     agent::{ToolDefinition, ToolSchemaProtocol},
-    config::LLMConfig,
+    config::{LLMConfig, global_config},
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
 };
 use anyhow::{Context, Result, bail};
@@ -60,6 +60,22 @@ pub fn build_provider(config: &LLMConfig) -> Result<Arc<dyn LLMProvider>> {
             resolve_provider_config(config)?,
         ))),
     }
+}
+
+/// Build one LLM provider directly from the installed global app config snapshot.
+///
+/// # 示例
+/// ```rust,no_run
+/// use openjarvis::config::{AppConfig, install_global_config};
+/// use openjarvis::llm::build_provider_from_global_config;
+///
+/// let config = AppConfig::builder_for_test().build().expect("config should build");
+/// install_global_config(config).expect("config should install");
+///
+/// let _provider = build_provider_from_global_config().expect("provider should build");
+/// ```
+pub fn build_provider_from_global_config() -> Result<Arc<dyn LLMProvider>> {
+    build_provider(global_config().llm_config())
 }
 
 enum LLMProviderProtocol {

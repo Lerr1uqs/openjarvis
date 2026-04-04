@@ -29,5 +29,7 @@
 
 ## 使用方式
 
+- 主启动链路可以在配置 install 后，通过 `build_provider_from_global_config()` 收敛顶层装配。
+- 单测、嵌入式调用和纯组件构造继续优先使用显式 `build_provider(&LLMConfig)`。
 - AgentLoop 只依赖 `LLMProvider` trait，不直接依赖某个 SDK。
 - 新 provider 应先满足统一消息模型，再考虑厂商特性。

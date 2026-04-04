@@ -49,7 +49,8 @@ cargo run
 - 当前长连接模式下不需要 HTTP 入口
 - 默认会自动拉起一个 Node sidecar，通过飞书官方 SDK 建立长连接
 - 启动时会按配置批量注册全部 channel；当前内置实现只有 `feishu`
-- `AppConfig` 在代码层已拆成 `server / channels / llm` 只读子配置，启动层只把对应子配置传给对应模块
+- `AppConfig` 在启动期完成加载和必要 override 后，会被安装成进程级只读快照
+- 顶层 runtime/worker/provider 可以直接从全局只读配置装配；测试和嵌入场景仍保留显式 `from_config(...)` / `build_provider(...)` 入口
 
 ## 配置说明
 

@@ -4,13 +4,12 @@ use anyhow::Result;
 use clap::Parser;
 use openjarvis::{
     agent::{
-        AgentRuntime, AgentWorker,
+        AgentWorker,
         tool::{browser, mcp::demo},
     },
     cli::OpenJarvisCli,
     command::CommandRegistry,
-    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, SessionStoreBackend},
-    llm::build_provider,
+    config::{AppConfig, SessionStoreBackend, install_global_config},
     logging,
     router::ChannelRouter,
     session::{MemorySessionStore, SessionManager, SessionStore, SqliteSessionStore},
@@ -21,7 +20,6 @@ use tracing::{info, warn};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = OpenJarvisCli::parse();
-    let _logging_guards = logging::init_tracing_from_default_config()?;
     // test-only
     if let Some(command) = cli.internal_mcp_command() {
         return demo::run_internal_demo_command(command).await;
@@ -30,6 +28,7 @@ async fn main() -> Result<()> {
         return browser::run_internal_browser_command(command).await;
     }
 
+    let _logging_guards = logging::init_tracing_from_default_config()?;
     let mut config = AppConfig::load()?;
     if cli.builtin_mcp {
         let executable = std::env::current_exe()?;
@@ -46,12 +45,14 @@ async fn main() -> Result<()> {
         max_output_tokens = config.llm_config().max_output_tokens(),
         "resolved llm token limits"
     );
+    let config = install_global_config(config)?;
 
-    let runtime = AgentRuntime::from_config(config.agent_config()).await?;
+    let agent = AgentWorker::from_global_config().await?;
     if !cli.load_skills.is_empty() {
         // Test-only startup path: enable only the explicitly requested local skills for this
         // process so external manual verification can exercise skill loading deterministically.
-        let enabled_skills = runtime
+        let enabled_skills = agent
+            .runtime()
             .tools()
             .skills()
             .restrict_to(&cli.load_skills)
@@ -65,14 +66,6 @@ async fn main() -> Result<()> {
 
     let command_registry = CommandRegistry::with_builtin_commands();
 
-    let agent = AgentWorker::builder()
-        .llm(build_provider(config.llm_config())?)
-        .runtime(runtime)
-        .system_prompt(DEFAULT_ASSISTANT_SYSTEM_PROMPT)
-        .llm_config(config.llm_config().clone())
-        .compact_config(config.agent_config().compact_config().clone())
-        .build()?;
-    
     let session_store: Arc<dyn SessionStore> =
         match config.session_config().persistence_config().backend() {
             SessionStoreBackend::Memory => Arc::new(MemorySessionStore::new()),
@@ -87,7 +80,7 @@ async fn main() -> Result<()> {
                 .await?,
             ),
         };
-        
+
     let mut router = ChannelRouter::builder()
         .agent(agent)
         .session_manager(SessionManager::with_store(session_store).await?)

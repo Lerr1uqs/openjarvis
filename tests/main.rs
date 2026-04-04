@@ -1,4 +1,8 @@
-use openjarvis::{agent::AgentWorker, config::AppConfig, router::ChannelRouter};
+use openjarvis::{
+    agent::AgentWorker,
+    config::{AppConfig, install_global_config},
+    router::ChannelRouter,
+};
 use std::{
     env::temp_dir,
     fs,
@@ -52,6 +56,22 @@ async fn startup_components_build_from_default_config() {
     let agent = AgentWorker::from_config(&config)
         .await
         .expect("agent should build");
+    let _router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
+}
+
+#[tokio::test]
+async fn startup_components_build_from_installed_global_config() {
+    let config = AppConfig::builder_for_test()
+        .build()
+        .expect("test config should validate");
+    install_global_config(config).expect("global config should install");
+
+    let agent = AgentWorker::from_global_config()
+        .await
+        .expect("agent should build from global config");
     let _router = ChannelRouter::builder()
         .agent(agent)
         .build()

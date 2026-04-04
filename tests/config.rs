@@ -1,9 +1,10 @@
 use openjarvis::config::{
-    AgentMcpServerTransportConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LogRotation,
-    SessionStoreBackend,
+    AgentMcpServerTransportConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig,
+    LogRotation, SessionStoreBackend, global_config, install_global_config, try_global_config,
 };
 use serde_json::json;
 use std::{
+    any::Any,
     env::temp_dir,
     fs,
     path::{Path, PathBuf},
@@ -101,10 +102,21 @@ impl<'a> MakeWriter<'a> for CapturedLogWriter {
     }
 }
 
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
 #[test]
 fn missing_config_path_returns_default_config() {
     let path = temp_dir().join(format!("openjarvis-missing-{}.yaml", Uuid::new_v4()));
-    let config = AppConfig::from_path(&path).expect("missing path should fall back to defaults");
+    let config =
+        AppConfig::from_yaml_path(&path).expect("missing path should fall back to defaults");
 
     assert_eq!(config.llm_config().provider, "mock");
     assert_eq!(
@@ -128,12 +140,78 @@ llm:
     )
     .expect("temp config should be written");
 
-    let config = AppConfig::from_path(&path).expect("yaml config should parse");
+    let config = AppConfig::from_yaml_path(&path).expect("yaml config should parse");
     fs::remove_file(&path).expect("temp config should be removed");
 
     assert_eq!(config.channel_config().feishu_config().mode, "");
     assert_eq!(config.llm_config().provider, "mock_llm");
     assert_eq!(config.llm_config().mock_response, "pong");
+}
+
+#[test]
+fn yaml_config_can_be_loaded_from_string() {
+    let config = AppConfig::from_yaml_str(
+        r#"
+llm:
+  provider: "mock_llm"
+  mock_response: "from-yaml-str"
+"#,
+    )
+    .expect("yaml string should parse");
+
+    assert_eq!(config.llm_config().provider, "mock_llm");
+    assert_eq!(config.llm_config().mock_response, "from-yaml-str");
+}
+
+#[test]
+fn builder_for_test_builds_minimal_validated_config() {
+    let config = AppConfig::builder_for_test()
+        .llm(LLMConfig {
+            provider: "mock".to_string(),
+            mock_response: "builder-mock".to_string(),
+            ..LLMConfig::default()
+        })
+        .build()
+        .expect("builder config should validate");
+
+    assert_eq!(config.llm_config().provider, "mock");
+    assert_eq!(config.llm_config().mock_response, "builder-mock");
+}
+
+#[test]
+fn global_config_installation_is_single_assignment_and_fail_fast() {
+    assert!(try_global_config().is_none());
+
+    let panic = std::panic::catch_unwind(global_config)
+        .expect_err("access before install should fail fast");
+    assert!(panic_message(panic).contains("global app config is not installed"));
+
+    let installed = install_global_config(
+        AppConfig::builder_for_test()
+            .llm(LLMConfig {
+                provider: "mock".to_string(),
+                mock_response: "installed".to_string(),
+                ..LLMConfig::default()
+            })
+            .build()
+            .expect("builder config should validate"),
+    )
+    .expect("first install should succeed");
+    assert_eq!(installed.llm_config().mock_response, "installed");
+    assert!(try_global_config().is_some());
+    assert_eq!(global_config().llm_config().mock_response, "installed");
+
+    let duplicate_error = install_global_config(
+        AppConfig::builder_for_test()
+            .build()
+            .expect("default builder config should validate"),
+    )
+    .expect_err("duplicate install should fail");
+    assert!(
+        duplicate_error
+            .to_string()
+            .contains("already been installed")
+    );
 }
 
 #[test]
@@ -187,7 +265,7 @@ llm:
 
 #[test]
 fn session_memory_backend_parses_from_yaml() {
-    let config: AppConfig = serde_yaml::from_str(
+    let config = AppConfig::from_yaml_str(
         r#"
 session:
   persistence:

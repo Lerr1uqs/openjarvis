@@ -7,9 +7,11 @@ use super::{
     sandbox::DummySandboxContainer,
 };
 use crate::compact::CompactProvider;
-use crate::config::{AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
+use crate::config::{
+    AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig, global_config,
+};
 use crate::context::{ChatMessage, ChatMessageRole};
-use crate::llm::{LLMProvider, build_provider};
+use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
 use crate::thread::{Thread, ThreadToolEvent};
@@ -306,6 +308,35 @@ impl AgentWorker {
         Self::builder()
             .llm(build_provider(config.llm_config())?)
             .runtime(AgentRuntime::from_config(config.agent_config()).await?)
+            .system_prompt(DEFAULT_ASSISTANT_SYSTEM_PROMPT)
+            .llm_config(config.llm_config().clone())
+            .compact_config(config.agent_config().compact_config().clone())
+            .build()
+    }
+
+    /// Build a worker directly from the installed global app config snapshot.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::{
+    ///     agent::AgentWorker,
+    ///     config::{AppConfig, install_global_config},
+    /// };
+    ///
+    /// let config = AppConfig::builder_for_test().build()?;
+    /// install_global_config(config)?;
+    ///
+    /// let worker = AgentWorker::from_global_config().await?;
+    /// assert!(worker.sandbox().is_placeholder());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_global_config() -> Result<Self> {
+        let config = global_config();
+        Self::builder()
+            .llm(build_provider_from_global_config()?)
+            .runtime(AgentRuntime::from_global_config().await?)
             .system_prompt(DEFAULT_ASSISTANT_SYSTEM_PROMPT)
             .llm_config(config.llm_config().clone())
             .compact_config(config.agent_config().compact_config().clone())

@@ -21,10 +21,13 @@
 ## 核心能力
 
 - 从配置构造 hooks 和 tools。
+- 同时保留显式 `from_config(...)` 和顶层装配用的 `from_global_config()`。
 - 为多个请求复用同一组 registry。
 - 作为 Worker 和 Loop 的共享能力入口。
 
 ## 使用方式
 
+- 主启动链路可以在 install 全局只读配置后，通过 `from_global_config()` 收敛装配代码。
+- 单测、嵌入式场景和需要局部隔离的代码继续优先使用显式 `from_config(...)`。
 - Runtime 适合放全局目录和共享设施。
 - 线程级动态状态必须回收到 `Thread`，Runtime 不能成为第二份线程状态源。

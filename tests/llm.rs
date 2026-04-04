@@ -1,8 +1,8 @@
 use chrono::Utc;
 use openjarvis::{
-    config::LLMConfig,
+    config::{AppConfig, LLMConfig, install_global_config},
     context::{ChatMessage, ChatMessageRole},
-    llm::{LLMRequest, build_provider},
+    llm::{LLMRequest, build_provider, build_provider_from_global_config},
 };
 use std::{env::temp_dir, fs, path::PathBuf};
 use uuid::Uuid;
@@ -54,6 +54,56 @@ async fn mock_llm_alias_builds_same_provider() {
             .expect("mock provider should return text")
             .content,
         "pong"
+    );
+}
+
+#[tokio::test]
+async fn provider_can_build_from_explicit_and_global_config_paths() {
+    // 测试场景: build_provider 继续支持显式配置，主启动链路也可以改走全局配置便捷入口。
+    let llm_config = LLMConfig {
+        provider: "mock".to_string(),
+        mock_response: "from-global-config".to_string(),
+        ..LLMConfig::default()
+    };
+
+    let explicit_provider =
+        build_provider(&llm_config).expect("explicit provider should build without global config");
+    let explicit_reply = explicit_provider
+        .generate(LLMRequest {
+            messages: build_messages("system", "hello"),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("explicit provider should reply");
+    assert_eq!(
+        explicit_reply
+            .message
+            .expect("explicit provider should return text")
+            .content,
+        "from-global-config"
+    );
+
+    let app_config = AppConfig::builder_for_test()
+        .llm(llm_config)
+        .build()
+        .expect("test app config should validate");
+    install_global_config(app_config).expect("global config should install");
+
+    let global_provider =
+        build_provider_from_global_config().expect("global provider should build");
+    let global_reply = global_provider
+        .generate(LLMRequest {
+            messages: build_messages("system", "hello"),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("global provider should reply");
+    assert_eq!(
+        global_reply
+            .message
+            .expect("global provider should return text")
+            .content,
+        "from-global-config"
     );
 }
 

@@ -3,7 +3,10 @@
 use super::{
     ToolCallRequest, ToolCallResult, ToolDefinition, hook::HookRegistry, tool::ToolRegistry,
 };
-use crate::{config::AgentConfig, thread::Thread};
+use crate::{
+    config::{AgentConfig, global_config},
+    thread::Thread,
+};
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
 
@@ -39,6 +42,28 @@ impl AgentRuntime {
         Self::from_config_with_skill_roots(config, vec![PathBuf::from(".skills")]).await
     }
 
+    /// Create a runtime from the installed global app config snapshot.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use openjarvis::{
+    ///     agent::AgentRuntime,
+    ///     config::{AppConfig, install_global_config},
+    /// };
+    ///
+    /// let config = AppConfig::builder_for_test().build()?;
+    /// install_global_config(config)?;
+    ///
+    /// let runtime = AgentRuntime::from_global_config().await?;
+    /// assert_eq!(runtime.hooks().len().await, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_global_config() -> Result<Self> {
+        Self::from_config(global_config().agent_config()).await
+    }
+
     /// Create a runtime from config with explicit local skill roots.
     ///
     /// This exists mainly so tests can opt into deterministic roots instead of using the
@@ -48,10 +73,15 @@ impl AgentRuntime {
         skill_roots: Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            hooks: Arc::new(HookRegistry::from_config(config.hook_config()).await?),
+            hooks: Arc::new(
+                HookRegistry::from_config(config.hook_config())
+                    .await?
+            ),
             tools: Arc::new(
-                ToolRegistry::from_config_with_skill_roots(config.tool_config(), skill_roots)
-                    .await?,
+                ToolRegistry::from_config_with_skill_roots(
+                    config.tool_config(), 
+                    skill_roots
+                ).await?,
             ),
         })
     }

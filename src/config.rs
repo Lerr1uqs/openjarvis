@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     env, fmt, fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -17,6 +18,87 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1_024;
 const KIMI_K2_5_CONTEXT_WINDOW_TOKENS: usize = 262_144;
 const KIMI_K2_5_MAX_OUTPUT_TOKENS: usize = 32_768;
+static GLOBAL_APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
+
+/// Install one process-wide read-only app config snapshot.
+///
+/// The input config is validated before installation and can only be installed once during the
+/// current process lifetime.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::{AppConfig, install_global_config};
+///
+/// let config = AppConfig::builder_for_test()
+///     .build()
+///     .expect("test config should build");
+/// let installed = install_global_config(config).expect("config should install once");
+///
+/// assert_eq!(installed.llm_config().provider, "mock");
+/// ```
+pub fn install_global_config(config: AppConfig) -> Result<&'static AppConfig> {
+    config
+        .validate()
+        .context("failed to validate app config before global installation")?;
+    if GLOBAL_APP_CONFIG.set(config).is_err() {
+        bail!("global app config has already been installed");
+    }
+
+    let installed = GLOBAL_APP_CONFIG
+        .get()
+        .expect("global app config should be readable immediately after installation");
+    info!(
+        llm_provider = %installed.llm_config().provider,
+        llm_model = %installed.llm_config().model,
+        builtin_mcp_enabled = installed
+            .agent_config()
+            .tool_config()
+            .mcp_config()
+            .servers()
+            .contains_key(BUILTIN_MCP_SERVER_NAME),
+        "installed global read-only app config"
+    );
+    Ok(installed)
+}
+
+/// Return the installed global app config snapshot, or fail fast when startup has not installed it
+/// yet.
+///
+/// Production startup paths should call [`install_global_config`] before using this accessor.
+/// Tests and embedded callers that do not want global state should keep using explicit
+/// `from_config(...)` style APIs instead.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::{AppConfig, global_config, install_global_config};
+///
+/// let config = AppConfig::builder_for_test()
+///     .build()
+///     .expect("test config should build");
+/// install_global_config(config).expect("config should install");
+///
+/// assert_eq!(global_config().llm_config().provider, "mock");
+/// ```
+pub fn global_config() -> &'static AppConfig {
+    GLOBAL_APP_CONFIG.get().expect(
+        "global app config is not installed; call install_global_config before accessing it",
+    )
+}
+
+/// Return the installed global app config snapshot when startup has already installed it.
+///
+/// This probe helper exists for code paths that need to detect initialization state without
+/// panicking.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::try_global_config;
+///
+/// assert!(try_global_config().is_none());
+/// ```
+pub fn try_global_config() -> Option<&'static AppConfig> {
+    GLOBAL_APP_CONFIG.get()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -46,8 +128,9 @@ impl Default for AppConfig {
 impl AppConfig {
     /// Load configuration from `OPENJARVIS_CONFIG` or `config.yaml`.
     ///
-    /// When `config/openjarvis/mcp.json` exists beside the YAML root, its MCP servers are merged
-    /// into `agent.tool.mcp.servers`.
+    /// This is the default startup entrypoint. It applies the same validation, relative-path
+    /// resolution, and optional `config/openjarvis/mcp.json` sidecar merge behavior as
+    /// [`AppConfig::from_yaml_path`].
     ///
     /// # 示例
     /// ```no_run
@@ -58,24 +141,25 @@ impl AppConfig {
     /// ```
     pub fn load() -> Result<Self> {
         let path = env::var("OPENJARVIS_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
-        Self::from_path(path)
+        Self::from_yaml_path(path)
     }
 
-    /// Load configuration from a specific YAML path, falling back to defaults when the file is
+    /// Load configuration from one specific YAML path, falling back to defaults when the file is
     /// missing.
     ///
-    /// When `config/openjarvis/mcp.json` exists beside the YAML root, its MCP servers are merged
-    /// into `agent.tool.mcp.servers`.
+    /// Compared with [`AppConfig::from_yaml_str`], this entrypoint also resolves relative logging
+    /// and session paths against the YAML location and attempts to merge the optional
+    /// `config/openjarvis/mcp.json` sidecar beside the YAML root.
     ///
     /// # 示例
     /// ```rust
     /// use openjarvis::config::AppConfig;
     ///
     /// let config =
-    ///     AppConfig::from_path("missing-config.yaml").expect("missing config should use defaults");
+    ///     AppConfig::from_yaml_path("missing-config.yaml").expect("missing config should use defaults");
     /// assert_eq!(config.llm_config().provider, "mock");
     /// ```
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_yaml_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut config = if path.exists() {
             let raw = fs::read_to_string(path)
@@ -92,6 +176,65 @@ impl AppConfig {
             .validate()
             .with_context(|| format!("failed to validate config file {}", path.display()))?;
         Ok(config)
+    }
+
+    /// Parse configuration directly from one YAML string.
+    ///
+    /// Compared with [`AppConfig::from_yaml_path`], this entrypoint validates the parsed config but
+    /// does not resolve relative filesystem paths and does not load any external MCP sidecar file
+    /// because it has no filesystem anchor.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::from_yaml_str(
+    ///     r#"
+    /// llm:
+    ///   provider: "mock"
+    ///   mock_response: "pong"
+    /// "#,
+    /// )
+    /// .expect("yaml string should parse");
+    ///
+    /// assert_eq!(config.llm_config().mock_response, "pong");
+    /// ```
+    pub fn from_yaml_str(yaml: &str) -> Result<Self> {
+        let config = serde_yaml::from_str::<Self>(yaml)
+            .context("failed to parse config from yaml string")?;
+        config
+            .validate()
+            .context("failed to validate config from yaml string")?;
+        Ok(config)
+    }
+
+    /// Return one minimal validated config builder for unit tests and embedded construction.
+    ///
+    /// This entrypoint starts from [`AppConfig::default`] and keeps configuration explicit inside
+    /// the current test without touching the process-wide global snapshot.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::{AppConfig, LLMConfig};
+    ///
+    /// let config = AppConfig::builder_for_test()
+    ///     .llm(LLMConfig {
+    ///         provider: "mock".to_string(),
+    ///         mock_response: "builder".to_string(),
+    ///         ..LLMConfig::default()
+    ///     })
+    ///     .build()
+    ///     .expect("builder config should validate");
+    ///
+    /// assert_eq!(config.llm_config().mock_response, "builder");
+    /// ```
+    pub fn builder_for_test() -> AppConfigBuilderForTest {
+        AppConfigBuilderForTest::default()
+    }
+
+    #[doc(hidden)]
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_yaml_path(path)
     }
 
     /// Return the read-only channel configuration view.
@@ -135,7 +278,11 @@ impl AppConfig {
         &self.llm
     }
 
-    /// Enable the demo-only builtin MCP server for local verification.
+    /// Enable the demo-only builtin MCP server for local verification before global installation.
+    ///
+    /// This is only a startup-phase override for the to-be-installed config snapshot. Callers
+    /// should finish this mutation before [`install_global_config`] and should not treat it as a
+    /// runtime writable config interface.
     ///
     /// # 示例
     /// ```rust
@@ -219,6 +366,80 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+}
+
+/// Builder used by tests to assemble one validated [`AppConfig`] without depending on global
+/// process state.
+#[derive(Debug, Clone)]
+pub struct AppConfigBuilderForTest {
+    config: AppConfig,
+}
+
+impl Default for AppConfigBuilderForTest {
+    fn default() -> Self {
+        Self {
+            config: AppConfig::default(),
+        }
+    }
+}
+
+impl AppConfigBuilderForTest {
+    /// Replace the logging section used by the test config under construction.
+    pub fn logging(mut self, logging: LoggingConfig) -> Self {
+        self.config.logging = logging;
+        self
+    }
+
+    /// Replace the channel section used by the test config under construction.
+    pub fn channels(mut self, channels: ChannelConfig) -> Self {
+        self.config.channels = channels;
+        self
+    }
+
+    /// Replace the session section used by the test config under construction.
+    pub fn session(mut self, session: SessionConfig) -> Self {
+        self.config.session = session;
+        self
+    }
+
+    /// Replace the agent section used by the test config under construction.
+    pub fn agent(mut self, agent: AgentConfig) -> Self {
+        self.config.agent = agent;
+        self
+    }
+
+    /// Replace the LLM section used by the test config under construction.
+    pub fn llm(mut self, llm: LLMConfig) -> Self {
+        self.config.llm = llm;
+        self
+    }
+
+    /// Finish the builder and validate the resulting config snapshot.
+    ///
+    /// This builder path intentionally does not resolve relative paths from disk and does not load
+    /// external MCP sidecar files; tests should set those values explicitly when they care.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::{AppConfig, LLMConfig};
+    ///
+    /// let config = AppConfig::builder_for_test()
+    ///     .llm(LLMConfig {
+    ///         provider: "mock".to_string(),
+    ///         mock_response: "pong".to_string(),
+    ///         ..LLMConfig::default()
+    ///     })
+    ///     .build()
+    ///     .expect("builder config should validate");
+    ///
+    /// assert_eq!(config.llm_config().mock_response, "pong");
+    /// ```
+    pub fn build(self) -> Result<AppConfig> {
+        self.config
+            .validate()
+            .context("failed to validate app config built for test")?;
+        Ok(self.config)
     }
 }
 

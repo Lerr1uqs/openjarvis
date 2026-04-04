@@ -28,5 +28,7 @@
 
 ## 使用方式
 
+- 主程序可以在配置 install 后，通过 `from_global_config()` 构造 worker。
+- 单测和嵌入式调用继续优先使用显式 `from_config(...)`，避免把全局单例带进局部场景。
 - Router 不直接调 `AgentLoop`，而是通过 `AgentWorkerHandle` 投递请求。
 - 跨轮线程真相应留在 `ThreadContext`，不要放在 Worker 私有缓存里。

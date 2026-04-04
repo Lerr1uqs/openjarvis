@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
-    agent::{AgentRequest, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent},
-    config::AppConfig,
+    agent::{AgentRequest, AgentRuntime, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent},
+    config::{AppConfig, install_global_config},
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
@@ -211,6 +211,42 @@ llm:
 
     assert_eq!(worker.runtime().hooks().len().await, 1);
     assert!(worker.sandbox().is_placeholder());
+}
+
+#[tokio::test]
+async fn worker_can_build_from_explicit_and_global_config_paths() {
+    // 测试场景: runtime/worker 显式 from_config 路径必须继续可用，同时主启动链路可以切换到全局配置便捷入口。
+    let config = AppConfig::from_yaml_str(
+        r#"
+agent:
+  hook:
+    notification: ["echo", "worker-hook"]
+llm:
+  provider: "mock"
+"#,
+    )
+    .expect("config should parse");
+
+    let explicit_runtime = AgentRuntime::from_config(config.agent_config())
+        .await
+        .expect("explicit runtime should build");
+    assert_eq!(explicit_runtime.hooks().len().await, 1);
+
+    let explicit_worker = AgentWorker::from_config(&config)
+        .await
+        .expect("explicit worker should build");
+    assert_eq!(explicit_worker.runtime().hooks().len().await, 1);
+
+    install_global_config(config).expect("global config should install");
+    let global_runtime = AgentRuntime::from_global_config()
+        .await
+        .expect("global runtime should build");
+    assert_eq!(global_runtime.hooks().len().await, 1);
+    let global_worker = AgentWorker::from_global_config()
+        .await
+        .expect("global worker should build");
+    assert_eq!(global_worker.runtime().hooks().len().await, 1);
+    assert!(global_worker.sandbox().is_placeholder());
 }
 
 #[tokio::test]
