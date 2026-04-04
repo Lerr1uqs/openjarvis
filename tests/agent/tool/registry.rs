@@ -1,3 +1,4 @@
+use super::{build_thread, call_tool, list_tools};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -6,7 +7,7 @@ use openjarvis::{
         ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
         ToolsetCatalogEntry, empty_tool_input_schema,
     },
-    thread::{ThreadContext, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -59,7 +60,7 @@ async fn compact_tool_visibility_is_controlled_by_request_state() {
         .await
         .expect("builtin tools should register");
 
-    let thread_context = ThreadContext::new(
+    let thread_context = Thread::new(
         ThreadContextLocator::new(
             None,
             "feishu",
@@ -78,15 +79,15 @@ async fn compact_tool_visibility_is_controlled_by_request_state() {
     // 测试场景: 只有在当前 request state 显式要求暴露时，compact tool 才对模型可见。
     let with_compact = registry
         .list_for_context_with_compact(&thread_context, true)
-        .await;
-    let with_compact = with_compact.expect("tool listing should succeed after request expose");
+        .await
+        .expect("tool listing should succeed after request expose");
 
     assert!(with_compact.iter().any(|tool| tool.name == "compact"));
 }
 
 #[tokio::test]
-async fn deprecated_thread_entrypoints_forward_to_thread_context_runtime() {
-    // 测试场景: deprecated thread-id 入口仍要转发到 ThreadContext 路径，且不能把 toolset 状态泄漏到其他线程。
+async fn thread_state_is_loaded_from_thread_snapshot_only() {
+    // 测试场景: registry 只消费 Thread 自身的 loaded_toolsets，不再恢复 thread-id keyed legacy cache。
     let registry = ToolRegistry::with_skill_roots(Vec::new());
     registry
         .register_toolset(
@@ -95,35 +96,25 @@ async fn deprecated_thread_entrypoints_forward_to_thread_context_runtime() {
         )
         .await
         .expect("demo toolset should register");
+    let mut loaded_thread = build_thread("thread_loaded");
+    let other_thread = build_thread("thread_other");
 
-    #[allow(deprecated)]
-    let load_result = registry
-        .call_for_thread(
-            "thread_compat",
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo" }),
-            },
-        )
+    let load_result = call_tool(
+        &registry,
+        &mut loaded_thread,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo" }),
+        },
+    )
+    .await
+    .expect("load_toolset should succeed");
+    let visible_for_loaded = list_tools(&registry, &loaded_thread)
         .await
-        .expect("legacy load_toolset entrypoint should succeed");
-    #[allow(deprecated)]
-    let visible_for_loaded = registry
-        .list_for_thread("thread_compat")
-        .await
-        .expect("loaded legacy thread should expose demo tool");
-    #[allow(deprecated)]
-    let visible_for_other = registry
-        .list_for_thread("thread_other")
+        .expect("loaded thread should expose demo tool");
+    let visible_for_other = list_tools(&registry, &other_thread)
         .await
         .expect("other thread should keep isolated visibility");
-    let mut thread_context = ThreadContext::new(
-        ThreadContextLocator::for_internal_thread("thread_compat"),
-        Utc::now(),
-    );
-    registry
-        .merge_legacy_thread_state(&mut thread_context)
-        .await;
 
     assert_eq!(load_result.metadata["loaded_toolsets"], json!(["demo"]));
     assert!(
@@ -136,5 +127,5 @@ async fn deprecated_thread_entrypoints_forward_to_thread_context_runtime() {
             .iter()
             .any(|tool| tool.name == "demo__echo")
     );
-    assert_eq!(thread_context.load_toolsets(), vec!["demo".to_string()]);
+    assert_eq!(loaded_thread.load_toolsets(), vec!["demo".to_string()]);
 }

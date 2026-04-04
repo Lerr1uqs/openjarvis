@@ -11,7 +11,7 @@ use crate::config::ChannelConfig;
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
-use crate::thread::ThreadContext;
+use crate::thread::Thread;
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, pending};
@@ -427,7 +427,7 @@ impl ChannelRouter {
                 .sessions
                 .load_thread_context(&locator)
                 .await?
-                .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
+                .unwrap_or_else(|| Thread::new((&locator).into(), message.received_at));
             if let Some(reply) = self
                 .commands
                 .try_execute_with_thread_context(&message, &mut thread_context)
@@ -462,6 +462,9 @@ impl ChannelRouter {
     async fn handle_agent_event(&self, event: AgentWorkerEvent) -> Result<()> {
         match event {
             AgentWorkerEvent::Dispatch(event) => self.process_agent_dispatch_event(event).await,
+            AgentWorkerEvent::ThreadContextSynced(update) => {
+                self.sync_bootstrapped_thread_context(update).await
+            }
             AgentWorkerEvent::CommitCompleted(commit) => self.store_completed_commit(commit).await,
             AgentWorkerEvent::CommitFailed(commit) => self.store_failed_commit(commit).await,
         }
@@ -492,6 +495,16 @@ impl ChannelRouter {
             target: event.target,
         };
         self.dispatch_outgoing(outgoing).await
+    }
+
+    async fn sync_bootstrapped_thread_context(
+        &self,
+        update: crate::agent::SyncedThreadContext,
+    ) -> Result<()> {
+        self.sessions
+            .store_thread_context(&update.locator, update.thread_context, update.synced_at)
+            .await?;
+        Ok(())
     }
 
     async fn dispatch_command_reply(
@@ -637,7 +650,7 @@ impl ChannelRouter {
             .sessions
             .load_thread_context(&locator)
             .await?
-            .unwrap_or_else(|| ThreadContext::new((&locator).into(), message.received_at));
+            .unwrap_or_else(|| Thread::new((&locator).into(), message.received_at));
         if let Err(error) = self
             .agent_tx
             .send(AgentRequest {

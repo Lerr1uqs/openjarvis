@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
-use uuid::Uuid;
 
 const COMPACT_SYSTEM_PROMPT: &str = "你是 OpenJarvis 的 compact summarizer。你会把历史 chat 压缩成一条 assistant 可见的紧凑上下文。严格输出 JSON 对象，字段必须是 `compacted_assistant`。内容必须明确说明“这是压缩后的上下文”，并保留任务目标、用户约束、当前背景、当前规划、已完成、未完成和关键事实。不要输出 markdown，不要输出额外解释。";
 pub const COMPACTED_ASSISTANT_PREFIX: &str = "这是压缩后的上下文，请基于这些信息继续当前任务：\n";
@@ -18,12 +17,11 @@ pub const COMPACTED_USER_CONTINUE_MESSAGE: &str = "继续";
 /// Fixed-format compact request sent to a compact provider.
 #[derive(Debug, Clone)]
 pub struct CompactRequest {
-    pub source_turn_ids: Vec<Uuid>,
     pub messages: Vec<ChatMessage>,
 }
 
 impl CompactRequest {
-    /// Create one compact request from resolved source turns and messages.
+    /// Create one compact request from resolved source messages.
     ///
     /// # 示例
     /// ```rust
@@ -32,28 +30,19 @@ impl CompactRequest {
     ///     compact::CompactRequest,
     ///     context::{ChatMessage, ChatMessageRole},
     /// };
-    /// use uuid::Uuid;
-    ///
     /// let request = CompactRequest::new(
-    ///     vec![Uuid::new_v4()],
     ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", Utc::now())],
     /// )
     /// .expect("request should be valid");
     ///
     /// assert_eq!(request.messages.len(), 1);
     /// ```
-    pub fn new(source_turn_ids: Vec<Uuid>, messages: Vec<ChatMessage>) -> Result<Self> {
-        if source_turn_ids.is_empty() {
-            bail!("compact request must contain at least one source turn id");
-        }
+    pub fn new(messages: Vec<ChatMessage>) -> Result<Self> {
         if messages.is_empty() {
             bail!("compact request must contain at least one source message");
         }
 
-        Ok(Self {
-            source_turn_ids,
-            messages,
-        })
+        Ok(Self { messages })
     }
 }
 
@@ -114,10 +103,8 @@ pub struct CompactPrompt {
 ///     compact::{CompactRequest, build_compact_prompt},
 ///     context::{ChatMessage, ChatMessageRole},
 /// };
-/// use uuid::Uuid;
 ///
 /// let request = CompactRequest::new(
-///     vec![Uuid::new_v4()],
 ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", Utc::now())],
 /// )
 /// .expect("request should build");
@@ -130,13 +117,7 @@ pub fn build_compact_prompt(request: &CompactRequest) -> CompactPrompt {
     CompactPrompt {
         system_prompt: COMPACT_SYSTEM_PROMPT.to_string(),
         user_prompt: format!(
-            "你将收到需要被 compact 的 chat 历史。\n请输出 JSON：{{\"compacted_assistant\":\"...\"}}\nsource_turn_ids: {}\nchat_history:\n{}",
-            request
-                .source_turn_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
+            "你将收到需要被 compact 的 chat 历史。\n请输出 JSON：{{\"compacted_assistant\":\"...\"}}\nchat_history:\n{}",
             rendered_history
         ),
     }
@@ -186,7 +167,6 @@ impl CompactProvider for LLMCompactProvider {
     async fn compact(&self, request: CompactRequest) -> Result<CompactSummary> {
         let prompt = build_compact_prompt(&request);
         info!(
-            source_turn_count = request.source_turn_ids.len(),
             source_message_count = request.messages.len(),
             "calling compact provider"
         );

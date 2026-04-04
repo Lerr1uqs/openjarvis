@@ -8,7 +8,7 @@ use openjarvis::{
     compact::ContextBudgetReport,
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
-    thread::{ThreadContext, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator},
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -38,8 +38,8 @@ impl ToolHandler for DemoFeatureTool {
 
 #[tokio::test]
 async fn feature_prompt_rebuilder_rebuilds_fixed_slots_from_all_providers() {
-    // 测试场景: rebuilder 只负责写入静态 features_system_prompt；
-    // 动态 context capacity 由 AutoCompactor 单独注入 transient runtime system message。
+    // 测试场景: rebuilder 应生成稳定 system messages，
+    // 并由调用方在 init 时一次性持久化进 Thread。
     let fixture = SkillFixture::new("openjarvis-feature-rebuilder");
     fixture.write_skill(
         "demo_skill",
@@ -71,7 +71,7 @@ Read `guide.md` before replying.
     let rebuilder = FeaturePromptRebuilder::new(Arc::clone(&registry), compact_config.clone());
     let auto_compactor = AutoCompactor::new(compact_config);
     let now = chrono::Utc::now();
-    let mut thread_context = ThreadContext::new(
+    let mut thread_context = Thread::new(
         ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_feature", "thread_feature"),
         now,
     );
@@ -86,39 +86,41 @@ Read `guide.md` before replying.
         256,
     );
 
-    rebuilder
-        .rebuild(&mut thread_context, true)
+    let built_messages = rebuilder
+        .build_messages(&thread_context, true)
         .await
-        .expect("feature prompts should rebuild");
-    auto_compactor.notify_capacity(&mut thread_context, Some(&budget_report));
+        .expect("feature prompts should build");
+    assert!(thread_context.ensure_system_prefix_messages(&built_messages));
+    let mut runtime_system_messages = Vec::new();
+    auto_compactor.notify_capacity(&mut runtime_system_messages, Some(&budget_report));
 
-    let features_system_prompt = thread_context.features_system_prompt();
     assert!(
-        features_system_prompt
-            .toolset_catalog
+        thread_context
+            .system_prefix_messages()
             .iter()
             .any(|message| message.content.contains("OpenJarvis tool-use mode"))
     );
     assert!(
-        features_system_prompt
-            .toolset_catalog
+        thread_context
+            .system_prefix_messages()
             .iter()
             .any(|message| message.content.contains("Available toolsets"))
     );
     assert!(
-        features_system_prompt
-            .skill_catalog
+        thread_context
+            .system_prefix_messages()
             .iter()
             .any(|message| message.content.contains("Available local skills"))
     );
-    assert_eq!(features_system_prompt.auto_compact.len(), 1);
     assert!(
-        features_system_prompt.auto_compact[0]
-            .content
-            .contains("Auto-compact 已开启")
+        thread_context
+            .system_prefix_messages()
+            .iter()
+            .any(|message| message.content.contains("Auto-compact 已开启"))
     );
 
-    let exported_messages = thread_context.messages();
+    let mut exported_messages = thread_context.messages();
+    exported_messages.extend(runtime_system_messages);
     let auto_compact_index = exported_messages
         .iter()
         .position(|message| message.content.contains("Auto-compact 已开启"))
@@ -133,7 +135,7 @@ Read `guide.md` before replying.
 
 #[tokio::test]
 async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
-    // 测试场景: provider rebuild 只能更新 features_system_prompt，不能改写 persisted history。
+    // 测试场景: build_messages 只负责生成初始化消息，不能直接改写 persisted history。
     let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
     registry
         .register_builtin_tools()
@@ -144,7 +146,7 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
         AppConfig::default().agent_config().compact_config().clone(),
     );
     let now = chrono::Utc::now();
-    let mut thread_context = ThreadContext::new(
+    let mut thread_context = Thread::new(
         ThreadContextLocator::new(
             None,
             "feishu",
@@ -165,10 +167,10 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
         now,
     );
 
-    rebuilder
-        .rebuild(&mut thread_context, false)
+    let built_messages = rebuilder
+        .build_messages(&thread_context, false)
         .await
-        .expect("feature prompts should rebuild");
+        .expect("feature prompts should build");
 
     assert_eq!(thread_context.load_messages().len(), 1);
     assert_eq!(
@@ -176,17 +178,14 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
         "persisted history"
     );
     assert!(
-        thread_context
-            .features_system_prompt()
-            .toolset_catalog
+        built_messages
             .iter()
             .any(|message| message.content.contains("OpenJarvis tool-use mode"))
     );
     assert!(
-        thread_context
-            .features_system_prompt()
-            .auto_compact
-            .is_empty()
+        !built_messages
+            .iter()
+            .any(|message| message.content.contains("Auto-compact 已开启"))
     );
     assert!(
         !thread_context
@@ -202,7 +201,7 @@ async fn auto_compactor_injects_capacity_as_transient_runtime_system_message() {
     let compact_config = AppConfig::default().agent_config().compact_config().clone();
     let auto_compactor = AutoCompactor::new(compact_config.clone());
     let now = chrono::Utc::now();
-    let mut thread_context = ThreadContext::new(
+    let thread_context = Thread::new(
         ThreadContextLocator::new(
             None,
             "feishu",
@@ -215,7 +214,6 @@ async fn auto_compactor_injects_capacity_as_transient_runtime_system_message() {
     let budget_report = ContextBudgetReport::new(
         HashMap::from([
             (ContextTokenKind::System, 32),
-            (ContextTokenKind::Memory, 8),
             (ContextTokenKind::Chat, 160),
             (ContextTokenKind::VisibleTool, 16),
             (ContextTokenKind::ReservedOutput, 16),
@@ -223,17 +221,12 @@ async fn auto_compactor_injects_capacity_as_transient_runtime_system_message() {
         256,
     );
 
-    auto_compactor.notify_capacity(&mut thread_context, Some(&budget_report));
+    let mut runtime_system_messages = Vec::new();
+    auto_compactor.notify_capacity(&mut runtime_system_messages, Some(&budget_report));
 
+    assert!(thread_context.system_prefix_messages().is_empty());
     assert!(
-        thread_context
-            .features_system_prompt()
-            .auto_compact
-            .is_empty()
-    );
-    assert!(
-        thread_context
-            .messages()
+        runtime_system_messages
             .iter()
             .any(|message| message.content.contains("<context capacity"))
     );

@@ -1,11 +1,11 @@
-//! Feature-prompt providers that rebuild fixed feature system prompts on `ThreadContext`.
+//! Feature providers that materialize stable system messages into `Thread` during init.
 
 use super::tool::ToolRegistry;
 use crate::{
     compact::ContextBudgetReport,
     config::AgentCompactConfig,
     context::{ChatMessage, ChatMessageRole},
-    thread::{ThreadContext, ThreadFeaturesSystemPrompt},
+    thread::Thread,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,45 +17,22 @@ const TOOL_USE_MODE_PROMPT: &str = "You are running in OpenJarvis tool-use mode.
 
 /// Shared immutable input passed to one feature prompt provider rebuild.
 pub struct FeaturePromptBuildContext<'a> {
-    pub thread_context: &'a ThreadContext,
+    pub thread_context: &'a Thread,
     pub created_at: DateTime<Utc>,
     pub auto_compact_enabled: bool,
 }
 
-/// Fixed provider contract for one thread-scoped dynamic feature prompt.
+/// Fixed provider contract for one thread-scoped init system-message producer.
 #[async_trait]
 pub trait FeaturePromptProvider: Send + Sync {
     /// Return the stable provider name used for logging and tests.
     fn name(&self) -> &'static str;
 
-    /// Build the current feature prompt output from immutable thread/runtime inputs.
-    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<FeaturePromptOutput>;
+    /// Build the stable init-time system messages from immutable thread inputs.
+    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<Vec<ChatMessage>>;
 }
 
-/// One provider rebuild result mapped back into `ThreadContext`.
-pub enum FeaturePromptOutput {
-    ToolsetCatalog(Vec<ChatMessage>),
-    SkillCatalog(Vec<ChatMessage>),
-    AutoCompact(Vec<ChatMessage>),
-}
-
-impl FeaturePromptOutput {
-    fn write_into(self, features_system_prompt: &mut ThreadFeaturesSystemPrompt) {
-        match self {
-            Self::ToolsetCatalog(messages) => {
-                features_system_prompt.toolset_catalog = messages;
-            }
-            Self::SkillCatalog(messages) => {
-                features_system_prompt.skill_catalog = messages;
-            }
-            Self::AutoCompact(messages) => {
-                features_system_prompt.auto_compact = messages;
-            }
-        }
-    }
-}
-
-/// Rebuild all fixed feature prompt providers into the current `ThreadContext`.
+/// Build all fixed feature prompts into one init-time system-message snapshot.
 pub struct FeaturePromptRebuilder {
     pub providers: Vec<Box<dyn FeaturePromptProvider>>,
 }
@@ -76,32 +53,43 @@ impl FeaturePromptRebuilder {
         }
     }
 
-    /// Rebuild the current thread feature system prompt in fixed provider order.
-    pub async fn rebuild(
+    /// Build the current stable feature messages in fixed provider order.
+    pub async fn build_messages(
         &self,
-        thread_context: &mut ThreadContext,
+        thread_context: &Thread,
         auto_compact_enabled: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<ChatMessage>> {
         let created_at = Utc::now();
         let context = FeaturePromptBuildContext {
             thread_context,
             created_at,
             auto_compact_enabled,
         };
-        let mut features_system_prompt = ThreadFeaturesSystemPrompt::default();
+        let mut messages = Vec::new();
 
         for provider in &self.providers {
-            let output = provider.build(&context).await?;
-            output.write_into(&mut features_system_prompt);
+            messages.extend(provider.build(&context).await?);
         }
 
         info!(
             thread_id = %thread_context.locator.thread_id,
             provider_count = self.providers.len(),
-            "rebuilding fixed feature prompt providers for thread"
+            system_message_count = messages.len(),
+            "built fixed feature init messages for thread"
         );
-        thread_context.rebuild_features_system_prompt(features_system_prompt);
-        Ok(())
+        Ok(messages)
+    }
+
+    /// Initialize the thread's stable feature messages when the thread has not been initialized yet.
+    pub async fn initialize_thread(
+        &self,
+        thread_context: &mut Thread,
+        auto_compact_enabled: bool,
+    ) -> Result<bool> {
+        let messages = self
+            .build_messages(thread_context, auto_compact_enabled)
+            .await?;
+        Ok(thread_context.ensure_system_prefix_messages(&messages))
     }
 }
 
@@ -122,7 +110,7 @@ impl FeaturePromptProvider for ToolsetCatalogFeaturePromptProvider {
         "toolset_catalog"
     }
 
-    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<FeaturePromptOutput> {
+    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<Vec<ChatMessage>> {
         let mut messages = vec![ChatMessage::new(
             ChatMessageRole::System,
             TOOL_USE_MODE_PROMPT,
@@ -140,7 +128,7 @@ impl FeaturePromptProvider for ToolsetCatalogFeaturePromptProvider {
             ));
         }
 
-        Ok(FeaturePromptOutput::ToolsetCatalog(messages))
+        Ok(messages)
     }
 }
 
@@ -161,8 +149,8 @@ impl FeaturePromptProvider for SkillCatalogFeaturePromptProvider {
         "skill_catalog"
     }
 
-    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<FeaturePromptOutput> {
-        let messages = self
+    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<Vec<ChatMessage>> {
+        Ok(self
             .tool_registry
             .skills()
             .catalog_prompt()
@@ -171,8 +159,7 @@ impl FeaturePromptProvider for SkillCatalogFeaturePromptProvider {
             .map(|catalog_prompt| {
                 ChatMessage::new(ChatMessageRole::System, catalog_prompt, context.created_at)
             })
-            .collect::<Vec<_>>();
-        Ok(FeaturePromptOutput::SkillCatalog(messages))
+            .collect::<Vec<_>>())
     }
 }
 
@@ -195,16 +182,16 @@ impl FeaturePromptProvider for AutoCompactFeaturePromptProvider {
         "auto_compact"
     }
 
-    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<FeaturePromptOutput> {
+    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<Vec<ChatMessage>> {
         if !context.auto_compact_enabled {
-            return Ok(FeaturePromptOutput::AutoCompact(Vec::new()));
+            return Ok(Vec::new());
         }
 
-        Ok(FeaturePromptOutput::AutoCompact(vec![ChatMessage::new(
+        Ok(vec![ChatMessage::new(
             ChatMessageRole::System,
-            "Auto-compact 已开启。`compact` 工具当前可用；当你判断剩余上下文不足以安全继续时，可以主动调用它。`compact` 只会压缩当前线程的 chat 历史，不会压缩 system 或 memory。",
+            "Auto-compact 已开启。`compact` 工具当前可用；当你判断剩余上下文不足以安全继续时，可以主动调用它。`compact` 只会压缩当前线程的非 system 历史。",
             context.created_at,
-        )]))
+        )])
     }
 }
 
@@ -230,14 +217,15 @@ impl AutoCompactor {
     ///     compact::ContextBudgetReport,
     ///     config::AgentCompactConfig,
     ///     context::ContextTokenKind,
-    ///     thread::{ThreadContext, ThreadContextLocator},
+    ///     thread::{Thread, ThreadContextLocator},
     /// };
     ///
     /// let now = Utc::now();
-    /// let mut thread_context = ThreadContext::new(
+    /// let thread_context = Thread::new(
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     now,
     /// );
+    /// let mut runtime_system_messages = Vec::new();
     /// let budget_report = ContextBudgetReport::new(
     ///     HashMap::from([
     ///         (ContextTokenKind::System, 32),
@@ -249,24 +237,24 @@ impl AutoCompactor {
     /// );
     ///
     /// AutoCompactor::new(AgentCompactConfig::default())
-    ///     .notify_capacity(&mut thread_context, Some(&budget_report));
+    ///     .notify_capacity(&mut runtime_system_messages, Some(&budget_report));
     ///
-    /// assert!(thread_context
-    ///     .messages()
+    /// assert!(runtime_system_messages
     ///     .iter()
     ///     .any(|message| message.content.contains("<context capacity")));
     /// ```
     pub fn notify_capacity(
         &self,
-        thread_context: &mut ThreadContext,
+        runtime_system_messages: &mut Vec<ChatMessage>,
         budget_report: Option<&ContextBudgetReport>,
     ) {
         let Some(budget_report) = budget_report else {
-            thread_context.replace_live_system_messages(Vec::new());
+            runtime_system_messages.clear();
             return;
         };
 
-        thread_context.replace_live_system_messages(vec![ChatMessage::new(
+        runtime_system_messages.clear();
+        runtime_system_messages.push(ChatMessage::new(
             ChatMessageRole::System,
             build_auto_compact_dynamic_prompt(
                 budget_report,
@@ -274,7 +262,7 @@ impl AutoCompactor {
                 self.compact_config.runtime_threshold_ratio(),
             ),
             Utc::now(),
-        )]);
+        ));
     }
 }
 

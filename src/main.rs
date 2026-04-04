@@ -8,7 +8,7 @@ use openjarvis::{
         tool::{browser, mcp::demo},
     },
     cli::OpenJarvisCli,
-    command::{CommandRegistry, register_runtime_commands},
+    command::CommandRegistry,
     config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, SessionStoreBackend},
     llm::build_provider,
     logging,
@@ -48,7 +48,6 @@ async fn main() -> Result<()> {
     );
 
     let runtime = AgentRuntime::from_config(config.agent_config()).await?;
-    let compact_runtime = runtime.compact_runtime();
     if !cli.load_skills.is_empty() {
         // Test-only startup path: enable only the explicitly requested local skills for this
         // process so external manual verification can exercise skill loading deterministically.
@@ -63,14 +62,9 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>();
         info!(skills = ?enabled_skill_names, "loaded local skills from startup flags");
     }
-    let mut command_registry = CommandRegistry::with_builtin_commands();
-    register_runtime_commands(
-        &mut command_registry,
-        config.agent_config().compact_config().enabled(),
-        config.agent_config().compact_config().auto_compact(),
-        compact_runtime,
-    )?;
-    // TODO: 修改为链式builder DEFAULT_ASSISTANT_SYSTEM_PROMPT在new中默认 但是提供注入api
+
+    let command_registry = CommandRegistry::with_builtin_commands();
+
     let agent = AgentWorker::builder()
         .llm(build_provider(config.llm_config())?)
         .runtime(runtime)
@@ -78,6 +72,7 @@ async fn main() -> Result<()> {
         .llm_config(config.llm_config().clone())
         .compact_config(config.agent_config().compact_config().clone())
         .build()?;
+    
     let session_store: Arc<dyn SessionStore> =
         match config.session_config().persistence_config().backend() {
             SessionStoreBackend::Memory => Arc::new(MemorySessionStore::new()),
@@ -92,6 +87,7 @@ async fn main() -> Result<()> {
                 .await?,
             ),
         };
+        
     let mut router = ChannelRouter::builder()
         .agent(agent)
         .session_manager(SessionManager::with_store(session_store).await?)

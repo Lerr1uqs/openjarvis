@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     session::{SessionKey, ThreadLocator},
-    thread::ThreadContext,
+    thread::Thread,
 };
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
@@ -286,7 +286,7 @@ VALUES (?1, ?2, ?3, ?4, ?5)
     async fn load_thread_context(
         &self,
         locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<ThreadContext>> {
+    ) -> SessionStoreResult<Option<Thread>> {
         let session_id = locator.session_id.to_string();
         let thread_id = locator.thread_id.to_string();
         let resolved_locator = crate::thread::ThreadContextLocator::from(locator);
@@ -304,13 +304,13 @@ WHERE session_id = ?1 AND thread_id = ?2
                 .optional()
                 .context("failed to load sqlite thread snapshot")?
                 .map(|(snapshot_json, revision)| {
-                    let mut thread_context = serde_json::from_str::<ThreadContext>(&snapshot_json)
+                    let mut thread_context = serde_json::from_str::<Thread>(&snapshot_json)
                         .with_context(|| "failed to deserialize sqlite thread snapshot")?;
                     thread_context.rebind_locator(resolved_locator);
                     thread_context.set_revision(
                         u64::try_from(revision).context("sqlite revision must not be negative")?,
                     );
-                    Ok::<ThreadContext, anyhow::Error>(thread_context)
+                    Ok::<Thread, anyhow::Error>(thread_context)
                 })
                 .transpose()
                 .map_err(Into::into)
@@ -323,7 +323,7 @@ WHERE session_id = ?1 AND thread_id = ?2
 
     async fn save_thread_context(
         &self,
-        thread_context: &ThreadContext,
+        thread_context: &Thread,
         updated_at: DateTime<Utc>,
         dedup_record: Option<&ExternalMessageDedupRecord>,
     ) -> SessionStoreResult<u64> {
@@ -387,7 +387,7 @@ INSERT INTO thread_metadata (
                         thread_context.locator.external_thread_id,
                         new_revision,
                         snapshot_json,
-                        thread_context.conversation.created_at.to_rfc3339(),
+                        thread_context.created_at.to_rfc3339(),
                         updated_at.to_rfc3339(),
                     ],
                 )

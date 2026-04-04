@@ -2,6 +2,7 @@
 
 mod demo;
 
+use super::{build_thread, call_tool, list_tools};
 use anyhow::{Context, Result, bail};
 use openjarvis::{
     agent::{McpServerState, ToolCallRequest, ToolRegistry, ToolSource},
@@ -260,19 +261,18 @@ async fn tool_registry_manages_stdio_mcp_server_lifecycle() {
     let toolsets = registry.list_toolsets().await;
     assert_eq!(toolsets.len(), 1);
     assert_eq!(toolsets[0].name, "demo_stdio");
-    let thread_id = "thread_demo_stdio";
-    registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo_stdio" }),
-            },
-        )
-        .await
-        .expect("demo stdio toolset should load");
-    let definitions = registry
-        .list_for_thread(thread_id)
+    let mut thread_context = build_thread("thread_demo_stdio");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo_stdio" }),
+        },
+    )
+    .await
+    .expect("demo stdio toolset should load");
+    let definitions = list_tools(&registry, &thread_context)
         .await
         .expect("thread-scoped definitions should list loaded MCP tools");
     assert_eq!(definitions.len(), 5);
@@ -287,16 +287,16 @@ async fn tool_registry_manages_stdio_mcp_server_lifecycle() {
                 && source.remote_tool_name == "echo"
     ));
 
-    let echo_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_stdio__echo".to_string(),
-                arguments: json!({ "text": "ping" }),
-            },
-        )
-        .await
-        .expect("echo tool should succeed");
+    let echo_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_stdio__echo".to_string(),
+            arguments: json!({ "text": "ping" }),
+        },
+    )
+    .await
+    .expect("echo tool should succeed");
     assert_eq!(echo_result.content, "[demo:stdio] ping");
     assert_eq!(echo_result.metadata["server_name"], "demo_stdio");
     assert_eq!(echo_result.metadata["remote_tool_name"], "echo");
@@ -325,16 +325,16 @@ async fn tool_registry_manages_stdio_mcp_server_lifecycle() {
         .expect("disabled server refresh should return snapshot");
     assert_eq!(refreshed_disabled_snapshot.state, McpServerState::Disabled);
 
-    let error = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_stdio__echo".to_string(),
-                arguments: json!({ "text": "ping" }),
-            },
-        )
-        .await
-        .expect_err("disabled MCP tool should be removed from registry");
+    let error = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_stdio__echo".to_string(),
+            arguments: json!({ "text": "ping" }),
+        },
+    )
+    .await
+    .expect_err("disabled MCP tool should be removed from registry");
     assert!(error.to_string().contains("disabled"));
 }
 

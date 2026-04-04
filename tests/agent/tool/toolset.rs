@@ -1,8 +1,9 @@
+use super::{build_thread, call_tool, list_tools};
 use anyhow::Result;
 use async_trait::async_trait;
 use openjarvis::agent::{
-    ThreadToolRuntimeManager, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
-    ToolRegistry, ToolsetCatalogEntry, empty_tool_input_schema,
+    ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
+    ToolsetCatalogEntry, empty_tool_input_schema,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -30,24 +31,8 @@ impl ToolHandler for DemoToolsetEchoTool {
 }
 
 #[tokio::test]
-async fn thread_tool_runtime_manager_tracks_loaded_toolsets_per_thread() {
-    let manager = ThreadToolRuntimeManager::new();
-
-    assert!(manager.load_toolset("thread_a", "browser").await);
-    assert!(!manager.load_toolset("thread_a", "browser").await);
-    assert!(manager.load_toolset("thread_b", "browser").await);
-    assert!(manager.unload_toolset("thread_a", "browser").await);
-    assert!(!manager.unload_toolset("thread_a", "browser").await);
-
-    assert!(manager.loaded_toolsets("thread_a").await.is_empty());
-    assert_eq!(
-        manager.loaded_toolsets("thread_b").await,
-        vec!["browser".to_string()]
-    );
-}
-
-#[tokio::test]
 async fn tool_registry_exposes_catalog_and_thread_scoped_load_unload() {
+    // 测试场景: toolset 可见性和加载状态只由 Thread 决定，registry 不再维护第二份线程真相。
     let registry = ToolRegistry::new();
     registry
         .register_toolset(
@@ -56,13 +41,14 @@ async fn tool_registry_exposes_catalog_and_thread_scoped_load_unload() {
         )
         .await
         .expect("demo toolset should register");
+    let mut thread_demo = build_thread("thread_demo");
+    let thread_other = build_thread("thread_other");
 
     let toolsets = registry.list_toolsets().await;
     assert_eq!(toolsets.len(), 1);
     assert_eq!(toolsets[0].name, "demo");
 
-    let initial_tools = registry
-        .list_for_thread("thread_demo")
+    let initial_tools = list_tools(&registry, &thread_demo)
         .await
         .expect("thread-scoped tool listing should succeed");
     let initial_names = initial_tools
@@ -72,27 +58,27 @@ async fn tool_registry_exposes_catalog_and_thread_scoped_load_unload() {
     assert_eq!(initial_names, vec!["load_toolset", "unload_toolset"]);
 
     let catalog_prompt = registry
-        .catalog_prompt("thread_demo")
+        .catalog_prompt_for_context(&thread_demo)
         .await
         .expect("catalog prompt should be available");
     assert!(catalog_prompt.contains("demo"));
     assert!(catalog_prompt.contains("Currently loaded toolsets for this thread: none"));
 
-    let load_result = registry
-        .call_for_thread(
-            "thread_demo",
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo" }),
-            },
-        )
-        .await
-        .expect("demo toolset should load");
+    let load_result = call_tool(
+        &registry,
+        &mut thread_demo,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo" }),
+        },
+    )
+    .await
+    .expect("demo toolset should load");
     assert_eq!(load_result.metadata["event_kind"], "load_toolset");
     assert_eq!(load_result.metadata["toolset"], "demo");
+    assert_eq!(thread_demo.load_toolsets(), vec!["demo".to_string()]);
 
-    let loaded_tools = registry
-        .list_for_thread("thread_demo")
+    let loaded_tools = list_tools(&registry, &thread_demo)
         .await
         .expect("loaded thread should expose toolset tools");
     let loaded_names = loaded_tools
@@ -104,20 +90,19 @@ async fn tool_registry_exposes_catalog_and_thread_scoped_load_unload() {
         vec!["demo__echo", "load_toolset", "unload_toolset"]
     );
 
-    let call_result = registry
-        .call_for_thread(
-            "thread_demo",
-            ToolCallRequest {
-                name: "demo__echo".to_string(),
-                arguments: json!({}),
-            },
-        )
-        .await
-        .expect("thread-scoped toolset tool should execute");
+    let call_result = call_tool(
+        &registry,
+        &mut thread_demo,
+        ToolCallRequest {
+            name: "demo__echo".to_string(),
+            arguments: json!({}),
+        },
+    )
+    .await
+    .expect("thread-scoped toolset tool should execute");
     assert_eq!(call_result.content, "demo-toolset-echo");
 
-    let isolated_tools = registry
-        .list_for_thread("thread_other")
+    let isolated_tools = list_tools(&registry, &thread_other)
         .await
         .expect("other thread should keep isolated tool visibility");
     assert_eq!(
@@ -128,28 +113,23 @@ async fn tool_registry_exposes_catalog_and_thread_scoped_load_unload() {
         vec!["load_toolset", "unload_toolset"]
     );
 
-    let unload_result = registry
-        .call_for_thread(
-            "thread_demo",
-            ToolCallRequest {
-                name: "unload_toolset".to_string(),
-                arguments: json!({ "name": "demo" }),
-            },
-        )
-        .await
-        .expect("demo toolset should unload");
+    let unload_result = call_tool(
+        &registry,
+        &mut thread_demo,
+        ToolCallRequest {
+            name: "unload_toolset".to_string(),
+            arguments: json!({ "name": "demo" }),
+        },
+    )
+    .await
+    .expect("demo toolset should unload");
     assert_eq!(unload_result.metadata["event_kind"], "unload_toolset");
-    assert_eq!(
-        registry
-            .loaded_toolsets_for_thread("thread_demo")
-            .await
-            .len(),
-        0
-    );
+    assert!(thread_demo.load_toolsets().is_empty());
 }
 
 #[tokio::test]
 async fn tool_registry_rejects_toolset_tool_calls_after_unload() {
+    // 测试场景: 卸载后 thread snapshot 不再暴露对应 toolset 工具。
     let registry = ToolRegistry::new();
     registry
         .register_toolset(
@@ -158,50 +138,51 @@ async fn tool_registry_rejects_toolset_tool_calls_after_unload() {
         )
         .await
         .expect("demo toolset should register");
+    let mut thread_context = build_thread("thread_demo_after_unload");
 
-    registry
-        .call_for_thread(
-            "thread_demo_after_unload",
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo" }),
-            },
-        )
-        .await
-        .expect("demo toolset should load");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo" }),
+        },
+    )
+    .await
+    .expect("demo toolset should load");
 
-    let call_result = registry
-        .call_for_thread(
-            "thread_demo_after_unload",
-            ToolCallRequest {
-                name: "demo__echo".to_string(),
-                arguments: json!({}),
-            },
-        )
-        .await
-        .expect("loaded toolset tool should execute");
+    let call_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "demo__echo".to_string(),
+            arguments: json!({}),
+        },
+    )
+    .await
+    .expect("loaded toolset tool should execute");
     assert_eq!(call_result.content, "demo-toolset-echo");
 
-    registry
-        .call_for_thread(
-            "thread_demo_after_unload",
-            ToolCallRequest {
-                name: "unload_toolset".to_string(),
-                arguments: json!({ "name": "demo" }),
-            },
-        )
-        .await
-        .expect("demo toolset should unload");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "unload_toolset".to_string(),
+            arguments: json!({ "name": "demo" }),
+        },
+    )
+    .await
+    .expect("demo toolset should unload");
 
-    let error = registry
-        .call_for_thread(
-            "thread_demo_after_unload",
-            ToolCallRequest {
-                name: "demo__echo".to_string(),
-                arguments: json!({}),
-            },
-        )
-        .await
-        .expect_err("unloaded toolset tool should no longer be callable");
+    let error = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "demo__echo".to_string(),
+            arguments: json!({}),
+        },
+    )
+    .await
+    .expect_err("unloaded toolset tool should no longer be callable");
     assert!(error.to_string().contains("not registered for thread"));
 }

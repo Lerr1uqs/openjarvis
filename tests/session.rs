@@ -10,7 +10,7 @@ use openjarvis::{
     model::{IncomingMessage, ReplyTarget},
     session::{MemorySessionStore, SessionKey, SessionManager, SessionStore, SqliteSessionStore},
     thread::{
-        ThreadContext, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
+        Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
     },
 };
@@ -105,12 +105,13 @@ async fn commit_messages_and_load_messages_creates_session_state() {
         .get(&locator.thread_id)
         .expect("default thread should exist");
 
-    assert_eq!(thread.turns.len(), 1);
-    assert_eq!(thread.external_thread_id, "default");
+    assert_eq!(thread.load_messages().len(), 2);
+    assert_eq!(thread.locator.external_thread_id, "default");
     assert_eq!(history.len(), 2);
     assert_eq!(
-        thread.turns[0]
-            .final_assistant_message()
+        thread
+            .load_messages()
+            .last()
             .map(|message| message.content.as_str()),
         Some("world")
     );
@@ -280,9 +281,8 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
             .iter()
             .any(|message| message.tool_call_id.as_deref() == Some("read:10"))
     );
-    assert_eq!(thread.turns.len(), 1);
-    assert_eq!(thread.turns[0].messages.len(), 11);
-    assert_eq!(thread.turns[0].messages[10].content, "final answer");
+    assert_eq!(thread.load_messages().len(), 11);
+    assert_eq!(thread.load_messages()[10].content, "final answer");
 }
 
 #[tokio::test]
@@ -358,7 +358,7 @@ async fn commit_messages_with_state_persists_loaded_toolsets_and_tool_events() {
 
 #[tokio::test]
 async fn store_and_load_thread_context_roundtrips_runtime_state() {
-    // 测试场景: Session 新的 ThreadContext 读写接口要能完整保留线程状态，而不是退回旧 thread shape。
+    // 测试场景: Session 新的 Thread 读写接口要能完整保留线程状态，而不是退回旧 thread shape。
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_thread_context", "hello context");
     let locator = manager
@@ -372,7 +372,7 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
         event.tool_name = Some("load_toolset".to_string());
         event
     };
-    let mut thread_context = ThreadContext::new(ThreadContextLocator::from(&locator), now);
+    let mut thread_context = Thread::new(ThreadContextLocator::from(&locator), now);
     assert!(thread_context.ensure_system_prompt_snapshot("session system snapshot", now));
     thread_context.enable_auto_compact();
     thread_context.store_turn_state(
@@ -405,11 +405,10 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
 
     assert_eq!(loaded.locator, ThreadContextLocator::from(&locator));
     assert_eq!(
-        loaded.request_context_system_messages()[0].content,
+        loaded.system_prefix_messages()[0].content,
         "session system snapshot"
     );
     assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
-    assert!(loaded.compact_enabled(false));
     assert!(loaded.auto_compact_enabled(false));
     assert_eq!(loaded.load_tool_events().len(), 1);
     assert!(thread_state.thread_context.is_some());
@@ -418,7 +417,7 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
 
 #[tokio::test]
 async fn lock_thread_context_allows_live_mutation_and_explicit_persist() {
-    // 测试场景: 外部调用方应能通过 locator 锁定 live ThreadContext，
+    // 测试场景: 外部调用方应能通过 locator 锁定 live Thread，
     // 直接修改内存态，再显式持久化到 session store。
     let manager = SessionManager::new();
     let incoming = build_incoming("msg_lock_thread_context", "lock thread context");
@@ -449,7 +448,7 @@ async fn lock_thread_context_allows_live_mutation_and_explicit_persist() {
         .expect("thread context should exist");
 
     assert_eq!(
-        loaded.request_context_system_messages()[0].content,
+        loaded.system_prefix_messages()[0].content,
         "locked system snapshot"
     );
     assert!(loaded.auto_compact_enabled(false));
@@ -493,7 +492,7 @@ async fn mutate_thread_context_persists_changes_without_manual_snapshot_roundtri
         .expect("thread context should exist");
 
     assert_eq!(
-        loaded.request_context_system_messages()[0].content,
+        loaded.system_prefix_messages()[0].content,
         "mutated snapshot"
     );
     assert!(loaded.auto_compact_enabled(false));
@@ -538,14 +537,10 @@ async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
         .load_thread_state(&locator)
         .await
         .expect("thread state should load");
-    registry
-        .rehydrate_thread(
-            &locator.thread_id.to_string(),
-            &thread_state.loaded_toolsets,
-        )
-        .await;
+    let mut thread_context = Thread::new(ThreadContextLocator::from(&locator), Utc::now());
+    thread_context.replace_loaded_toolsets(thread_state.loaded_toolsets.clone());
     let visible_tools = registry
-        .list_for_thread(&locator.thread_id.to_string())
+        .list_for_context(&thread_context)
         .await
         .expect("rehydrated runtime should expose loaded toolset tools");
 
@@ -613,8 +608,8 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
 }
 
 #[tokio::test]
-async fn commit_messages_with_active_thread_replaces_old_history_before_appending_new_commit() {
-    // 测试场景: compact 已经替换 active history 后，session 应写回 compacted turn，再追加本轮新 turn。
+async fn commit_messages_with_thread_context_replaces_old_history_before_appending_new_commit() {
+    // 测试场景: compact 已经替换 Thread 快照后，session 应写回 compacted messages，再追加本轮新消息。
     let manager = SessionManager::new();
     let first_incoming = build_incoming("msg_compact_1", "before compact");
     let locator = manager
@@ -643,9 +638,10 @@ async fn commit_messages_with_active_thread_replaces_old_history_before_appendin
         .load_thread_state(&locator)
         .await
         .expect("thread state should load")
-        .thread
+        .thread_context
         .expect("thread should exist before compact");
-    compacted_thread.turns = vec![openjarvis::thread::ConversationTurn::new(
+    let mut replacement = Thread::new(ThreadContextLocator::from(&locator), Utc::now());
+    replacement.store_turn(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", Utc::now()),
@@ -653,10 +649,11 @@ async fn commit_messages_with_active_thread_replaces_old_history_before_appendin
         ],
         Utc::now(),
         Utc::now(),
-    )];
+    );
+    compacted_thread.overwrite_active_history(&replacement);
 
     manager
-        .commit_messages_with_active_thread(
+        .commit_messages_with_thread_context(
             &locator,
             Some(compacted_thread),
             Some("msg_compact_2".to_string()),
@@ -666,8 +663,6 @@ async fn commit_messages_with_active_thread_replaces_old_history_before_appendin
             ],
             Utc::now(),
             Utc::now(),
-            Vec::new(),
-            Vec::new(),
         )
         .await
         .expect("compacted commit should store");
@@ -681,11 +676,11 @@ async fn commit_messages_with_active_thread_replaces_old_history_before_appendin
         .get(&locator.thread_id)
         .expect("thread should exist");
 
-    assert_eq!(thread.turns.len(), 2);
-    assert_eq!(thread.turns[0].messages[0].content, "这是压缩后的上下文");
-    assert_eq!(thread.turns[0].messages[1].content, "继续");
-    assert_eq!(thread.turns[1].messages[0].content, "new question");
-    assert_eq!(thread.turns[1].messages[1].content, "new reply");
+    assert_eq!(thread.load_messages().len(), 4);
+    assert_eq!(thread.load_messages()[0].content, "这是压缩后的上下文");
+    assert_eq!(thread.load_messages()[1].content, "继续");
+    assert_eq!(thread.load_messages()[2].content, "new question");
+    assert_eq!(thread.load_messages()[3].content, "new reply");
 }
 
 #[tokio::test]
@@ -767,7 +762,7 @@ async fn shared_store_merges_stale_state_updates_and_restores_external_message_d
 
 #[tokio::test]
 async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_follow_up_commits() {
-    // 测试场景: SQLite 持久化后的线程在“重启”后要恢复 compact turn、loaded toolsets、/auto-compact 状态，并继续同线程追加新 turn。
+    // 测试场景: SQLite 持久化后的线程在“重启”后要恢复 compact turn、loaded toolsets、auto-compact 状态，并继续同线程追加新 turn。
     let fixture = SessionSqliteFixture::new("openjarvis-session-restart");
     let store_a: Arc<dyn SessionStore> = Arc::new(
         SqliteSessionStore::open(fixture.db_path())
@@ -784,7 +779,7 @@ async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_foll
         .await
         .expect("manager A should resolve thread");
     let now = Utc::now();
-    let mut thread_context = ThreadContext::new(ThreadContextLocator::from(&locator_a), now);
+    let mut thread_context = Thread::new(ThreadContextLocator::from(&locator_a), now);
     assert!(thread_context.ensure_system_prompt_snapshot("sqlite system snapshot", now));
     thread_context.enable_auto_compact();
     thread_context.store_turn_state(
@@ -821,13 +816,13 @@ async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_foll
         .expect("restored thread context should load")
         .expect("restored thread context should exist");
 
-    assert_eq!(restored.turns.len(), 1);
+    assert_eq!(restored.load_messages().len(), 2);
     assert_eq!(
-        restored.request_context_system_messages()[0].content,
+        restored.system_prefix_messages()[0].content,
         "sqlite system snapshot"
     );
-    assert_eq!(restored.turns[0].messages[0].content, "这是压缩后的上下文");
-    assert_eq!(restored.turns[0].messages[1].content, "继续");
+    assert_eq!(restored.load_messages()[0].content, "这是压缩后的上下文");
+    assert_eq!(restored.load_messages()[1].content, "继续");
     assert_eq!(restored.load_toolsets(), vec!["demo".to_string()]);
     assert!(restored.auto_compact_enabled(false));
 

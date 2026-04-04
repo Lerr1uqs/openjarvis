@@ -9,8 +9,7 @@ use openjarvis::{
     },
     channels::{Channel, ChannelRegistration},
     cli::OpenJarvisCli,
-    command::{CommandRegistry, register_runtime_commands},
-    compact::{CompactRuntimeManager, CompactScopeKey},
+    command::CommandRegistry,
     config::{AppConfig, BUILTIN_MCP_SERVER_NAME, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
@@ -18,7 +17,7 @@ use openjarvis::{
     router::ChannelRouter,
     router::ChannelRouterBuilder,
     session::{MemorySessionStore, SessionKey, SessionManager, SessionStore},
-    thread::{ConversationThread, ThreadContext, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator},
 };
 use serde_json::json;
 use std::{
@@ -560,23 +559,21 @@ async fn router_stores_two_turns_for_same_session_thread_with_mock_agent() {
         observed_requests[1].locator.thread_id
     );
 
-    assert_eq!(thread.turns.len(), 2);
-    assert_eq!(thread.external_thread_id, "thread_shared");
+    assert_eq!(thread.load_messages().len(), 6);
+    assert_eq!(thread.locator.external_thread_id, "thread_shared");
     assert_eq!(history.len(), 6);
     assert_eq!(history[0].content, "first question");
     assert_eq!(history[1].content, "reply-first");
     assert_eq!(history[5].content, "reply-second");
-    assert_eq!(thread.turns[0].messages.len(), 2);
-    assert_eq!(thread.turns[1].messages.len(), 4);
-    assert_eq!(thread.turns[0].messages[0].content, "first question");
-    assert_eq!(thread.turns[0].messages[1].content, "reply-first");
-    assert_eq!(thread.turns[1].messages[0].content, "second question");
-    assert_eq!(thread.turns[1].messages[1].tool_calls[0].id, "call_mock_1");
+    assert_eq!(thread.load_messages()[0].content, "first question");
+    assert_eq!(thread.load_messages()[1].content, "reply-first");
+    assert_eq!(thread.load_messages()[2].content, "second question");
+    assert_eq!(thread.load_messages()[3].tool_calls[0].id, "call_mock_1");
     assert_eq!(
-        thread.turns[1].messages[2].tool_call_id.as_deref(),
+        thread.load_messages()[4].tool_call_id.as_deref(),
         Some("call_mock_1")
     );
-    assert_eq!(thread.turns[1].messages[3].content, "reply-second");
+    assert_eq!(thread.load_messages()[5].content, "reply-second");
 
     assert_eq!(recorded.len(), 4);
     assert_eq!(recorded[0].content, "reply-first");
@@ -711,13 +708,10 @@ async fn router_preserves_large_history_before_next_turn() {
         ]
     );
 
-    assert_eq!(thread.turns.len(), 2);
-    assert_eq!(thread.external_thread_id, "thread_truncation");
-    assert_eq!(thread.turns[0].messages.len(), 7);
-    assert_eq!(thread.turns[1].messages.len(), 2);
+    assert_eq!(thread.load_messages().len(), 9);
+    assert_eq!(thread.locator.external_thread_id, "thread_truncation");
     assert_eq!(
-        thread.turns[0]
-            .messages
+        thread.load_messages()[..7]
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
@@ -732,8 +726,7 @@ async fn router_preserves_large_history_before_next_turn() {
         ]
     );
     assert_eq!(
-        thread.turns[1]
-            .messages
+        thread.load_messages()[7..]
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
@@ -954,15 +947,12 @@ async fn router_returns_failed_reply_for_unknown_command_without_session_or_agen
 }
 
 #[tokio::test]
-async fn router_thread_scoped_command_updates_thread_context_without_agent_dispatch() {
+async fn router_removed_auto_compact_command_returns_unknown_reply_without_agent_dispatch() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let incoming_tx = Arc::new(Mutex::new(None));
     let (request_tx, mut request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
-    let compact_runtime = Arc::new(CompactRuntimeManager::new());
-    let mut commands = CommandRegistry::with_builtin_commands();
-    register_runtime_commands(&mut commands, false, false, Arc::clone(&compact_runtime))
-        .expect("runtime command should register");
+    let commands = CommandRegistry::with_builtin_commands();
     let sessions = SessionManager::new();
     let mut router = ChannelRouter::builder()
         .agent_handle(AgentWorkerHandle {
@@ -1047,20 +1037,14 @@ async fn router_thread_scoped_command_updates_thread_context_without_agent_dispa
     assert_eq!(recorded.len(), 1);
     assert_eq!(
         recorded[0].content,
-        "[Command][auto-compact][SUCCESS]: auto-compact enabled for current thread `thread_runtime`; future turns will expose `compact` and context capacity prompts"
+        "[Command][auto-compact][FAILED]: unknown command"
     );
     assert_eq!(recorded[0].metadata["event_kind"], "Command");
     assert_eq!(recorded[0].metadata["command_name"], "auto-compact");
-    assert_eq!(recorded[0].metadata["command_status"], "SUCCESS");
+    assert_eq!(recorded[0].metadata["command_status"], "FAILED");
     assert!(request_rx.try_recv().is_err());
-    assert!(thread.compact_enabled(false));
-    assert!(thread.auto_compact_enabled(false));
-    #[allow(deprecated)]
-    {
-        let scope = CompactScopeKey::new("feishu", "ou_thread_command", "thread_runtime");
-        assert!(compact_runtime.compact_enabled(&scope, false).await);
-        assert!(compact_runtime.auto_compact_enabled(&scope, false).await);
-    }
+    assert!(!thread.auto_compact_enabled(false));
+    assert!(thread.load_messages().is_empty());
 }
 
 #[tokio::test]
@@ -1070,10 +1054,7 @@ async fn router_clear_command_resets_persisted_thread_context_without_agent_disp
     let incoming_tx = Arc::new(Mutex::new(None));
     let (request_tx, mut request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
-    let compact_runtime = Arc::new(CompactRuntimeManager::new());
-    let mut commands = CommandRegistry::with_builtin_commands();
-    register_runtime_commands(&mut commands, false, false, Arc::clone(&compact_runtime))
-        .expect("runtime command should register");
+    let commands = CommandRegistry::with_builtin_commands();
     let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let sessions = SessionManager::with_store(Arc::clone(&store))
         .await
@@ -1089,7 +1070,7 @@ async fn router_clear_command_resets_persisted_thread_context_without_agent_disp
         .await
         .expect("thread should resolve before clear");
     let now = Utc::now();
-    let mut seeded_thread = ThreadContext::new(ThreadContextLocator::from(&locator), now);
+    let mut seeded_thread = Thread::new(ThreadContextLocator::from(&locator), now);
     seeded_thread.enable_auto_compact();
     seeded_thread.store_turn_state(
         seed_incoming.external_message_id.clone(),
@@ -1207,11 +1188,9 @@ async fn router_clear_command_resets_persisted_thread_context_without_agent_disp
     assert!(request_rx.try_recv().is_err());
     assert!(thread.load_messages().is_empty());
     assert!(thread.load_toolsets().is_empty());
-    assert!(!thread.compact_enabled(false));
     assert!(!thread.auto_compact_enabled(false));
     assert!(restored.load_messages().is_empty());
     assert!(restored.load_toolsets().is_empty());
-    assert!(!restored.compact_enabled(false));
     assert!(!restored.auto_compact_enabled(false));
 }
 
@@ -1255,11 +1234,10 @@ async fn router_failed_turn_replies_with_full_error_chain() {
         .expect("thread should resolve");
 
     let send_task = tokio::spawn(async move {
-        let active_thread = empty_thread(locator.thread_id, &locator.external_thread_id);
+        let thread_context = empty_thread(&locator);
         event_tx
             .send(AgentWorkerEvent::CommitFailed(FailedAgentCommit {
-                thread_context: thread_context_from_locator(&locator, active_thread.clone()),
-                active_thread,
+                thread_context,
                 locator,
                 incoming,
                 error: "failed to call llm provider `openai_compatible` model `demo-model` at `https://provider.test/v1`: provider said 429: rate limit exceeded".to_string(),
@@ -1326,9 +1304,9 @@ async fn router_failed_turn_replies_with_full_error_chain() {
         .values()
         .next()
         .expect("thread should exist after failed commit");
-    assert_eq!(thread.turns.len(), 1);
+    assert_eq!(thread.load_messages().len(), 2);
     assert!(
-        thread.turns[0].messages[1]
+        thread.load_messages()[1]
             .content
             .contains("provider said 429: rate limit exceeded")
     );
@@ -1435,11 +1413,10 @@ async fn router_command_message_does_not_enter_existing_session() {
     let recorded = sent.lock().await.clone();
 
     assert_eq!(observed_requests.len(), 1);
-    assert_eq!(thread.turns.len(), 1);
-    assert_eq!(thread.turns[0].messages.len(), 2);
+    assert_eq!(thread.load_messages().len(), 2);
     assert_eq!(
-        thread.turns[0]
-            .messages
+        thread
+            .load_messages()
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
@@ -1548,10 +1525,10 @@ async fn router_completed_turn_can_skip_prepending_incoming_user_after_compact()
         .expect("thread should exist");
     let history = thread.load_messages();
 
-    assert_eq!(thread.turns.len(), 2);
-    assert_eq!(thread.turns[0].messages[0].content, "这是压缩后的上下文");
-    assert_eq!(thread.turns[0].messages[1].content, "继续");
-    assert_eq!(thread.turns[1].messages[0].content, "reply-after-compact");
+    assert_eq!(thread.load_messages().len(), 3);
+    assert_eq!(thread.load_messages()[0].content, "这是压缩后的上下文");
+    assert_eq!(thread.load_messages()[1].content, "继续");
+    assert_eq!(thread.load_messages()[2].content, "reply-after-compact");
     assert_eq!(
         history
             .iter()
@@ -1664,7 +1641,6 @@ fn spawn_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             commit_messages: vec![ChatMessage::new(
@@ -1726,7 +1702,6 @@ fn spawn_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             commit_messages: vec![
@@ -1798,7 +1773,6 @@ fn spawn_truncation_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             commit_messages,
@@ -1827,7 +1801,6 @@ fn spawn_truncation_mock_agent_loop(
                     event_tx
                         .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                             thread_context: request.thread_context.clone(),
-                            active_thread: request.thread_context.to_conversation_thread(),
                             locator: request.locator,
                             incoming: request.incoming,
                             commit_messages: vec![ChatMessage::new(
@@ -1877,7 +1850,6 @@ fn spawn_single_turn_mock_agent_loop(
         event_tx
             .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
                 thread_context: request.thread_context.clone(),
-                active_thread: request.thread_context.to_conversation_thread(),
                 locator: request.locator,
                 incoming: request.incoming,
                 commit_messages: vec![ChatMessage::new(
@@ -1904,8 +1876,9 @@ fn spawn_compact_mock_agent_loop(
             .recv()
             .await
             .expect("compact mock agent should receive one request");
-        let mut active_thread = request.thread_context.to_conversation_thread();
-        active_thread.turns = vec![openjarvis::thread::ConversationTurn::new(
+        let mut compacted_thread = request.thread_context.clone();
+        let mut replacement = Thread::new(ThreadContextLocator::from(&request.locator), Utc::now());
+        replacement.store_turn(
             None,
             vec![
                 ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", Utc::now()),
@@ -1913,7 +1886,8 @@ fn spawn_compact_mock_agent_loop(
             ],
             Utc::now(),
             Utc::now(),
-        )];
+        );
+        compacted_thread.overwrite_active_history(&replacement);
 
         event_tx
             .send(AgentWorkerEvent::Dispatch(build_dispatch_event(
@@ -1930,11 +1904,7 @@ fn spawn_compact_mock_agent_loop(
             .expect("compact dispatch should be sent");
         event_tx
             .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
-                thread_context: thread_context_from_locator(
-                    &request.locator,
-                    active_thread.clone(),
-                ),
-                active_thread,
+                thread_context: compacted_thread,
                 locator: request.locator,
                 incoming: request.incoming,
                 commit_messages: vec![ChatMessage::new(
@@ -2030,13 +2000,6 @@ fn build_incoming_with(
     }
 }
 
-fn empty_thread(thread_id: Uuid, external_thread_id: &str) -> ConversationThread {
-    ConversationThread::with_id(thread_id, external_thread_id.to_string(), Utc::now())
-}
-
-fn thread_context_from_locator(
-    locator: &openjarvis::session::ThreadLocator,
-    thread: ConversationThread,
-) -> ThreadContext {
-    ThreadContext::from_conversation_thread(ThreadContextLocator::from(locator), thread)
+fn empty_thread(locator: &openjarvis::session::ThreadLocator) -> Thread {
+    Thread::new(ThreadContextLocator::from(locator), Utc::now())
 }

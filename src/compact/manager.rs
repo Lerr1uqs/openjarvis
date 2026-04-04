@@ -1,113 +1,111 @@
-//! Compact manager that coordinates plan selection, provider calls, and replacement-turn creation.
+//! Compact manager that summarizes one message sequence into replacement messages.
 
 use crate::{
     compact::{
         COMPACTED_ASSISTANT_PREFIX, COMPACTED_USER_CONTINUE_MESSAGE, CompactProvider,
-        CompactRequest, CompactStrategy, CompactSummary, CompactionPlan,
+        CompactRequest, CompactSummary,
     },
     context::{ChatMessage, ChatMessageRole},
-    thread::{ConversationThread, ConversationTurn},
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tracing::info;
 
-/// Result of applying one compact operation to a thread.
+/// Result of compacting one message sequence directly.
 #[derive(Debug, Clone)]
-pub struct CompactionOutcome {
-    pub strategy_name: String,
-    pub plan: CompactionPlan,
+pub struct MessageCompactionOutcome {
+    pub source_message_count: usize,
     pub summary: CompactSummary,
-    pub compacted_turn: ConversationTurn,
-    pub compacted_thread: ConversationThread,
+    pub compacted_messages: Vec<ChatMessage>,
 }
 
-/// Standalone compact manager that is ready to be wired into runtime later.
+/// Standalone compact manager that only depends on a provider and message input.
 pub struct CompactManager {
     provider: Arc<dyn CompactProvider>,
-    strategy: Arc<dyn CompactStrategy>,
 }
 
 impl CompactManager {
-    /// Create one compact manager from the selected provider and strategy.
-    pub fn new(provider: Arc<dyn CompactProvider>, strategy: Arc<dyn CompactStrategy>) -> Self {
-        Self { provider, strategy }
-    }
-
-    /// Compact one thread and return the fully materialized replacement result.
+    /// Create one compact manager from the selected provider.
     ///
     /// # 示例
     /// ```rust,no_run
     /// use chrono::Utc;
     /// use openjarvis::{
-    ///     compact::{
-    ///         CompactAllChatStrategy, CompactManager, CompactSummary, StaticCompactProvider,
-    ///     },
+    ///     compact::{CompactManager, CompactSummary, StaticCompactProvider},
     ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::ConversationThread,
     /// };
     /// use std::sync::Arc;
     ///
     /// # async fn demo() -> anyhow::Result<()> {
-    /// let now = Utc::now();
-    /// let mut thread = ConversationThread::new("default", now);
-    /// thread.store_turn(
-    ///     Some("msg_1".to_string()),
-    ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
-    ///     now,
-    ///     now,
-    /// );
-    /// let manager = CompactManager::new(
-    ///     Arc::new(StaticCompactProvider::new(CompactSummary {
-    ///         compacted_assistant: "压缩后的上下文".to_string(),
-    ///     })),
-    ///     Arc::new(CompactAllChatStrategy),
-    /// );
+    /// let manager = CompactManager::new(Arc::new(StaticCompactProvider::new(CompactSummary {
+    ///     compacted_assistant: "压缩后的上下文".to_string(),
+    /// })));
+    /// let messages = vec![ChatMessage::new(ChatMessageRole::User, "hello", Utc::now())];
     ///
-    /// let outcome = manager.compact_thread(&thread, now).await?;
+    /// let outcome = manager.compact_messages(&messages, Utc::now()).await?;
     /// assert!(outcome.is_some());
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn compact_thread(
-        &self,
-        thread: &ConversationThread,
-        compacted_at: DateTime<Utc>,
-    ) -> Result<Option<CompactionOutcome>> {
-        let Some(plan) = self.strategy.build_plan(thread)? else {
-            return Ok(None);
-        };
-        let source_messages = plan.source_messages(thread)?;
-        let request = CompactRequest::new(plan.source_turn_ids.clone(), source_messages)?;
+    pub fn new(provider: Arc<dyn CompactProvider>) -> Self {
+        Self { provider }
+    }
 
+    /// Compact one message sequence and return the replacement messages.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     compact::{CompactManager, CompactSummary, StaticCompactProvider},
+    ///     context::{ChatMessage, ChatMessageRole},
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// let manager = CompactManager::new(Arc::new(StaticCompactProvider::new(CompactSummary {
+    ///     compacted_assistant: "压缩后的上下文".to_string(),
+    /// })));
+    /// let messages = vec![ChatMessage::new(ChatMessageRole::User, "hello", Utc::now())];
+    ///
+    /// let outcome = manager.compact_messages(&messages, Utc::now()).await?;
+    /// assert_eq!(outcome.expect("should compact").compacted_messages.len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn compact_messages(
+        &self,
+        messages: &[ChatMessage],
+        compacted_at: DateTime<Utc>,
+    ) -> Result<Option<MessageCompactionOutcome>> {
+        if messages.is_empty() {
+            return Ok(None);
+        }
+
+        let request = CompactRequest::new(messages.to_vec())?;
         info!(
-            strategy = self.strategy.name(),
-            source_turn_count = request.source_turn_ids.len(),
             source_message_count = request.messages.len(),
-            "starting compact manager run"
+            "starting compact manager run from messages"
         );
 
         let summary = self.provider.compact(request).await?;
-        let compacted_turn = build_compacted_turn(&summary, compacted_at);
-        let compacted_thread = plan.apply(thread, compacted_turn.clone())?;
+        let compacted_messages = build_compacted_messages(&summary, compacted_at);
 
-        Ok(Some(CompactionOutcome {
-            strategy_name: self.strategy.name().to_string(),
-            plan,
+        Ok(Some(MessageCompactionOutcome {
+            source_message_count: messages.len(),
             summary,
-            compacted_turn,
-            compacted_thread,
+            compacted_messages,
         }))
     }
 }
 
-/// Build the persisted replacement turn that stands in for compacted source history.
-pub fn build_compacted_turn(
+/// Build the persisted replacement messages that stand in for compacted source history.
+pub fn build_compacted_messages(
     summary: &CompactSummary,
     compacted_at: DateTime<Utc>,
-) -> ConversationTurn {
-    let compacted_messages = vec![
+) -> Vec<ChatMessage> {
+    vec![
         ChatMessage::new(
             ChatMessageRole::Assistant,
             format!(
@@ -121,7 +119,5 @@ pub fn build_compacted_turn(
             COMPACTED_USER_CONTINUE_MESSAGE,
             compacted_at,
         ),
-    ];
-
-    ConversationTurn::new(None, compacted_messages, compacted_at, compacted_at)
+    ]
 }

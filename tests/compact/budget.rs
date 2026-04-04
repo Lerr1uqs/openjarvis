@@ -8,8 +8,8 @@ use openjarvis::{
 use std::collections::HashMap;
 
 #[test]
-fn context_budget_estimator_splits_system_memory_chat_and_tools() {
-    // 测试场景: 预算估算要覆盖完整请求，并分别统计 system、memory、chat 和 visible tools。
+fn context_budget_estimator_splits_system_chat_and_tools() {
+    // 测试场景: 预算估算要覆盖完整请求，并分别统计 system、chat 和 visible tools。
     let config: AppConfig = serde_yaml::from_str(
         r#"
 agent:
@@ -30,7 +30,6 @@ llm:
     let report = estimator.estimate(
         &[
             ChatMessage::new(ChatMessageRole::System, "system prompt", Utc::now()),
-            ChatMessage::new(ChatMessageRole::Memory, "remember this", Utc::now()),
             ChatMessage::new(ChatMessageRole::User, "hello compact", Utc::now()),
         ],
         &[openjarvis::agent::ToolDefinition {
@@ -42,7 +41,6 @@ llm:
     );
 
     assert!(report.system_tokens() > 0);
-    assert!(report.memory_tokens() > 0);
     assert!(report.chat_tokens() > 0);
     assert!(report.visible_tool_tokens() > 0);
     assert_eq!(report.reserved_output_tokens(), 32);
@@ -56,12 +54,11 @@ fn context_budget_report_reaches_ratio_at_boundary() {
     let report = ContextBudgetReport::new(
         HashMap::from([
             (ContextTokenKind::System, 10),
-            (ContextTokenKind::Memory, 10),
             (ContextTokenKind::Chat, 40),
             (ContextTokenKind::VisibleTool, 20),
             (ContextTokenKind::ReservedOutput, 20),
         ]),
-        100,
+        90,
     );
 
     assert!(report.reaches_ratio(1.0));

@@ -241,13 +241,11 @@ fn serialize_openai_messages(
 fn serialize_context_message(message: &ChatMessage) -> Result<ChatCompletionRequestMessage> {
     // Convert one unified message into the matching OpenAI message variant.
     match message.role {
-        ChatMessageRole::System | ChatMessageRole::Memory => {
-            Ok(ChatCompletionRequestSystemMessageArgs::default()
-                .content(message.content.clone())
-                .build()
-                .context("failed to build system message")?
-                .into())
-        }
+        ChatMessageRole::System => Ok(ChatCompletionRequestSystemMessageArgs::default()
+            .content(message.content.clone())
+            .build()
+            .context("failed to build system message")?
+            .into()),
         ChatMessageRole::User => Ok(ChatCompletionRequestUserMessageArgs::default()
             .content(message.content.clone())
             .build()

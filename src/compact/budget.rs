@@ -81,7 +81,6 @@ impl ContextBudgetReport {
     /// let report = ContextBudgetReport::new(
     ///     HashMap::from([
     ///         (ContextTokenKind::System, 10),
-    ///         (ContextTokenKind::Memory, 5),
     ///         (ContextTokenKind::Chat, 40),
     ///         (ContextTokenKind::VisibleTool, 12),
     ///         (ContextTokenKind::ReservedOutput, 16),
@@ -98,11 +97,6 @@ impl ContextBudgetReport {
     /// Return the estimated system token count.
     pub fn system_tokens(&self) -> usize {
         self.tokens(ContextTokenKind::System)
-    }
-
-    /// Return the estimated memory token count.
-    pub fn memory_tokens(&self) -> usize {
-        self.tokens(ContextTokenKind::Memory)
     }
 
     /// Return the estimated chat token count.

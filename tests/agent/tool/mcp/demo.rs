@@ -1,5 +1,6 @@
 //! Protocol tests for the demo-only internal MCP servers.
 
+use super::super::{build_thread, call_tool, list_tools};
 use super::{DemoHttpServerProcess, demo_http_config, demo_stdio_config, openjarvis_bin};
 use openjarvis::agent::{McpServerState, McpTransport, ToolCallRequest, ToolRegistry, ToolSource};
 use openjarvis::config::AppConfig;
@@ -56,37 +57,37 @@ async fn demo_stdio_internal_subcommand_exposes_mcp_tools() {
     let registry = ToolRegistry::from_config(config.agent_config().tool_config())
         .await
         .expect("tool registry should build");
-    let thread_id = "thread_demo_stdio_internal";
+    let mut thread_context = build_thread("thread_demo_stdio_internal");
 
     let servers = registry.mcp().list_servers().await;
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].state, McpServerState::Healthy);
     assert_eq!(servers[0].transport, McpTransport::Stdio);
     assert_eq!(servers[0].tool_count, 3);
-    registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo_stdio" }),
-            },
-        )
-        .await
-        .expect("demo stdio toolset should load");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo_stdio" }),
+        },
+    )
+    .await
+    .expect("demo stdio toolset should load");
 
-    let sum_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_stdio__sum".to_string(),
-                arguments: json!({
-                    "a": 4,
-                    "b": 5,
-                }),
-            },
-        )
-        .await
-        .expect("stdio sum tool should succeed");
+    let sum_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_stdio__sum".to_string(),
+            arguments: json!({
+                "a": 4,
+                "b": 5,
+            }),
+        },
+    )
+    .await
+    .expect("stdio sum tool should succeed");
     assert!(!sum_result.is_error);
     assert_eq!(sum_result.metadata["server_name"], "demo_stdio");
     assert_eq!(sum_result.metadata["structured_content"]["sum"], 9);
@@ -95,16 +96,16 @@ async fn demo_stdio_internal_subcommand_exposes_mcp_tools() {
         "stdio"
     );
 
-    let health_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_stdio__health_probe".to_string(),
-                arguments: json!({}),
-            },
-        )
-        .await
-        .expect("stdio health tool should succeed");
+    let health_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_stdio__health_probe".to_string(),
+            arguments: json!({}),
+        },
+    )
+    .await
+    .expect("stdio health tool should succeed");
     assert!(!health_result.is_error);
     assert_eq!(health_result.metadata["structured_content"]["ok"], true);
     assert_eq!(
@@ -122,7 +123,7 @@ async fn demo_http_internal_subcommand_exposes_mcp_tools() {
     let registry = ToolRegistry::from_config(config.agent_config().tool_config())
         .await
         .expect("tool registry should build");
-    let thread_id = "thread_demo_http_internal";
+    let mut thread_context = build_thread("thread_demo_http_internal");
 
     let servers = registry.mcp().list_servers().await;
     assert_eq!(servers.len(), 1);
@@ -131,19 +132,18 @@ async fn demo_http_internal_subcommand_exposes_mcp_tools() {
     assert_eq!(servers[0].transport, McpTransport::StreamableHttp);
     assert_eq!(servers[0].endpoint, demo_server.base_url());
     assert_eq!(servers[0].tool_count, 3);
-    registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo_http" }),
-            },
-        )
-        .await
-        .expect("demo http toolset should load");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo_http" }),
+        },
+    )
+    .await
+    .expect("demo http toolset should load");
 
-    let definitions = registry
-        .list_for_thread(thread_id)
+    let definitions = list_tools(&registry, &thread_context)
         .await
         .expect("thread-scoped definitions should list loaded MCP tools");
     let echo_definition = definitions
@@ -158,29 +158,29 @@ async fn demo_http_internal_subcommand_exposes_mcp_tools() {
                 && source.transport == McpTransport::StreamableHttp
     ));
 
-    let echo_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_http__echo".to_string(),
-                arguments: json!({ "text": "http-ready" }),
-            },
-        )
-        .await
-        .expect("http echo tool should succeed");
+    let echo_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_http__echo".to_string(),
+            arguments: json!({ "text": "http-ready" }),
+        },
+    )
+    .await
+    .expect("http echo tool should succeed");
     assert_eq!(echo_result.content, "[demo:streamable_http] http-ready");
     assert!(!echo_result.is_error);
 
-    let health_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_http__health_probe".to_string(),
-                arguments: json!({}),
-            },
-        )
-        .await
-        .expect("http health tool should succeed");
+    let health_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_http__health_probe".to_string(),
+            arguments: json!({}),
+        },
+    )
+    .await
+    .expect("http health tool should succeed");
     assert_eq!(health_result.metadata["structured_content"]["ok"], true);
     assert_eq!(
         health_result.metadata["structured_content"]["transport"],
@@ -206,7 +206,7 @@ async fn demo_stdio_server_can_be_loaded_from_external_mcp_json() {
     let registry = ToolRegistry::from_config(config.agent_config().tool_config())
         .await
         .expect("tool registry should build from external mcp json");
-    let thread_id = "thread_demo_stdio_external";
+    let mut thread_context = build_thread("thread_demo_stdio_external");
 
     let servers = registry.mcp().list_servers().await;
     assert_eq!(servers.len(), 1);
@@ -214,27 +214,27 @@ async fn demo_stdio_server_can_be_loaded_from_external_mcp_json() {
     assert_eq!(servers[0].state, McpServerState::Healthy);
     assert_eq!(servers[0].transport, McpTransport::Stdio);
     assert_eq!(servers[0].tool_count, 3);
-    registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo_stdio_file" }),
-            },
-        )
-        .await
-        .expect("external stdio toolset should load");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo_stdio_file" }),
+        },
+    )
+    .await
+    .expect("external stdio toolset should load");
 
-    let echo_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_stdio_file__echo".to_string(),
-                arguments: json!({ "text": "json-stdio-ready" }),
-            },
-        )
-        .await
-        .expect("external json stdio tool should succeed");
+    let echo_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_stdio_file__echo".to_string(),
+            arguments: json!({ "text": "json-stdio-ready" }),
+        },
+    )
+    .await
+    .expect("external json stdio tool should succeed");
     assert_eq!(echo_result.content, "[demo:stdio] json-stdio-ready");
     assert!(!echo_result.is_error);
 }
@@ -260,7 +260,7 @@ async fn demo_http_server_can_be_loaded_from_external_mcp_json() {
     let registry = ToolRegistry::from_config(config.agent_config().tool_config())
         .await
         .expect("tool registry should build from external mcp json");
-    let thread_id = "thread_demo_http_external";
+    let mut thread_context = build_thread("thread_demo_http_external");
 
     let servers = registry.mcp().list_servers().await;
     assert_eq!(servers.len(), 1);
@@ -269,27 +269,27 @@ async fn demo_http_server_can_be_loaded_from_external_mcp_json() {
     assert_eq!(servers[0].transport, McpTransport::StreamableHttp);
     assert_eq!(servers[0].endpoint, demo_server.base_url());
     assert_eq!(servers[0].tool_count, 3);
-    registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "load_toolset".to_string(),
-                arguments: json!({ "name": "demo_http_file" }),
-            },
-        )
-        .await
-        .expect("external http toolset should load");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo_http_file" }),
+        },
+    )
+    .await
+    .expect("external http toolset should load");
 
-    let echo_result = registry
-        .call_for_thread(
-            thread_id,
-            ToolCallRequest {
-                name: "mcp__demo_http_file__echo".to_string(),
-                arguments: json!({ "text": "json-http-ready" }),
-            },
-        )
-        .await
-        .expect("external json http tool should succeed");
+    let echo_result = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "mcp__demo_http_file__echo".to_string(),
+            arguments: json!({ "text": "json-http-ready" }),
+        },
+    )
+    .await
+    .expect("external json http tool should succeed");
     assert_eq!(
         echo_result.content,
         "[demo:streamable_http] json-http-ready"

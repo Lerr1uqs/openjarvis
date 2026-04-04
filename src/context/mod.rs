@@ -1,6 +1,4 @@
-//! Context and chat message types used to assemble prompt history for the agent loop.
-
-use crate::thread::ConversationThread;
+//! Unified chat message protocol shared by thread persistence and LLM requests.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,7 +6,6 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChatMessageRole {
     System,
-    Memory, // TODO: 没有这个东西
     User,
     Assistant,
     Toolcall,
@@ -20,7 +17,6 @@ impl ChatMessageRole {
     pub fn as_label(&self) -> &'static str {
         match self {
             Self::System => "system",
-            Self::Memory => "memory",
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::Toolcall => "toolcall",
@@ -81,113 +77,3 @@ impl ChatMessage {
 }
 
 pub type Messages = Vec<ChatMessage>;
-#[deprecated(note = "use ThreadContext and AgentLoop::run_v1 instead")]
-pub type ContextMessage = MessageContext;
-
-#[deprecated(note = "use ThreadContext and AgentLoop::run_v1 instead")]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MessageContext {
-    pub system: Vec<ChatMessage>,
-    pub memory: Vec<ChatMessage>,
-    pub chat: Vec<ChatMessage>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RenderedPrompt {
-    pub system_prompt: String,
-    pub user_message: String,
-}
-
-#[allow(deprecated)]
-impl MessageContext {
-    /// Create a context initialized with one system prompt message.
-    pub fn with_system_prompt(system_prompt: impl Into<String>) -> Self {
-        let mut context = Self::default();
-        context.push_system(system_prompt);
-        context
-    }
-
-    /// Append a system message to the context.
-    pub fn push_system(&mut self, content: impl Into<String>) {
-        self.system.push(ChatMessage::new(
-            ChatMessageRole::System,
-            content,
-            Utc::now(),
-        ));
-    }
-
-    #[allow(dead_code)]
-    /// Append a memory message to the context.
-    pub fn push_memory(&mut self, content: impl Into<String>) {
-        self.memory.push(ChatMessage::new(
-            ChatMessageRole::Memory,
-            content,
-            Utc::now(),
-        ));
-    }
-
-    /// Append chat messages that were already normalized to the unified protocol shape.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::context::{ChatMessage, ChatMessageRole, MessageContext};
-    ///
-    /// let mut context = MessageContext::with_system_prompt("system");
-    /// context.extend_chat_messages(vec![ChatMessage::new(
-    ///     ChatMessageRole::User,
-    ///     "hello",
-    ///     Utc::now(),
-    /// )]);
-    ///
-    /// assert_eq!(context.chat.len(), 1);
-    /// ```
-    pub fn extend_chat_messages<I>(&mut self, messages: I)
-    where
-        I: IntoIterator<Item = ChatMessage>,
-    {
-        self.chat.extend(messages);
-    }
-
-    /// Extend chat history from an existing conversation thread.
-    pub fn extend_from_thread(&mut self, thread: &ConversationThread) {
-        self.extend_chat_messages(thread.load_messages());
-    }
-
-    /// Return a read-only-style copy of the context messages in prompt order.
-    pub fn as_messages(&self) -> Messages {
-        let mut messages =
-            Vec::with_capacity(self.system.len() + self.memory.len() + self.chat.len());
-        messages.extend(self.system.iter().cloned());
-        messages.extend(self.memory.iter().cloned());
-        messages.extend(self.chat.iter().cloned());
-        messages
-    }
-
-    /// Render the context into the simplified prompt shape used by compatibility helpers.
-    pub fn render_for_llm(&self) -> RenderedPrompt {
-        let mut system_sections: Vec<String> =
-            self.system.iter().map(|msg| msg.content.clone()).collect();
-        if !self.memory.is_empty() {
-            let memory_section = self
-                .memory
-                .iter()
-                .map(|msg| format!("- {}", msg.content))
-                .collect::<Vec<_>>()
-                .join("\n");
-            system_sections.push(format!("Memory:\n{memory_section}"));
-        }
-
-        let user_message = self
-            .chat
-            .iter()
-            .map(|msg| format!("{}: {}", msg.role.as_label(), msg.content))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        RenderedPrompt {
-            system_prompt: system_sections.join("\n\n"),
-            user_message,
-        }
-    }
-}

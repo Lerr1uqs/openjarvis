@@ -12,10 +12,6 @@ fn context_token_kind_maps_chat_roles_to_budget_buckets() {
         ContextTokenKind::System
     );
     assert_eq!(
-        ContextTokenKind::for_chat_message_role(&ChatMessageRole::Memory),
-        ContextTokenKind::Memory
-    );
-    assert_eq!(
         ContextTokenKind::for_chat_message_role(&ChatMessageRole::User),
         ContextTokenKind::Chat
     );
@@ -31,7 +27,6 @@ fn context_budget_report_reads_bucket_tokens_by_enum() {
     let report = ContextBudgetReport::new(
         HashMap::from([
             (ContextTokenKind::System, 10),
-            (ContextTokenKind::Memory, 5),
             (ContextTokenKind::Chat, 40),
             (ContextTokenKind::VisibleTool, 12),
             (ContextTokenKind::ReservedOutput, 16),
@@ -45,7 +40,6 @@ fn context_budget_report_reads_bucket_tokens_by_enum() {
         "visible_tool_tokens"
     );
     assert_eq!(report.tokens(ContextTokenKind::System), 10);
-    assert_eq!(report.tokens(ContextTokenKind::Memory), 5);
     assert_eq!(report.tokens(ContextTokenKind::Chat), 40);
     assert_eq!(report.tokens(ContextTokenKind::VisibleTool), 12);
     assert_eq!(report.tokens(ContextTokenKind::ReservedOutput), 16);

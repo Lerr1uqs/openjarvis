@@ -3,7 +3,7 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     model::{IncomingMessage, ReplyTarget},
     session::{SessionKey, ThreadLocator},
-    thread::{ThreadContext, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator},
 };
 use serde_json::json;
 use std::{
@@ -42,11 +42,8 @@ fn build_locator(session_id: Uuid, incoming: &IncomingMessage) -> ThreadLocator 
     ThreadLocator::new(session_id, incoming, external_thread_id, thread_id)
 }
 
-fn build_compacted_thread_context(
-    locator: &ThreadLocator,
-    now: DateTime<Utc>,
-) -> (ThreadContext, Uuid) {
-    let mut thread_context = ThreadContext::new(ThreadContextLocator::from(locator), now);
+fn build_compacted_thread_context(locator: &ThreadLocator, now: DateTime<Utc>) -> (Thread, Uuid) {
+    let mut thread_context = Thread::new(ThreadContextLocator::from(locator), now);
     thread_context.enable_auto_compact();
     let turn_id = thread_context.store_turn_state(
         None,

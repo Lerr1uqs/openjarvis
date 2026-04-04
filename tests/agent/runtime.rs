@@ -7,7 +7,7 @@ use openjarvis::{
         ToolSource, ToolsetCatalogEntry, empty_tool_input_schema,
     },
     config::AppConfig,
-    thread::{ThreadContext, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -96,7 +96,7 @@ async fn runtime_manages_thread_tool_visibility_and_open_close_flow() {
         .await
         .expect("builtin tools should register");
     let runtime = AgentRuntime::with_parts(Default::default(), registry);
-    let mut thread_context = ThreadContext::new(
+    let mut thread_context = Thread::new(
         ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_runtime", "thread_runtime"),
         Utc::now(),
     );

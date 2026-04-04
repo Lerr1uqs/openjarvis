@@ -117,8 +117,7 @@ Alternative considered:
 `ThreadState` 会拆成几个稳定子域：
 
 - `ThreadFeatureState`
-  - `compact_enabled`
-  - `auto_compact`
+  - `auto_compact_override`
   - 未来其他 thread feature flags
 - `ThreadToolState`
   - `loaded_toolsets`
@@ -157,7 +156,7 @@ Alternative considered:
 
 所有命令都必须先 resolve 目标线程，再读取或修改对应 `ThreadContext`。
 
-`/auto-compact on|off|status` 只是其中一个线程级命令。这样它读写的就是和 AgentLoop 使用同一份线程状态，而不是额外的 override map。
+这样命令读写的就是和 AgentLoop 使用同一份线程状态，而不是额外的 override map。
 
 这也为未来 `/approve`、线程级工具权限调整等命令提供统一入口。
 

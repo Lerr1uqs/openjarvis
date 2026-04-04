@@ -1,15 +1,13 @@
 use chrono::Utc;
 use openjarvis::{
-    command::{CommandInvocation, CommandRegistry, register_runtime_commands},
-    compact::{CompactRuntimeManager, CompactScopeKey},
+    command::{CommandInvocation, CommandRegistry},
     model::{IncomingMessage, ReplyTarget},
     thread::{
-        ThreadContext, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
+        Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
     },
 };
 use serde_json::json;
-use std::sync::Arc;
 use uuid::Uuid;
 
 #[test]
@@ -100,7 +98,6 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
     assert!(thread_context.load_toolsets().is_empty());
     assert!(thread_context.load_tool_events().is_empty());
     assert!(thread_context.pending_tool_events().is_empty());
-    assert!(!thread_context.compact_enabled(false));
     assert!(!thread_context.auto_compact_enabled(false));
 }
 
@@ -185,12 +182,9 @@ async fn builtin_equal_command_handles_match_and_mismatch() {
 }
 
 #[test]
-fn all_registered_commands_are_treated_as_thread_commands() {
-    let compact_runtime = Arc::new(CompactRuntimeManager::new());
-    let mut registry = CommandRegistry::with_builtin_commands();
-    register_runtime_commands(&mut registry, false, false, compact_runtime)
-        .expect("runtime command should register");
-
+fn slash_prefixed_messages_are_treated_as_thread_commands() {
+    // 测试场景: 任何 `/...` 输入都会走命令分发，未注册命令也要返回 unknown command。
+    let registry = CommandRegistry::with_builtin_commands();
     let echo_is_command = registry
         .is_command(&build_incoming("/echo hi"))
         .expect("echo command should parse");
@@ -203,112 +197,22 @@ fn all_registered_commands_are_treated_as_thread_commands() {
 }
 
 #[tokio::test]
-async fn auto_compact_command_requires_resolved_thread_context() {
-    // 测试场景: 所有命令都必须绑定到某个线程上下文，不能再走无线程入口。
-    let compact_runtime = Arc::new(CompactRuntimeManager::new());
-    let mut registry = CommandRegistry::with_builtin_commands();
-    register_runtime_commands(&mut registry, false, false, compact_runtime)
-        .expect("runtime command should register");
-
-    let error = registry
-        .try_execute(&build_incoming("/auto-compact on"))
-        .await
-        .expect_err("command should require a resolved thread context");
-
-    assert!(
-        error
-            .to_string()
-            .contains("all commands require a resolved thread context")
-    );
-}
-
-#[tokio::test]
-async fn auto_compact_command_can_enable_and_report_status_for_current_thread() {
-    // 测试场景: 即使静态 compact 默认关闭，/auto-compact on 也应能在线程级启用并返回确认消息。
-    let compact_runtime = Arc::new(CompactRuntimeManager::new());
-    let mut registry = CommandRegistry::with_builtin_commands();
-    register_runtime_commands(&mut registry, false, false, Arc::clone(&compact_runtime))
-        .expect("runtime command should register");
-    let incoming_on = build_incoming("/auto-compact on");
+async fn removed_auto_compact_command_returns_unknown_reply_without_mutating_thread() {
+    // 测试场景: `/auto-compact` 不再允许通过命令修改线程开关，只返回 unknown command。
+    let registry = CommandRegistry::with_builtin_commands();
     let mut thread_context = build_thread_context();
 
-    let enabled = registry
-        .try_execute_with_thread_context(&incoming_on, &mut thread_context)
+    let reply = registry
+        .try_execute_with_thread_context(&build_incoming("/auto-compact on"), &mut thread_context)
         .await
-        .expect("auto-compact on should execute")
-        .expect("auto-compact on should be handled");
-    let status = registry
-        .try_execute_with_thread_context(
-            &build_incoming("/auto-compact status"),
-            &mut thread_context,
-        )
-        .await
-        .expect("auto-compact status should execute")
-        .expect("auto-compact status should be handled");
+        .expect("removed auto-compact command should still execute through registry")
+        .expect("removed auto-compact command should be handled as unknown command");
 
     assert_eq!(
-        enabled.formatted_content(),
-        "[Command][auto-compact][SUCCESS]: auto-compact enabled for current thread `thread_command`; future turns will expose `compact` and context capacity prompts"
+        reply.formatted_content(),
+        "[Command][auto-compact][FAILED]: unknown command"
     );
-    assert_eq!(
-        status.formatted_content(),
-        "[Command][auto-compact][SUCCESS]: auto-compact is enabled for current thread `thread_command`"
-    );
-    assert!(thread_context.compact_enabled(false));
-    assert!(thread_context.auto_compact_enabled(false));
-    #[allow(deprecated)]
-    {
-        let scope = CompactScopeKey::from_incoming(&incoming_on);
-        assert!(compact_runtime.compact_enabled(&scope, false).await);
-        assert!(compact_runtime.auto_compact_enabled(&scope, false).await);
-    }
-}
-
-#[tokio::test]
-async fn auto_compact_command_off_restores_disabled_status_for_current_thread() {
-    // 测试场景: /auto-compact off 应关闭当前线程的 runtime override，并让 status 变回 disabled。
-    let mut registry = CommandRegistry::with_builtin_commands();
-    let compact_runtime = Arc::new(CompactRuntimeManager::new());
-    register_runtime_commands(&mut registry, false, false, Arc::clone(&compact_runtime))
-        .expect("runtime command should register");
-    let incoming_on = build_incoming("/auto-compact on");
-    let mut thread_context = build_thread_context();
-
-    let _enabled = registry
-        .try_execute_with_thread_context(&incoming_on, &mut thread_context)
-        .await
-        .expect("auto-compact on should execute")
-        .expect("auto-compact on should be handled");
-    let disabled = registry
-        .try_execute_with_thread_context(&build_incoming("/auto-compact off"), &mut thread_context)
-        .await
-        .expect("auto-compact off should execute")
-        .expect("auto-compact off should be handled");
-    let status = registry
-        .try_execute_with_thread_context(
-            &build_incoming("/auto-compact status"),
-            &mut thread_context,
-        )
-        .await
-        .expect("auto-compact status should execute")
-        .expect("auto-compact status should be handled");
-
-    assert_eq!(
-        disabled.formatted_content(),
-        "[Command][auto-compact][SUCCESS]: auto-compact disabled for current thread `thread_command`; future turns will stop exposing `compact` and context capacity prompts"
-    );
-    assert_eq!(
-        status.formatted_content(),
-        "[Command][auto-compact][SUCCESS]: auto-compact is disabled for current thread `thread_command`"
-    );
-    assert!(!thread_context.compact_enabled(false));
     assert!(!thread_context.auto_compact_enabled(false));
-    #[allow(deprecated)]
-    {
-        let scope = CompactScopeKey::from_incoming(&incoming_on);
-        assert!(!compact_runtime.compact_enabled(&scope, false).await);
-        assert!(!compact_runtime.auto_compact_enabled(&scope, false).await);
-    }
 }
 
 fn build_incoming(content: &str) -> IncomingMessage {
@@ -330,9 +234,9 @@ fn build_incoming(content: &str) -> IncomingMessage {
     }
 }
 
-fn build_thread_context() -> ThreadContext {
+fn build_thread_context() -> Thread {
     let thread_id = derive_internal_thread_id("ou_command:feishu:thread_command");
-    ThreadContext::new(
+    Thread::new(
         ThreadContextLocator::new(
             None,
             "feishu",

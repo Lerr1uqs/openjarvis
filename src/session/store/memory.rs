@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     session::{SessionKey, ThreadLocator},
-    thread::ThreadContext,
+    thread::Thread,
 };
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 #[derive(Debug, Default)]
 struct MemoryStoreState {
     sessions: HashMap<SessionKey, StoredSessionRecord>,
-    threads: HashMap<Uuid, ThreadContext>,
+    threads: HashMap<Uuid, Thread>,
     external_messages: HashMap<(Uuid, String), ExternalMessageDedupRecord>,
 }
 
@@ -80,14 +80,14 @@ impl SessionStore for MemorySessionStore {
     async fn load_thread_context(
         &self,
         locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<ThreadContext>> {
+    ) -> SessionStoreResult<Option<Thread>> {
         let state = self.state.lock().await;
         Ok(state.threads.get(&locator.thread_id).cloned())
     }
 
     async fn save_thread_context(
         &self,
-        thread_context: &ThreadContext,
+        thread_context: &Thread,
         updated_at: DateTime<Utc>,
         dedup_record: Option<&ExternalMessageDedupRecord>,
     ) -> SessionStoreResult<u64> {
@@ -112,7 +112,7 @@ impl SessionStore for MemorySessionStore {
         let actual_revision = state
             .threads
             .get(&thread_id)
-            .map(ThreadContext::revision)
+            .map(Thread::revision)
             .unwrap_or_default();
         if !state.sessions.contains_key(&session_key) {
             return Err(anyhow!("session `{}` was not resolved before save", session_id).into());

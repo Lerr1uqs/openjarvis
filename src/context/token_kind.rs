@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 pub enum ContextTokenKind {
     #[serde(rename = "system_tokens")]
     System,
-    #[serde(rename = "memory_tokens")]
-    Memory,
     #[serde(rename = "chat_tokens")]
     Chat,
     #[serde(rename = "visible_tool_tokens")]
@@ -20,9 +18,8 @@ pub enum ContextTokenKind {
 
 impl ContextTokenKind {
     /// Stable ordered list of token buckets used in request-level budget reporting.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::System,
-        Self::Memory,
         Self::Chat,
         Self::VisibleTool,
         Self::ReservedOutput,
@@ -39,7 +36,6 @@ impl ContextTokenKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::System => "system_tokens",
-            Self::Memory => "memory_tokens",
             Self::Chat => "chat_tokens",
             Self::VisibleTool => "visible_tool_tokens",
             Self::ReservedOutput => "reserved_output_tokens",
@@ -60,7 +56,6 @@ impl ContextTokenKind {
     pub fn for_chat_message_role(role: &ChatMessageRole) -> Self {
         match role {
             ChatMessageRole::System => Self::System,
-            ChatMessageRole::Memory => Self::Memory,
             ChatMessageRole::User
             | ChatMessageRole::Assistant
             | ChatMessageRole::Toolcall

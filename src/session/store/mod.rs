@@ -9,7 +9,7 @@ mod sqlite;
 
 use crate::{
     session::{SessionKey, ThreadLocator},
-    thread::ThreadContext,
+    thread::Thread,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -84,12 +84,12 @@ pub trait SessionStore: Send + Sync {
     async fn load_thread_context(
         &self,
         locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<ThreadContext>>;
+    ) -> SessionStoreResult<Option<Thread>>;
 
     /// Persist the latest thread snapshot with compare-and-swap revision semantics.
     async fn save_thread_context(
         &self,
-        thread_context: &ThreadContext,
+        thread_context: &Thread,
         updated_at: DateTime<Utc>,
         dedup_record: Option<&ExternalMessageDedupRecord>,
     ) -> SessionStoreResult<u64>;

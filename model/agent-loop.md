@@ -1,40 +1,26 @@
-thread_init函数 如果thread没有初始化 就进行初始化 进行system prompt的注入
+# AgentLoop
 
-runtime.tool负责工具管理 包括工具的可见性
+这个文件是快速总览版，详细边界以 ` model/agent/loop.md ` 为准。
 
-```rust
-agent loop {
+## 定位
 
-   if not inited {
-      thread_init(&mut thread/thread id)
-   }
+- `AgentLoop` 是一次 agent turn 的执行器。
+- 它消费“已经初始化好的 `Thread` + 当前 incoming message”。
+- 它不拥有线程初始化和稳定 system prompt 注入的 ownership。
 
-   if Compactor::need_compact(&thread.messages()) {
-      Compactor::run(&thread)
-   }
+## 核心边界
 
-   if active_memory_enabled {
-      unimplmented!
-   }
+- worker 负责 `init_thread()`。
+- loop 负责 request-time runtime state。
+- loop 内的临时 system messages 和 live chat messages 只存在于本轮局部变量。
+- loop 结束时只把需要持久化的消息回收到 `Thread`。
 
-   if auto_compact_enabled {
-      thread.append(ChatMessage(
-         // 类似于 "asistant: 当前的上下文已使用 [77%]",
-         Context::budget(thread.messages()).into()
-      ))
-   }
+## 主流程
 
-   thread.append(user_input)
-
-   tools = runtime.tools()
-
-   response = llm.generate(messages, tools)
-
-   for tool in tools {
-      # runtime能在内部调用 Compactor的服务 而不需要做特化
-      runtime.call_tool(..., extra=thread_locator)
-   }
-}
-```
-
-runtime要提供 close_tool, open_tool list_tool等能力
+1. 读取持久化 `Thread`
+2. 准备 request-time tools 与预算
+3. 追加当前用户消息
+4. 调用 LLM
+5. 执行工具并把 assistant/tool messages 追加回 working set
+6. 必要时触发 runtime compact
+7. 产出 commit messages 与更新后的 `Thread`

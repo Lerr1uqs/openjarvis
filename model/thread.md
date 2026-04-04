@@ -2,71 +2,74 @@
 
 ## 定位
 
-- `ThreadContext` 是单条线程的统一事务宿主。
-- 它同时承载可持久化历史和线程级运行时状态，是 Agent、Command、Session 共享的核心对象。
+- `Thread` 是线程级持久化聚合。
+- 它负责保存线程身份、持久化消息和线程级非消息状态。
+- 它不负责 LLM 调用、不负责 Router 编排，也不负责 request-time live working set。
 
-## 边界
+```rust
+pub struct Thread {
+   pub locator: ThreadContextLocator,
+   pub thread: ThreadContext,
+   pub state: ThreadState,
+}
+```
 
-- 负责保存线程身份、对话历史、工具状态、feature override、审批状态。
-- 不负责消息路由，不负责调用 LLM，不负责工具注册表全局目录。
+## 严格边界
+
+- `ThreadContext` 只负责持久化消息域。
+- `ThreadState` 只负责 feature/tool/approval 这类非消息状态。
+- request-time 临时消息只属于 `AgentLoop` 局部执行期，不属于 `Thread` 模型。
+- `Turn` 只保留为提交概念，不再作为主存储结构。
 
 ## 关键概念
 
 - `ThreadContextLocator`
-  当前线程的稳定定位信息。
+  线程的稳定定位信息，包含 `session_id`、`channel`、`user_id`、`external_thread_id`、`thread_id`。
 - `thread_key`
-  线程身份的归一化原串，格式固定为 `user_id:channel:external_thread_id`。
-  它不是单独存一份业务对象，而是由 session 解析阶段基于外部消息现场即时推导出来。
-- `ThreadConversation`
-  线程的持久化历史，包含 `turns` 和 `tool_events`。
-- `ConversationTurn`
-  一轮处理后的消息集合。
+  归一化线程键，格式固定为 `user_id:channel:external_thread_id`。
+- `ThreadContext`
+  持久化消息序列，以及 `created_at` / `updated_at`。
 - `ThreadState`
-  线程级持久状态，当前拆成 `features / request_context / tools / approval`。
-- `ThreadFeaturesSystemPrompt`
-  当前请求前临时重建的静态 feature system prompt 槽位，固定包含 `toolset_catalog / skill_catalog / auto_compact`。
-- `live_system_messages`
-  当前请求的瞬时 runtime system messages，例如 auto-compact 的动态容量提示。
-- `live_memory_messages`
-  当前请求的瞬时 memory messages，只参与本轮 request，不进入固定 system prompt 槽位。
-- `ThreadToolEvent`
-  工具加载、卸载、执行的结构化审计事件。
+  线程级 feature override、loaded toolsets、tool event、approval 状态。
+
+## 消息模型
+
+- `Thread.thread.messages`
+  当前线程全部持久化消息。
+- 稳定 `System` messages 在 `init_thread()` 时一次性注入到 `Thread` 并持久化。
+- 这些稳定 `System` messages 必须位于持久化消息序列前缀。
+- `Thread::messages()`
+  返回全部持久化消息。
+- `Thread::load_messages()`
+  返回全部持久化的非 `System` 消息。
+- `Thread::system_prefix_messages()`
+  返回持久化的 `System` 前缀。
+- LLM 请求消息
+  由 `AgentLoop` 在运行时临时拼接 `persisted messages + transient system messages + current live chat messages`。
+
+## 初始化 Ownership
+
+- `init_thread()` 属于 worker，不属于 `AgentLoop`。
+- worker 在进入 live loop 前准备 feature/tool registry，并构造稳定 system messages。
+- 初始化后的 system messages 直接持久化进 `Thread`，之后 loop 只消费已初始化线程。
+- 初始化如果改动了线程，必须立即同步到 session/store。
+
+## compact 边界
+
+- compact 的输入边界是 message 序列，不是 turn slice。
+- 主链路只 compact 全部非 `System` message。
+- compact 写回时保留持久化 `System` 前缀，只替换非 `System` 历史。
+- compact 是否执行由调用方决定，`Thread` 本身只提供消息读写边界。
+
+## Turn 概念
+
+- `Turn` 仍然表示“一次用户输入驱动的一轮提交”。
+- `Thread::store_turn(...)` 仍是提交接口，但落盘边界已经收敛为 message append。
+- tool event 在提交时再统一绑定到该次 turn。
 
 ## 核心能力
 
-- 通过 `channel + user_id + external_thread_id` 生成稳定 `thread_key`，再派生 internal thread id。
-- 以 turn 为单位保存聊天历史。
-- 在线程初始化时固化 system prompt snapshot。
-- 通过零参 `messages()` 对外导出完整请求消息序列，固定顺序为 persisted snapshot -> features_system_prompt -> live_system_messages -> live_memory_messages -> persisted history -> live_chat。
-- 用固定的 `features_system_prompt` 槽位表达静态 feature system prompt，不在 loop 中临时拼 `Vec<ChatMessage>`。
-- 通过统一 rebuild 入口整体替换 `features_system_prompt`，不把 feature 状态变化写成一次性历史消息。
-- 通过 `AutoCompactor::notify_capacity(...)` 注入动态容量提示，这类 prompt 不占用固定 slot。
-- 通过 `push_message(...)` 接收本轮 live chat；兼容路径下的 system / memory 会先进入 request-time 输入，再重建成 live system / live memory messages。
-- 记录线程当前已加载 toolset。
-- 保存 compact / auto-compact 的线程级覆盖状态。
-- 在 turn 落盘前把 `pending_tool_events` 绑定到本轮 turn。
-- 支持清空线程到初始状态，但保留线程身份。
-
-## thread_key 来源
-
-- 输入来源是外部消息里的三元组：`channel`、`user_id`、`external_thread_id`。
-- `external_thread_id` 由上游平台提供；如果上游没有提供，就先归一成 `default`。
-- Session 层先基于 `IncomingMessage` 生成 `SessionKey(channel + user_id)`。
-- 然后再用 `SessionKey::thread_key(external_thread_id)` 拼出：
-  `user_id:channel:external_thread_id`
-- 这个字符串就是 `thread_key`，随后再通过 `derive_internal_thread_id(thread_key)` 稳定派生出内部 `thread_id`。
-
-所以线程身份链路是：
-
-`IncomingMessage -> external_thread_id -> thread_key -> internal thread_id -> ThreadContextLocator`
-
-## 使用方式
-
-- AgentLoop 在整个单轮执行期间直接读写 `ThreadContext`。
-- Router 只负责把 `incoming` 和目标 `ThreadContext` 交给 AgentLoop，不直接操控 messages。
-- toolset / skill / auto-compact 的稳定 system prompt 通过固定 `FeaturePromptProvider` 重建后写入 `features_system_prompt`。
-- request-time memory 通过 memory provider 写入 `live_memory_messages`。
-- auto-compact 的动态容量信息通过 `AutoCompactor` 写入 `live_system_messages`。
-- 基础 system prompt 继续只在线程初始化时写入 persisted snapshot；后续 rebuild 不会覆盖它。
-- Command 修改线程开关或清空历史时，也直接修改 `ThreadContext`。
-- Session 持久化的对象不是零散状态，而是完整 `ThreadContext` 快照。
+- 根据 `channel + user_id + external_thread_id` 派生稳定 `thread_id`。
+- 以 message 为最小持久化单位保存线程历史。
+- 持久化线程级 toolset 状态和 tool event 审计信息。
+- 在清空线程时保留线程身份，只重置消息和线程状态。

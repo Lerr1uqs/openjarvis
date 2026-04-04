@@ -10,10 +10,9 @@ pub mod toolset;
 pub mod write;
 
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
-use crate::thread::{ThreadContext, ThreadContextLocator};
+use crate::thread::Thread;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use chrono::Utc;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -28,7 +27,7 @@ pub use mcp::{
 pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use skill::{LoadSkillTool, LoadedSkill, LoadedSkillFile, SkillManifest, SkillRegistry};
-pub use toolset::{ThreadToolRuntimeManager, ThreadToolRuntimeSnapshot, ToolsetCatalogEntry};
+pub use toolset::ToolsetCatalogEntry;
 pub use write::WriteTool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +198,6 @@ pub struct ToolRegistry {
     // AGENT-TODO: 对String起别名
     always_visible_handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
     toolsets: RwLock<HashMap<String, RegisteredToolset>>,
-    thread_runtimes: Arc<toolset::ThreadToolRuntimeManager>,
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
 }
@@ -242,7 +240,6 @@ impl ToolRegistry {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
-            thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::new()),
         }
@@ -265,7 +262,6 @@ impl ToolRegistry {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
-            thread_runtimes: Arc::new(toolset::ThreadToolRuntimeManager::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
         }
@@ -427,10 +423,7 @@ impl ToolRegistry {
     }
 
     /// Return the thread-scoped visible tool definitions for one thread context.
-    pub async fn list_for_context(
-        &self,
-        thread_context: &ThreadContext,
-    ) -> Result<Vec<ToolDefinition>> {
+    pub async fn list_for_context(&self, thread_context: &Thread) -> Result<Vec<ToolDefinition>> {
         self.list_for_context_with_compact(thread_context, false)
             .await
     }
@@ -438,7 +431,7 @@ impl ToolRegistry {
     /// Return the thread-scoped visible tool definitions and optionally expose `compact`.
     pub async fn list_for_context_with_compact(
         &self,
-        thread_context: &ThreadContext,
+        thread_context: &Thread,
         compact_visible: bool,
     ) -> Result<Vec<ToolDefinition>> {
         let mut definitions = self.list_for_context_static(thread_context).await?;
@@ -452,7 +445,7 @@ impl ToolRegistry {
     /// Return the thread-scoped visible tool definitions without dynamic compact projection.
     pub async fn list_for_context_static(
         &self,
-        thread_context: &ThreadContext,
+        thread_context: &Thread,
     ) -> Result<Vec<ToolDefinition>> {
         let mut definitions = self.list().await;
         definitions.push(load_toolset_definition());
@@ -474,7 +467,7 @@ impl ToolRegistry {
     /// Execute one tool request within the current thread context runtime.
     pub async fn call_for_context(
         &self,
-        thread_context: &mut ThreadContext,
+        thread_context: &mut Thread,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let thread_id = thread_context.locator.thread_id.clone();
@@ -520,11 +513,11 @@ impl ToolRegistry {
     /// use chrono::Utc;
     /// use openjarvis::{
     ///     agent::ToolRegistry,
-    ///     thread::{ThreadContext, ThreadContextLocator},
+    ///     thread::{Thread, ThreadContextLocator},
     /// };
     ///
     /// let registry = ToolRegistry::new();
-    /// let mut thread_context = ThreadContext::new(
+    /// let mut thread_context = Thread::new(
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     Utc::now(),
     /// );
@@ -533,11 +526,7 @@ impl ToolRegistry {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn open_tool(
-        &self,
-        thread_context: &mut ThreadContext,
-        tool_name: &str,
-    ) -> Result<bool> {
+    pub async fn open_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
         let tool_name = tool_name.trim();
         if tool_name.is_empty() {
             bail!("open_tool requires a non-empty tool name");
@@ -557,11 +546,11 @@ impl ToolRegistry {
     /// use chrono::Utc;
     /// use openjarvis::{
     ///     agent::ToolRegistry,
-    ///     thread::{ThreadContext, ThreadContextLocator},
+    ///     thread::{Thread, ThreadContextLocator},
     /// };
     ///
     /// let registry = ToolRegistry::new();
-    /// let mut thread_context = ThreadContext::new(
+    /// let mut thread_context = Thread::new(
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     Utc::now(),
     /// );
@@ -570,11 +559,7 @@ impl ToolRegistry {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn close_tool(
-        &self,
-        thread_context: &mut ThreadContext,
-        tool_name: &str,
-    ) -> Result<bool> {
+    pub async fn close_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
         let tool_name = tool_name.trim();
         if tool_name.is_empty() {
             bail!("close_tool requires a non-empty tool name");
@@ -593,10 +578,7 @@ impl ToolRegistry {
     }
 
     /// Return the compact toolset catalog prompt for one thread context.
-    pub async fn catalog_prompt_for_context(
-        &self,
-        thread_context: &ThreadContext,
-    ) -> Option<String> {
+    pub async fn catalog_prompt_for_context(&self, thread_context: &Thread) -> Option<String> {
         let entries = self.list_toolsets().await;
         if entries.is_empty() {
             return None;
@@ -632,75 +614,6 @@ impl ToolRegistry {
         entries
     }
 
-    /// Merge deprecated thread-id keyed compatibility state into one `ThreadContext`.
-    pub async fn merge_legacy_thread_state(&self, thread_context: &mut ThreadContext) {
-        let thread_id = thread_context.locator.thread_id.clone();
-        let loaded_toolsets = self.thread_runtimes.loaded_toolsets(&thread_id).await;
-        if !loaded_toolsets.is_empty() {
-            thread_context.replace_loaded_toolsets(loaded_toolsets);
-        }
-    }
-
-    /// Sync one `ThreadContext` back into the deprecated thread-id keyed compatibility caches.
-    pub async fn sync_legacy_thread_state(&self, thread_context: &ThreadContext) {
-        let thread_id = thread_context.locator.thread_id.clone();
-        self.thread_runtimes
-            .replace_loaded_toolsets(&thread_id, &thread_context.load_toolsets())
-            .await;
-    }
-
-    /// Replace one thread runtime from persisted thread metadata.
-    #[deprecated(note = "use merge_legacy_thread_state with ThreadContext instead")]
-    pub async fn rehydrate_thread(
-        &self,
-        thread_id: &str,
-        loaded_toolsets: &[String],
-    ) -> ThreadToolRuntimeSnapshot {
-        self.thread_runtimes
-            .replace_loaded_toolsets(thread_id, loaded_toolsets)
-            .await
-    }
-
-    /// Return the loaded toolset names for one internal thread.
-    #[deprecated(note = "use ThreadContext::load_toolsets instead")]
-    pub async fn loaded_toolsets_for_thread(&self, thread_id: &str) -> Vec<String> {
-        self.thread_runtimes.loaded_toolsets(thread_id).await
-    }
-
-    /// Return the thread-scoped visible tool definitions for one internal thread id.
-    #[deprecated(note = "use list_for_context instead")]
-    pub async fn list_for_thread(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
-        let thread_context = self.legacy_thread_context(thread_id).await;
-        self.list_for_context(&thread_context).await
-    }
-
-    /// Return the thread-scoped visible tool definitions without dynamic compact projection.
-    #[deprecated(note = "use list_for_context_static instead")]
-    pub async fn list_for_thread_static(&self, thread_id: &str) -> Result<Vec<ToolDefinition>> {
-        let thread_context = self.legacy_thread_context(thread_id).await;
-        self.list_for_context_static(&thread_context).await
-    }
-
-    /// Execute one tool request within the deprecated thread-id keyed compatibility runtime.
-    #[deprecated(note = "use call_for_context instead")]
-    pub async fn call_for_thread(
-        &self,
-        thread_id: &str,
-        request: ToolCallRequest,
-    ) -> Result<ToolCallResult> {
-        let mut thread_context = self.legacy_thread_context(thread_id).await;
-        let result = self.call_for_context(&mut thread_context, request).await;
-        self.sync_legacy_thread_state(&thread_context).await;
-        result
-    }
-
-    /// Return the compact toolset catalog prompt for one internal thread.
-    #[deprecated(note = "use catalog_prompt_for_context instead")]
-    pub async fn catalog_prompt(&self, thread_id: &str) -> Option<String> {
-        let thread_context = self.legacy_thread_context(thread_id).await;
-        self.catalog_prompt_for_context(&thread_context).await
-    }
-
     /// Return the MCP management API exposed by this tool registry.
     pub fn mcp(&self) -> ToolRegistryMcpApi<'_> {
         ToolRegistryMcpApi { registry: self }
@@ -716,15 +629,6 @@ impl ToolRegistry {
         let definition = handler.definition();
         let mut handlers = self.always_visible_handlers.write().await;
         handlers.entry(definition.name).or_insert(handler);
-    }
-
-    async fn legacy_thread_context(&self, thread_id: &str) -> ThreadContext {
-        let mut thread_context = ThreadContext::new(
-            ThreadContextLocator::for_internal_thread(thread_id),
-            Utc::now(),
-        );
-        self.merge_legacy_thread_state(&mut thread_context).await;
-        thread_context
     }
 
     pub(crate) async fn toolset_registered(&self, toolset_name: &str) -> bool {
@@ -849,7 +753,7 @@ impl ToolRegistry {
 
     async fn load_toolset(
         &self,
-        thread_context: &mut ThreadContext,
+        thread_context: &mut Thread,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: ManageToolsetArguments = parse_tool_arguments(request, "load_toolset")?;
@@ -877,7 +781,7 @@ impl ToolRegistry {
 
     async fn unload_toolset(
         &self,
-        thread_context: &mut ThreadContext,
+        thread_context: &mut Thread,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: ManageToolsetArguments = parse_tool_arguments(request, "unload_toolset")?;

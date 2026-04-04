@@ -1,74 +1,33 @@
 mod token_kind;
 
 use chrono::Utc;
-use openjarvis::{
-    context::{ChatMessage, ChatMessageRole, ChatToolCall, MessageContext},
-    thread::ConversationThread,
-};
+use openjarvis::context::{ChatMessage, ChatMessageRole, ChatToolCall};
 use serde_json::json;
 
 #[test]
-fn context_renders_system_memory_and_chat() {
-    // 测试场景: system、memory、chat 三段上下文应被正确拼接进兼容 prompt。
-    let now = Utc::now();
-    let mut thread = ConversationThread::new("default", now);
-    thread.store_turn(
-        Some("msg_1".to_string()),
-        vec![
-            ChatMessage::new(ChatMessageRole::User, "hello", now),
-            ChatMessage::new(ChatMessageRole::Assistant, "world", now),
-        ],
-        now,
-        now,
-    );
-
-    let mut context = MessageContext::with_system_prompt("system prompt");
-    context.push_memory("remember this");
-    context.extend_from_thread(&thread);
-    let rendered = context.render_for_llm();
-
-    assert!(rendered.system_prompt.contains("system prompt"));
-    assert!(rendered.system_prompt.contains("remember this"));
-    assert!(rendered.user_message.contains("user: hello"));
-    assert!(rendered.user_message.contains("assistant: world"));
+fn chat_message_role_labels_match_prompt_contract() {
+    // 测试场景: 统一消息协议的 role label 必须稳定，避免 prompt render 和 compact transcript 漂移。
+    assert_eq!(ChatMessageRole::System.as_label(), "system");
+    assert_eq!(ChatMessageRole::User.as_label(), "user");
+    assert_eq!(ChatMessageRole::Assistant.as_label(), "assistant");
+    assert_eq!(ChatMessageRole::Toolcall.as_label(), "toolcall");
+    assert_eq!(ChatMessageRole::ToolResult.as_label(), "tool_result");
 }
 
 #[test]
-fn context_extend_from_thread_preserves_tool_call_metadata() {
-    // 测试场景: 从 thread 回填 chat history 时，tool_call 元数据不能丢失。
-    let now = Utc::now();
-    let mut thread = ConversationThread::new("default", now);
-    thread.store_turn(
-        Some("msg_1".to_string()),
-        vec![
-            ChatMessage::new(ChatMessageRole::User, "读取配置", now),
-            ChatMessage::new(ChatMessageRole::Assistant, "", now).with_tool_calls(vec![
-                ChatToolCall {
-                    id: "call_1".to_string(),
-                    name: "read".to_string(),
-                    arguments: json!({ "path": "config.yaml" }),
-                },
-            ]),
-            ChatMessage::new(ChatMessageRole::ToolResult, "ok", now).with_tool_call_id("call_1"),
-            ChatMessage::new(ChatMessageRole::Assistant, "完成", now),
-        ],
-        now,
-        now,
-    );
+fn chat_message_preserves_tool_call_metadata() {
+    // 测试场景: assistant/tool_result 的 tool-call 关联信息必须原样保留。
+    let message = ChatMessage::new(ChatMessageRole::Assistant, "读取配置", Utc::now())
+        .with_tool_calls(vec![ChatToolCall {
+            id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: json!({ "path": "config.yaml" }),
+        }]);
+    let result =
+        ChatMessage::new(ChatMessageRole::ToolResult, "ok", Utc::now()).with_tool_call_id("call_1");
 
-    let mut context = MessageContext::with_system_prompt("system prompt");
-    context.extend_from_thread(&thread);
-    let messages = context.as_messages();
-
-    assert_eq!(messages.len(), 5);
-    assert!(
-        messages
-            .iter()
-            .any(|message| message.tool_calls.iter().any(|call| call.id == "call_1"))
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|message| message.tool_call_id.as_deref() == Some("call_1"))
-    );
+    assert_eq!(message.tool_calls.len(), 1);
+    assert_eq!(message.tool_calls[0].id, "call_1");
+    assert_eq!(message.tool_calls[0].name, "read");
+    assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
 }

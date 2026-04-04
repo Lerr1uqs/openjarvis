@@ -2,16 +2,17 @@
 
 use super::{
     agent_loop::{AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopOutput},
+    feature::FeaturePromptRebuilder,
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
 };
 use crate::compact::CompactProvider;
 use crate::config::{AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig};
-use crate::context::ChatMessage;
+use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
-use crate::thread::{ConversationThread, ThreadContext, ThreadToolEvent};
+use crate::thread::{Thread, ThreadToolEvent};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -22,15 +23,14 @@ use tracing::warn;
 pub struct AgentRequest {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
-    pub thread_context: ThreadContext,
+    pub thread_context: Thread,
 }
 
 #[derive(Debug, Clone)]
 pub struct CompletedAgentCommit {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
-    pub thread_context: ThreadContext,
-    pub active_thread: ConversationThread,
+    pub thread_context: Thread,
     pub commit_messages: Vec<ChatMessage>,
     pub persist_incoming_user: bool,
     pub loaded_toolsets: Vec<String>,
@@ -39,12 +39,18 @@ pub struct CompletedAgentCommit {
 }
 
 #[derive(Debug, Clone)]
+pub struct SyncedThreadContext {
+    pub locator: ThreadLocator,
+    pub thread_context: Thread,
+    pub synced_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FailedAgentCommit {
     pub locator: ThreadLocator,
     pub incoming: IncomingMessage,
     pub error: String,
-    pub thread_context: ThreadContext,
-    pub active_thread: ConversationThread,
+    pub thread_context: Thread,
     pub loaded_toolsets: Vec<String>,
     pub completed_at: DateTime<Utc>,
 }
@@ -52,6 +58,7 @@ pub struct FailedAgentCommit {
 #[derive(Debug, Clone)]
 pub enum AgentWorkerEvent {
     Dispatch(AgentDispatchEvent),
+    ThreadContextSynced(SyncedThreadContext),
     CommitCompleted(CompletedAgentCommit),
     CommitFailed(FailedAgentCommit),
 }
@@ -63,6 +70,9 @@ pub struct AgentWorkerHandle {
 
 pub struct AgentWorker {
     agent_loop: AgentLoop,
+    thread_initializer: FeaturePromptRebuilder,
+    system_prompt: String,
+    compact_config: AgentCompactConfig,
     sandbox: DummySandboxContainer,
 }
 
@@ -147,35 +157,81 @@ impl AgentWorkerBuilder {
 
     /// Build the worker from the accumulated fields.
     pub fn build(self) -> Result<AgentWorker> {
-        let Some(llm) = self.llm else {
+        let Self {
+            llm,
+            runtime,
+            system_prompt,
+            llm_config,
+            compact_config,
+            compact_provider,
+        } = self;
+        let Some(llm) = llm else {
             bail!("agent worker builder requires an llm provider");
         };
-        let agent_loop = match self.compact_provider {
+        let thread_initializer =
+            FeaturePromptRebuilder::new(runtime.tools(), compact_config.clone());
+        let agent_loop = match compact_provider {
             Some(compact_provider) => AgentLoop::with_compact_provider_and_system_prompt(
                 llm,
-                self.runtime,
-                self.llm_config,
-                self.compact_config,
+                runtime,
+                llm_config,
+                compact_config.clone(),
                 compact_provider,
-                Some(self.system_prompt.clone()),
+                Some(system_prompt.clone()),
             ),
             None => AgentLoop::with_compact_config_and_system_prompt(
                 llm,
-                self.runtime,
-                self.llm_config,
-                self.compact_config,
-                Some(self.system_prompt.clone()),
+                runtime,
+                llm_config,
+                compact_config.clone(),
+                Some(system_prompt.clone()),
             ),
         };
 
         Ok(AgentWorker {
             agent_loop,
+            thread_initializer,
+            system_prompt,
+            compact_config,
             sandbox: DummySandboxContainer::new(),
         })
     }
 }
 
 impl AgentWorker {
+    async fn initialize_thread(&self, thread_context: &mut Thread) -> Result<bool> {
+        if !thread_context.system_prefix_messages().is_empty() {
+            return Ok(false);
+        }
+
+        self.agent_loop
+            .runtime()
+            .tools()
+            .register_builtin_tools()
+            .await?;
+
+        let created_at = Utc::now();
+        let mut system_messages = Vec::new();
+        if !self.system_prompt.trim().is_empty() {
+            system_messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                self.system_prompt.trim(),
+                created_at,
+            ));
+        }
+        system_messages.extend(
+            self.thread_initializer
+                .build_messages(
+                    thread_context,
+                    self.compact_config.enabled()
+                        && thread_context.auto_compact_enabled(self.compact_config.auto_compact()),
+                )
+                .await?,
+        );
+
+        Ok(thread_context.ensure_system_prefix_messages(&system_messages))
+    }
+
     /// Create one worker builder.
     pub fn builder() -> AgentWorkerBuilder {
         AgentWorkerBuilder::new()
@@ -342,16 +398,30 @@ impl AgentWorker {
             }
         });
 
+        let mut thread_context = request.thread_context.clone();
+        if self.initialize_thread(&mut thread_context).await? {
+            event_tx
+                .send(AgentWorkerEvent::ThreadContextSynced(SyncedThreadContext {
+                    locator: request.locator.clone(),
+                    thread_context: thread_context.clone(),
+                    synced_at: request.incoming.received_at,
+                }))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to report bootstrapped thread: {error}")
+                })?;
+        }
+
         let loop_output = self
             .agent_loop
             .run_v1(
                 AgentEventSender::from_incoming_and_locator(
                     dispatch_tx,
                     &request.incoming,
-                    &request.thread_context.locator,
+                    &thread_context.locator,
                 ),
                 &request.incoming,
-                request.thread_context.clone(),
+                thread_context.clone(),
             )
             .await;
         forward_dispatch_task
@@ -366,7 +436,6 @@ impl AgentWorker {
                         locator: request.locator,
                         incoming: request.incoming,
                         thread_context: loop_output.thread_context.clone(),
-                        active_thread: loop_output.thread_context.to_conversation_thread(),
                         commit_messages: loop_output.commit_messages.clone(),
                         persist_incoming_user: loop_output.persist_incoming_user,
                         loaded_toolsets: loop_output.loaded_toolsets.clone(),
@@ -387,9 +456,8 @@ impl AgentWorker {
                         locator: request.locator,
                         incoming: request.incoming,
                         error: error_message.clone(),
-                        thread_context: request.thread_context.clone(),
-                        active_thread: request.thread_context.to_conversation_thread(),
-                        loaded_toolsets: request.thread_context.load_toolsets(),
+                        thread_context: thread_context.clone(),
+                        loaded_toolsets: thread_context.load_toolsets(),
                         completed_at,
                     }))
                     .await

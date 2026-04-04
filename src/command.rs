@@ -2,16 +2,15 @@
 //!
 //! The router uses this module as a hard pre-processing stage. Any incoming message that starts
 //! with `/` is treated as a command message. Every command is thread-scoped, so the router must
-//! resolve the target `ThreadContext` before execution. Unknown commands return a formatted failure
+//! resolve the target `Thread` before execution. Unknown commands return a formatted failure
 //! response without touching `AgentWorker`.
 //! Some Feishu channel messages may arrive as `@_user_1 /echo zxf`, so command matching strips
 //! one leading Feishu mention token before checking whether the message starts with `/`.
-//! Commands can still mutate shared live state and override static YAML defaults even though
-//! command messages themselves do not enter the persisted session history.
+//! Commands can still mutate resolved thread state even though command messages themselves do not
+//! enter the persisted session history.
 
-use crate::compact::{CompactRuntimeManager, CompactScopeKey};
 use crate::model::IncomingMessage;
-use crate::thread::ThreadContext;
+use crate::thread::Thread;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -219,7 +218,7 @@ pub trait CommandHandler: Send + Sync {
         &self,
         invocation: &CommandInvocation,
         incoming: &IncomingMessage,
-        thread_context: &mut ThreadContext,
+        thread_context: &mut Thread,
     ) -> Result<CommandReply>;
 }
 
@@ -299,7 +298,7 @@ impl CommandRegistry {
     ///         &self,
     ///         _invocation: &CommandInvocation,
     ///         _incoming: &IncomingMessage,
-    ///         _thread_context: &mut openjarvis::thread::ThreadContext,
+    ///         _thread_context: &mut openjarvis::thread::Thread,
     ///     ) -> anyhow::Result<CommandReply> {
     ///         Ok(CommandReply::success("ping", "pong"))
     ///     }
@@ -328,21 +327,11 @@ impl CommandRegistry {
         Ok(CommandInvocation::parse(&normalized_content)?.is_some())
     }
 
-    /// Try to execute one incoming message as a slash command.
-    ///
-    /// Returns `Ok(None)` when the message is not a command. Slash commands always return
-    /// `Some(CommandReply)`, including unknown-command failures.
-    #[deprecated(note = "resolve a ThreadContext first and call try_execute_with_thread_context")]
-    pub async fn try_execute(&self, incoming: &IncomingMessage) -> Result<Option<CommandReply>> {
-        let _ = incoming;
-        bail!("all commands require a resolved thread context")
-    }
-
     /// Try to execute one incoming message as a slash command with the resolved target thread context.
     pub async fn try_execute_with_thread_context(
         &self,
         incoming: &IncomingMessage,
-        thread_context: &mut ThreadContext,
+        thread_context: &mut Thread,
     ) -> Result<Option<CommandReply>> {
         let normalized_content = remove_prefix_at_if_exist(incoming);
         let Some(invocation) = CommandInvocation::parse(&normalized_content)? else {
@@ -370,44 +359,6 @@ impl Default for CommandRegistry {
     }
 }
 
-/// Register runtime-scoped built-in commands that need live shared state.
-///
-/// # 示例
-/// ```rust,no_run
-/// # async fn demo() -> anyhow::Result<()> {
-/// use openjarvis::{
-///     command::{CommandRegistry, register_runtime_commands},
-///     compact::CompactRuntimeManager,
-/// };
-/// use std::sync::Arc;
-///
-/// let mut registry = CommandRegistry::with_builtin_commands();
-/// register_runtime_commands(
-///     &mut registry,
-///     true,
-///     false,
-///     Arc::new(CompactRuntimeManager::new()),
-/// )?;
-/// # Ok(())
-/// # }
-/// ```
-pub fn register_runtime_commands(
-    registry: &mut CommandRegistry,
-    default_compact_enabled: bool,
-    default_auto_compact: bool,
-    compact_runtime: Arc<CompactRuntimeManager>,
-) -> Result<()> {
-    registry.register(
-        "auto-compact",
-        Arc::new(AutoCompactCommand::new(
-            default_compact_enabled,
-            default_auto_compact,
-            compact_runtime,
-        )),
-    )?;
-    Ok(())
-}
-
 struct TestCommand;
 
 #[async_trait]
@@ -416,7 +367,7 @@ impl CommandHandler for TestCommand {
         &self,
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
-        _thread_context: &mut ThreadContext,
+        _thread_context: &mut Thread,
     ) -> Result<CommandReply> {
         let message = if invocation.raw_arguments().is_empty() {
             "test command ok".to_string()
@@ -435,7 +386,7 @@ impl CommandHandler for EqualCommand {
         &self,
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
-        _thread_context: &mut ThreadContext,
+        _thread_context: &mut Thread,
     ) -> Result<CommandReply> {
         let arguments = invocation.arguments();
         if arguments.len() != 2 {
@@ -467,7 +418,7 @@ impl CommandHandler for EchoCommand {
         &self,
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
-        _thread_context: &mut ThreadContext,
+        _thread_context: &mut Thread,
     ) -> Result<CommandReply> {
         Ok(CommandReply::success(
             invocation.name(),
@@ -490,7 +441,7 @@ impl CommandHandler for ClearCommand {
         &self,
         invocation: &CommandInvocation,
         incoming: &IncomingMessage,
-        thread_context: &mut ThreadContext,
+        thread_context: &mut Thread,
     ) -> Result<CommandReply> {
         if !invocation.arguments().is_empty() {
             return Ok(Self::usage(invocation.name()));
@@ -509,93 +460,6 @@ impl CommandHandler for ClearCommand {
                 thread_context.locator.external_thread_id
             ),
         ))
-    }
-}
-
-struct AutoCompactCommand {
-    default_compact_enabled: bool,
-    default_auto_compact: bool,
-    compact_runtime: Arc<CompactRuntimeManager>,
-}
-
-impl AutoCompactCommand {
-    fn new(
-        default_compact_enabled: bool,
-        default_auto_compact: bool,
-        compact_runtime: Arc<CompactRuntimeManager>,
-    ) -> Self {
-        Self {
-            default_compact_enabled,
-            default_auto_compact,
-            compact_runtime,
-        }
-    }
-
-    fn usage(name: &str) -> CommandReply {
-        CommandReply::failed(name, "usage: /auto-compact <on|off|status>")
-    }
-}
-
-#[async_trait]
-impl CommandHandler for AutoCompactCommand {
-    #[allow(deprecated)]
-    async fn execute(
-        &self,
-        invocation: &CommandInvocation,
-        incoming: &IncomingMessage,
-        thread_context: &mut ThreadContext,
-    ) -> Result<CommandReply> {
-        let Some(action) = invocation.arguments().first().map(|value| value.as_str()) else {
-            return Ok(Self::usage(invocation.name()));
-        };
-        let scope = CompactScopeKey::from_incoming(incoming);
-
-        match action {
-            "on" => {
-                thread_context.enable_auto_compact();
-                self.compact_runtime
-                    .set_compact_enabled(scope.clone(), true)
-                    .await;
-                self.compact_runtime
-                    .set_auto_compact(scope.clone(), true)
-                    .await;
-                Ok(CommandReply::success(
-                    invocation.name(),
-                    format!(
-                        "auto-compact enabled for current thread `{}`; future turns will expose `compact` and context capacity prompts",
-                        scope.external_thread_id
-                    ),
-                ))
-            }
-            "off" => {
-                thread_context.disable_auto_compact();
-                self.compact_runtime
-                    .set_compact_enabled(scope.clone(), self.default_compact_enabled)
-                    .await;
-                self.compact_runtime
-                    .set_auto_compact(scope.clone(), false)
-                    .await;
-                Ok(CommandReply::success(
-                    invocation.name(),
-                    format!(
-                        "auto-compact disabled for current thread `{}`; future turns will stop exposing `compact` and context capacity prompts",
-                        scope.external_thread_id
-                    ),
-                ))
-            }
-            "status" => {
-                let enabled = thread_context.auto_compact_enabled(self.default_auto_compact);
-                Ok(CommandReply::success(
-                    invocation.name(),
-                    format!(
-                        "auto-compact is {} for current thread `{}`",
-                        if enabled { "enabled" } else { "disabled" },
-                        scope.external_thread_id
-                    ),
-                ))
-            }
-            _ => Ok(Self::usage(invocation.name())),
-        }
     }
 }
 
