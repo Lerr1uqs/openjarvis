@@ -25,7 +25,7 @@
 
 ## 核心能力
 
-- 从本地 `.skills` 根目录扫描 `SKILL.md`。
+- 默认从当前工作区 `.openjarvis/skills` 根目录扫描 `SKILL.md`。
 - 支持 enable / disable / restrict_to 等启用控制。
 - 在真正需要时再把 skill 内容装进上下文，避免常驻膨胀。
 - 解析 skill 正文里引用的相对文件并一起加载。

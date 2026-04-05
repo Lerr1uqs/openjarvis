@@ -3,11 +3,9 @@
 use anyhow::Result;
 use clap::Parser;
 use openjarvis::{
-    agent::{
-        AgentWorker,
-        tool::{browser, mcp::demo},
-    },
+    agent::AgentWorker,
     cli::OpenJarvisCli,
+    cli_command::CliCommandRegistry,
     command::CommandRegistry,
     config::{AppConfig, SessionStoreBackend, install_global_config},
     logging,
@@ -20,12 +18,9 @@ use tracing::{debug, info, warn};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = OpenJarvisCli::parse();
-    // test-only
-    if let Some(command) = cli.internal_mcp_command() {
-        return demo::run_internal_demo_command(command).await;
-    }
-    if let Some(command) = cli.internal_browser_command() {
-        return browser::run_internal_browser_command(command).await;
+    let cli_command_registry = CliCommandRegistry::with_builtin_commands()?;
+    if cli_command_registry.dispatch_from_cli(&cli).await? {
+        return Ok(());
     }
 
     let _logging_guards =

@@ -1,11 +1,11 @@
 skill提供的能力
 
-load_skills 从本地多个路径加载 可以在配置文件中添加
+load_skills 当前默认从工作区本地路径加载，未来可以再扩展其他路径或配置化
 
-- 默认 ~/.openjarvis/skills/
-- ~/.openjarvis/installed_skills/
-- ./.openjarvis/skills/
-- 其他 指定
+- 当前实现默认 ./.openjarvis/skills/
+- 未来可扩展 ~/.openjarvis/skills/
+- 未来可扩展 ~/.openjarvis/installed_skills/
+- 未来可扩展其他指定路径
 
 fetch_remote 从clawhub等地方获取
 

@@ -55,7 +55,8 @@ impl ToolHandler for LoadSkillTool {
         }
 
         // TODO: gate remote skill fetch, updates, and approval workflow before loading untrusted
-        // external skills. Local `.skills` is the only supported source in this V1.
+        // external skills. Workspace-local `.openjarvis/skills` is the only supported source in
+        // this V1.
         let loaded_skill = self.registry.load(skill_name).await?;
         let referenced_paths = loaded_skill
             .referenced_files

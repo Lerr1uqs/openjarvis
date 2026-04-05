@@ -10,11 +10,18 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
     thread::{Thread, ThreadContextLocator},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 use super::tool::skill::SkillFixture;
 
 struct DemoFeatureTool;
+
+fn acpx_skill_resource_body() -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/unittest/skills/acpx/SKILL.md"),
+    )
+    .expect("acpx skill fixture should be readable")
+}
 
 #[async_trait]
 impl ToolHandler for DemoFeatureTool {
@@ -131,6 +138,54 @@ Read `guide.md` before replying.
         .expect("dynamic capacity prompt should exist");
 
     assert!(auto_compact_index < capacity_index);
+}
+
+#[tokio::test]
+async fn feature_prompt_rebuilder_includes_enabled_acpx_skill_in_thread_system_message() {
+    // 测试场景: 启动阶段如果显式启用 `acpx`，thread 固定 system message 中应出现该 skill。
+    let fixture = SkillFixture::new("openjarvis-feature-acpx-skill");
+    fixture.write_skill("acpx", &acpx_skill_resource_body());
+
+    let registry = Arc::new(ToolRegistry::with_skill_roots(vec![
+        fixture.skills_root().to_path_buf(),
+    ]));
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools and skills should register");
+    registry
+        .skills()
+        .restrict_to(&["acpx".to_string()])
+        .await
+        .expect("acpx should be enabled");
+
+    let rebuilder = FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        AppConfig::default().agent_config().compact_config().clone(),
+    );
+    let now = chrono::Utc::now();
+    let mut thread_context = Thread::new(
+        ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_acpx", "thread_acpx"),
+        now,
+    );
+
+    let inserted = rebuilder
+        .initialize_thread(&mut thread_context, false)
+        .await
+        .expect("feature prompts should initialize");
+
+    assert!(inserted);
+    let skill_message = thread_context
+        .system_prefix_messages()
+        .iter()
+        .find(|message| message.content.contains("Available local skills"))
+        .expect("skill catalog system message should exist");
+    assert!(skill_message.content.contains("acpx"));
+    assert!(
+        skill_message
+            .content
+            .contains("agent-to-agent communication")
+    );
 }
 
 #[tokio::test]

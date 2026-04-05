@@ -1,5 +1,6 @@
-//! Local skill registry that scans `.skills`, indexes manifests, and loads skill bodies on demand.
+//! Local skill registry that scans `.openjarvis/skills`, indexes manifests, and loads skill bodies on demand.
 
+use crate::skill::default_skill_roots;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -10,7 +11,6 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::warn;
 
-const DEFAULT_LOCAL_SKILL_ROOT: &str = ".skills";
 const SKILL_ENTRY_FILE_NAME: &str = "SKILL.md";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +29,7 @@ impl SkillManifest {
     /// ```rust,no_run
     /// use openjarvis::agent::SkillManifest;
     ///
-    /// let manifest = SkillManifest::from_skill_file(".skills/example/SKILL.md")
+    /// let manifest = SkillManifest::from_skill_file(".openjarvis/skills/example/SKILL.md")
     ///     .expect("skill manifest should parse");
     /// assert_eq!(manifest.name, "example");
     /// ```
@@ -81,8 +81,8 @@ impl LoadedSkill {
     ///     manifest: SkillManifest {
     ///         name: "demo".to_string(),
     ///         description: "demo skill".to_string(),
-    ///         skill_dir: PathBuf::from(".skills/demo"),
-    ///         skill_file: PathBuf::from(".skills/demo/SKILL.md"),
+    ///         skill_dir: PathBuf::from(".openjarvis/skills/demo"),
+    ///         skill_file: PathBuf::from(".openjarvis/skills/demo/SKILL.md"),
     ///         enabled: true,
     ///     },
     ///     body: "Do the demo task.".to_string(),
@@ -130,7 +130,8 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
-    /// Create a skill registry that only scans the current workspace `.skills` directory.
+    /// Create a skill registry that only scans the current workspace `.openjarvis/skills`
+    /// directory.
     ///
     /// # 示例
     /// ```rust,no_run
@@ -143,9 +144,7 @@ impl SkillRegistry {
     /// # }
     /// ```
     pub fn new() -> Self {
-        // TODO: support additional roots such as ~/.openjarvis/skills,
-        // ~/.openjarvis/installed_skills, and config-defined paths.
-        Self::with_roots(vec![PathBuf::from(DEFAULT_LOCAL_SKILL_ROOT)])
+        Self::with_roots(default_skill_roots())
     }
 
     /// Create a skill registry with explicit local roots.

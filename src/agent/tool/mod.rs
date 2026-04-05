@@ -1,6 +1,7 @@
 //! Shared tool traits, schemas, and registry for the built-in agent tool set.
 
 use crate::agent::memory::{MemoryRepository, register_memory_toolset};
+use crate::skill::{default_skill_roots, default_skill_roots_for_workspace};
 pub mod browser;
 pub mod edit;
 pub mod mcp;
@@ -251,7 +252,7 @@ impl ToolRegistry {
     /// use openjarvis::agent::ToolRegistry;
     /// use std::path::PathBuf;
     ///
-    /// let registry = ToolRegistry::with_skill_roots(vec![PathBuf::from(".skills")]);
+    /// let registry = ToolRegistry::with_skill_roots(vec![PathBuf::from(".openjarvis/skills")]);
     /// assert!(registry.list().await.is_empty());
     /// # Ok(())
     /// # }
@@ -270,7 +271,9 @@ impl ToolRegistry {
     /// assert!(registry.memory_repository().memory_root().ends_with(".openjarvis/memory"));
     /// ```
     pub fn with_workspace_root(workspace_root: impl Into<PathBuf>) -> Self {
-        Self::with_workspace_root_and_skill_roots(workspace_root, vec![PathBuf::from(".skills")])
+        let workspace_root = workspace_root.into();
+        let skill_roots = default_skill_roots_for_workspace(&workspace_root);
+        Self::with_workspace_root_and_skill_roots(workspace_root, skill_roots)
     }
 
     /// Create an empty tool registry with explicit workspace root and local skill roots.
@@ -283,7 +286,7 @@ impl ToolRegistry {
     ///
     /// let _registry = ToolRegistry::with_workspace_root_and_skill_roots(
     ///     "/tmp/openjarvis-workspace",
-    ///     vec![PathBuf::from(".skills")],
+    ///     vec![PathBuf::from(".openjarvis/skills")],
     /// );
     /// ```
     pub fn with_workspace_root_and_skill_roots(
@@ -313,13 +316,13 @@ impl ToolRegistry {
     /// # }
     /// ```
     pub async fn from_config(config: &AgentToolConfig) -> Result<Self> {
-        Self::from_config_with_skill_roots(config, vec![PathBuf::from(".skills")]).await
+        Self::from_config_with_skill_roots(config, default_skill_roots()).await
     }
 
     /// Create a tool registry from config with explicit local skill roots.
     ///
     /// This exists mainly so tests can opt into deterministic roots instead of using the
-    /// workspace `.skills` directory.
+    /// workspace `.openjarvis/skills` directory.
     pub async fn from_config_with_skill_roots(
         config: &AgentToolConfig,
         skill_roots: Vec<PathBuf>,

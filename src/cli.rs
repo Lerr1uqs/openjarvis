@@ -1,4 +1,4 @@
-//! Command-line parsing for the OpenJarvis binary and internal MCP helpers.
+//! Command-line parsing for the OpenJarvis binary and local protocol helpers.
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ pub struct OpenJarvisCli {
     /// Load demo-only builtin MCP servers for local verification.
     #[arg(long, global = true)]
     pub builtin_mcp: bool,
-    /// Test-only: preload one or more local skills from `.skills` into this process so the
-    /// running agent can use them.
+    /// Test-only: preload one or more local skills from `.openjarvis/skills` into this process so
+    /// the running agent can use them.
     ///
     /// This flag is intended for local verification and smoke tests. It does not print the skill
     /// body; it starts the normal runtime and restricts the enabled local skills to the selected
@@ -72,17 +72,75 @@ impl OpenJarvisCli {
             _ => None,
         }
     }
+
+    /// Return the parsed top-level skill command when present.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use clap::Parser;
+    /// use openjarvis::cli::{OpenJarvisCli, SkillCommand};
+    ///
+    /// let cli = OpenJarvisCli::parse_from(["openjarvis", "skill", "install", "acpx"]);
+    /// assert!(matches!(
+    ///     cli.skill_command(),
+    ///     Some(SkillCommand::Install { name }) if name == "acpx"
+    /// ));
+    /// ```
+    pub fn skill_command(&self) -> Option<&SkillCommand> {
+        match &self.command {
+            Some(OpenJarvisCommand::Skill(arguments)) => Some(&arguments.command),
+            _ => None,
+        }
+    }
 }
 
 /// Top-level OpenJarvis subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum OpenJarvisCommand {
+    /// Local skill management commands.
+    #[command(name = "skill")]
+    Skill(SkillArgs),
     /// Internal demo-only MCP helpers used by tests and local protocol verification.
     #[command(name = "internal-mcp", hide = true)]
     InternalMcp(InternalMcpArgs),
     /// Internal browser helpers used by local smoke verification and tests.
     #[command(name = "internal-browser", hide = true)]
     InternalBrowser(InternalBrowserArgs),
+}
+
+impl OpenJarvisCommand {
+    /// Return the stable top-level subcommand name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Skill(_) => "skill",
+            Self::InternalMcp(_) => "internal-mcp",
+            Self::InternalBrowser(_) => "internal-browser",
+        }
+    }
+}
+
+/// Arguments for the public `skill` command namespace.
+#[derive(Debug, Clone, Args)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub command: SkillCommand,
+}
+
+/// Public skill management commands.
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum SkillCommand {
+    /// Install one curated local skill into the current workspace.
+    #[command(name = "install")]
+    Install {
+        /// Stable curated skill name, for example `acpx`.
+        name: String,
+    },
+    /// Uninstall one local skill from the current workspace.
+    #[command(name = "uninstall")]
+    Uninstall {
+        /// Exact local skill name to remove, for example `acpx`.
+        name: String,
+    },
 }
 
 /// Arguments for the hidden `internal-mcp` helper namespace.

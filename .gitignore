@@ -9,3 +9,4 @@ config.yaml
 tmp/
 temp/
 data/
+.openjarvis/skills/

@@ -1,6 +1,6 @@
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use openjarvis::{
-    cli::{InternalBrowserCommand, InternalMcpCommand, OpenJarvisCli},
+    cli::{InternalBrowserCommand, InternalMcpCommand, OpenJarvisCli, SkillCommand},
     config::{AgentMcpServerTransportConfig, AppConfig, BUILTIN_MCP_SERVER_NAME},
 };
 
@@ -38,6 +38,38 @@ fn cli_parses_repeated_load_skill_flags() {
     assert_eq!(cli.load_skills, ["local_smoke_test", "local_prompt_probe"]);
     assert!(!cli.builtin_mcp);
     assert!(cli.internal_mcp_command().is_none());
+}
+
+#[test]
+fn cli_parses_public_skill_install_command() {
+    let cli = OpenJarvisCli::parse_from(["openjarvis", "skill", "install", "acpx"]);
+
+    assert!(matches!(
+        cli.skill_command(),
+        Some(SkillCommand::Install { name }) if name == "acpx"
+    ));
+    assert!(cli.internal_mcp_command().is_none());
+}
+
+#[test]
+fn cli_parses_public_skill_uninstall_command() {
+    let cli = OpenJarvisCli::parse_from(["openjarvis", "skill", "uninstall", "acpx"]);
+
+    assert!(matches!(
+        cli.skill_command(),
+        Some(SkillCommand::Uninstall { name }) if name == "acpx"
+    ));
+}
+
+#[test]
+fn cli_rejects_unknown_skill_subcommand() {
+    let error = OpenJarvisCli::try_parse_from(["openjarvis", "skill", "stall", "acpx"])
+        .expect_err("unknown skill subcommand should fail");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+    let rendered = error.to_string();
+    assert!(rendered.contains("stall"));
+    assert!(rendered.contains("install"));
 }
 
 #[test]

@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod channels;
 pub mod cli;
+pub mod cli_command;
 pub mod command;
 pub mod compact;
 pub mod config;
@@ -12,4 +13,5 @@ pub mod logging;
 pub mod model;
 pub mod router;
 pub mod session;
+pub mod skill;
 pub mod thread;

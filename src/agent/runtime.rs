@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{
     config::{AgentConfig, global_config},
+    skill::default_skill_roots,
     thread::Thread,
 };
 use anyhow::Result;
@@ -39,7 +40,7 @@ impl AgentRuntime {
     /// # }
     /// ```
     pub async fn from_config(config: &AgentConfig) -> Result<Self> {
-        Self::from_config_with_skill_roots(config, vec![PathBuf::from(".skills")]).await
+        Self::from_config_with_skill_roots(config, default_skill_roots()).await
     }
 
     /// Create a runtime from the installed global app config snapshot.
@@ -67,7 +68,7 @@ impl AgentRuntime {
     /// Create a runtime from config with explicit local skill roots.
     ///
     /// This exists mainly so tests can opt into deterministic roots instead of using the
-    /// workspace `.skills` directory.
+    /// workspace `.openjarvis/skills` directory.
     pub async fn from_config_with_skill_roots(
         config: &AgentConfig,
         skill_roots: Vec<PathBuf>,

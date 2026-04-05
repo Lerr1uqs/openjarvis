@@ -48,6 +48,30 @@ npm install
 cargo run
 ```
 
+## 本地 Skill
+
+本地 skill 默认放在当前工作区的 `.openjarvis/skills/`。
+
+安装首版 curated `acpx` skill：
+
+```bash
+openjarvis skill install acpx
+```
+
+卸载本地 `acpx` skill：
+
+```bash
+openjarvis skill uninstall acpx
+```
+
+安装完成后，skill 文件会落到：
+
+```text
+./.openjarvis/skills/acpx/SKILL.md
+```
+
+运行时需要让 agent 显式加载某个本地 skill 时，仍然通过现有 `load_skill` 工具或启动参数 `--load-skill <name>` 使用。
+
 默认监听地址：
 
 - 当前长连接模式下不需要 HTTP 入口

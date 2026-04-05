@@ -16,7 +16,7 @@ pub(crate) struct SkillFixture {
 impl SkillFixture {
     pub(crate) fn new(prefix: &str) -> Self {
         let root = temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
-        let skills_root = root.join(".skills");
+        let skills_root = root.join(".openjarvis/skills");
         fs::create_dir_all(&skills_root).expect("skills root should be created");
         Self { root, skills_root }
     }

@@ -1,5 +1,5 @@
 use openjarvis::{
-    agent::AgentWorker,
+    agent::{AgentWorker, SkillManifest},
     config::{AppConfig, install_global_config},
     router::ChannelRouter,
 };
@@ -28,6 +28,10 @@ impl MainConfigFixture {
         &self.config_path
     }
 
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn write_yaml(&self, yaml: &str) {
         fs::write(&self.config_path, yaml).expect("fixture yaml should be written");
     }
@@ -48,6 +52,10 @@ impl Drop for MainConfigFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn acpx_skill_resource_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/unittest/skills/acpx/SKILL.md")
 }
 
 #[tokio::test]
@@ -105,6 +113,71 @@ llm:
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to parse mcp config file"));
     assert!(stderr.contains("config/openjarvis/mcp.json"));
+}
+
+#[test]
+fn skill_install_command_rejects_unknown_curated_skill_before_app_config_load() {
+    let fixture = MainConfigFixture::new("openjarvis-main-skill-install-before-config");
+    fixture.write_yaml(":\ninvalid\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("skill")
+        .arg("install")
+        .arg("missing-skill")
+        .env("OPENJARVIS_CONFIG", fixture.config_path())
+        .current_dir(fixture.root())
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported curated skill `missing-skill`"));
+    assert!(!stderr.contains("failed to parse config file"));
+}
+
+#[test]
+fn skill_install_and_uninstall_commands_manage_workspace_skill_files() {
+    let fixture = MainConfigFixture::new("openjarvis-main-skill-install-uninstall");
+    let install_output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("skill")
+        .arg("install")
+        .arg("acpx")
+        .env(
+            "OPENJARVIS_CURATED_SKILL_ACPX_PATH",
+            acpx_skill_resource_path(),
+        )
+        .current_dir(fixture.root())
+        .output()
+        .expect("openjarvis binary should run skill install");
+
+    assert!(install_output.status.success());
+    let skill_file = fixture.root().join(".openjarvis/skills/acpx/SKILL.md");
+    assert!(skill_file.exists());
+    assert_eq!(
+        skill_file.file_name().and_then(|name| name.to_str()),
+        Some("SKILL.md")
+    );
+
+    let manifest =
+        SkillManifest::from_skill_file(&skill_file).expect("installed acpx skill should parse");
+    assert_eq!(manifest.name, "acpx");
+    assert!(
+        manifest
+            .description
+            .contains("agent-to-agent communication")
+    );
+
+    let uninstall_output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("skill")
+        .arg("uninstall")
+        .arg("acpx")
+        .current_dir(fixture.root())
+        .output()
+        .expect("openjarvis binary should run skill uninstall");
+
+    assert!(uninstall_output.status.success());
+    assert!(!skill_file.exists());
+    assert!(!fixture.root().join(".openjarvis/skills/acpx").exists());
 }
 
 #[test]
