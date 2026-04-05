@@ -16,6 +16,8 @@
   会话解析与持久化边界。
 - `thread.md`
   线程级事务宿主与运行时状态。
+- `memory.md`
+  工作区级本地长期记忆模型。
 - `context.md`
   送给 LLM 的消息组织模型。
 - `command.md`

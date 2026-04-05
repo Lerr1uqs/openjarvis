@@ -7,4 +7,5 @@
 logs/
 config.yaml
 tmp/
+temp/
 data/

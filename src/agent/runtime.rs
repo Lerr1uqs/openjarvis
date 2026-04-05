@@ -73,15 +73,10 @@ impl AgentRuntime {
         skill_roots: Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            hooks: Arc::new(
-                HookRegistry::from_config(config.hook_config())
-                    .await?
-            ),
+            hooks: Arc::new(HookRegistry::from_config(config.hook_config()).await?),
             tools: Arc::new(
-                ToolRegistry::from_config_with_skill_roots(
-                    config.tool_config(), 
-                    skill_roots
-                ).await?,
+                ToolRegistry::from_config_with_skill_roots(config.tool_config(), skill_roots)
+                    .await?,
             ),
         })
     }

@@ -3,6 +3,7 @@
 pub mod agent_loop;
 pub mod feature;
 pub mod hook;
+pub mod memory;
 pub mod runtime;
 pub mod sandbox;
 pub mod tool;
@@ -18,6 +19,11 @@ pub use feature::{
     ToolsetCatalogFeaturePromptProvider,
 };
 pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
+pub use memory::{
+    ActiveMemoryCatalogEntry, ActiveMemoryCatalogFeaturePromptProvider, MemoryDocument,
+    MemoryDocumentMetadata, MemoryDocumentSummary, MemoryRepository, MemorySearchResponse,
+    MemoryType, MemoryWriteRequest, register_memory_toolset,
+};
 pub use runtime::AgentRuntime;
 pub use sandbox::DummySandboxContainer;
 pub use tool::{

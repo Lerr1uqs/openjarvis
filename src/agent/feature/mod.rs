@@ -1,6 +1,6 @@
 //! Feature providers that materialize stable system messages into `Thread` during init.
 
-use super::tool::ToolRegistry;
+use super::{memory::ActiveMemoryCatalogFeaturePromptProvider, tool::ToolRegistry};
 use crate::{
     compact::ContextBudgetReport,
     config::AgentCompactConfig,
@@ -45,6 +45,9 @@ impl FeaturePromptRebuilder {
                 Box::new(ToolsetCatalogFeaturePromptProvider::new(Arc::clone(
                     &tool_registry,
                 ))),
+                Box::new(ActiveMemoryCatalogFeaturePromptProvider::new(
+                    tool_registry.memory_repository(),
+                )),
                 Box::new(SkillCatalogFeaturePromptProvider::new(Arc::clone(
                     &tool_registry,
                 ))),

@@ -1,5 +1,6 @@
 //! Shared tool traits, schemas, and registry for the built-in agent tool set.
 
+use crate::agent::memory::{MemoryRepository, register_memory_toolset};
 pub mod browser;
 pub mod edit;
 pub mod mcp;
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::warn;
 
 pub use edit::EditTool;
 pub use mcp::{
@@ -200,6 +202,7 @@ pub struct ToolRegistry {
     toolsets: RwLock<HashMap<String, RegisteredToolset>>,
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
+    memory_repository: Arc<MemoryRepository>,
 }
 
 pub fn tool_definition_from_args<T>(
@@ -237,12 +240,7 @@ impl RegisteredToolset {
 impl ToolRegistry {
     /// Create an empty tool registry.
     pub fn new() -> Self {
-        Self {
-            always_visible_handlers: RwLock::new(HashMap::new()),
-            toolsets: RwLock::new(HashMap::new()),
-            mcp: Arc::new(mcp::McpManager::new()),
-            skills: Arc::new(skill::SkillRegistry::new()),
-        }
+        Self::with_workspace_root(default_workspace_root())
     }
 
     /// Create an empty tool registry with explicit local skill roots.
@@ -259,11 +257,45 @@ impl ToolRegistry {
     /// # }
     /// ```
     pub fn with_skill_roots(skill_roots: Vec<PathBuf>) -> Self {
+        Self::with_workspace_root_and_skill_roots(default_workspace_root(), skill_roots)
+    }
+
+    /// Create an empty tool registry pinned to one explicit workspace root.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::with_workspace_root("/tmp/openjarvis-workspace");
+    /// assert!(registry.memory_repository().memory_root().ends_with(".openjarvis/memory"));
+    /// ```
+    pub fn with_workspace_root(workspace_root: impl Into<PathBuf>) -> Self {
+        Self::with_workspace_root_and_skill_roots(workspace_root, vec![PathBuf::from(".skills")])
+    }
+
+    /// Create an empty tool registry with explicit workspace root and local skill roots.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use std::path::PathBuf;
+    ///
+    /// use openjarvis::agent::ToolRegistry;
+    ///
+    /// let _registry = ToolRegistry::with_workspace_root_and_skill_roots(
+    ///     "/tmp/openjarvis-workspace",
+    ///     vec![PathBuf::from(".skills")],
+    /// );
+    /// ```
+    pub fn with_workspace_root_and_skill_roots(
+        workspace_root: impl Into<PathBuf>,
+        skill_roots: Vec<PathBuf>,
+    ) -> Self {
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
+            memory_repository: Arc::new(MemoryRepository::new(workspace_root.into())),
         }
     }
 
@@ -385,6 +417,9 @@ impl ToolRegistry {
         self.register_if_missing(Arc::new(ShellTool::new())).await;
         if !self.toolset_registered("browser").await {
             browser::register_browser_toolset(self).await?;
+        }
+        if !self.toolset_registered("memory").await {
+            register_memory_toolset(self).await?;
         }
         self.skills.reload().await?;
         self.sync_skill_handlers().await;
@@ -624,6 +659,19 @@ impl ToolRegistry {
         ToolRegistrySkillApi { registry: self }
     }
 
+    /// Return the shared local memory repository used by feature prompts and the memory toolset.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// assert!(registry.memory_repository().memory_root().ends_with(".openjarvis/memory"));
+    /// ```
+    pub fn memory_repository(&self) -> Arc<MemoryRepository> {
+        Arc::clone(&self.memory_repository)
+    }
+
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
         // Register the handler only when the name is not present yet.
         let definition = handler.definition();
@@ -811,6 +859,19 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn default_workspace_root() -> PathBuf {
+    match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to resolve current workspace root; falling back to relative `.`"
+            );
+            PathBuf::from(".")
+        }
     }
 }
 

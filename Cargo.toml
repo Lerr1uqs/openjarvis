@@ -33,3 +33,7 @@ path = "scripts/llm_test.rs"
 [[bin]]
 name = "browser_bilibili_search_dump"
 path = "scripts/browser_bilibili_search_dump.rs"
+
+[[bin]]
+name = "tool_schema_dump"
+path = "scripts/tool_schema_dump.rs"

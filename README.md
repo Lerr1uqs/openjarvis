@@ -17,12 +17,16 @@
   - `write`
   - `edit`
   - `shell`
+- 已实现本地 memory feature
+  - 工作区 `./.openjarvis/memory/{active,passive}` markdown 仓库
+  - thread init 注入 active memory `keyword -> path` catalog
+  - `memory` toolset: `memory_get` / `memory_search` / `memory_write` / `memory_list`
 - 已实现两类 LLM provider
   - `mock`
   - `openai_compatible` 及其别名 `openai` / `deepseek`
 - 已实现 Feishu 文本消息回发
 - 已实现 tool call / tool result 事件回发到当前群聊
-- `memory / sandbox` 仍然为空壳，暂未接入
+- `sandbox` 仍然是占位实现，暂未接入真实隔离能力
 
 ## 本地启动
 
@@ -151,7 +155,7 @@ agent:
 - 长连接入口当前通过官方 Node SDK sidecar 接入，再转给 Rust router
 - 当前这版运行时未实现 webhook 模式
 - 当前 ReAct loop 只支持一轮工具调用
-- compact 当前只压缩线程 `chat`，不会压缩 `system` 和 `memory`
+- compact 当前只压缩线程 `chat`，不会压缩 `system` 和 thread init 注入的 active memory catalog
 - 工具已经注册，但还没有做权限审批和沙箱隔离
-- 不支持 session/memory/thread 持久化
+- memory 当前只支持本地 markdown 持久化与词法检索，不支持 embedding / FTS / 热刷新当前线程 catalog
 - 当前虽然走 `register_channels` 批量注册，但实际只内置了 `feishu` 一个 channel
