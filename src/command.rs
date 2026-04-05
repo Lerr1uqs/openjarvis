@@ -9,13 +9,20 @@
 //! Commands can still mutate resolved thread state even though command messages themselves do not
 //! enter the persisted session history.
 
-use crate::model::IncomingMessage;
-use crate::thread::Thread;
+use crate::{
+    compact::{ContextBudgetEstimator, ContextBudgetReport},
+    config::{AppConfig, try_global_config},
+    context::{ChatMessage, ChatMessageRole, ContextTokenKind},
+    model::IncomingMessage,
+    thread::Thread,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
+
+const CONTEXT_MESSAGE_PREVIEW_LIMIT: usize = 48;
 
 /// Formatted command execution reply returned back to the upstream channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +271,9 @@ impl CommandRegistry {
             .register("echo", Arc::new(EchoCommand))
             .expect("built-in echo command should register");
         registry
+            .register("context", Arc::new(ContextCommand))
+            .expect("built-in context command should register");
+        registry
             .register("clear", Arc::new(ClearCommand))
             .expect("built-in clear command should register");
         registry
@@ -427,6 +437,101 @@ impl CommandHandler for EchoCommand {
     }
 }
 
+struct ContextCommand;
+
+impl ContextCommand {
+    fn usage(name: &str) -> CommandReply {
+        CommandReply::failed(name, "usage: /context [role|detail [count]]")
+    }
+}
+
+#[async_trait]
+impl CommandHandler for ContextCommand {
+    async fn execute(
+        &self,
+        invocation: &CommandInvocation,
+        _incoming: &IncomingMessage,
+        thread_context: &mut Thread,
+    ) -> Result<CommandReply> {
+        let messages = thread_context.messages();
+        let estimator = context_budget_estimator();
+
+        match invocation.arguments() {
+            [] => {
+                let report = estimator.estimate(&messages, &[]);
+                info!(
+                    thread_id = %thread_context.locator.thread_id,
+                    external_thread_id = %thread_context.locator.external_thread_id,
+                    mode = "summary",
+                    message_count = messages.len(),
+                    total_estimated_tokens = report.total_estimated_tokens,
+                    utilization_ratio = report.utilization_ratio,
+                    "inspected current thread context usage by command"
+                );
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format_context_summary(thread_context, messages.len(), &report),
+                ))
+            }
+            [mode] if mode.eq_ignore_ascii_case("role") => {
+                let report = estimator.estimate(&messages, &[]);
+                info!(
+                    thread_id = %thread_context.locator.thread_id,
+                    external_thread_id = %thread_context.locator.external_thread_id,
+                    mode = "role",
+                    message_count = messages.len(),
+                    context_window_tokens = estimator.context_window_tokens(),
+                    total_estimated_tokens = report.total_estimated_tokens,
+                    "inspected per-role thread context usage by command"
+                );
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format_context_role_report(thread_context, &messages, &estimator, &report),
+                ))
+            }
+            [mode] if mode.eq_ignore_ascii_case("detail") => {
+                info!(
+                    thread_id = %thread_context.locator.thread_id,
+                    external_thread_id = %thread_context.locator.external_thread_id,
+                    mode = "detail",
+                    message_count = messages.len(),
+                    context_window_tokens = estimator.context_window_tokens(),
+                    detail_count = 20,
+                    "inspected per-message thread context usage by command"
+                );
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format_context_detail_report(thread_context, &messages, &estimator, 20),
+                ))
+            }
+            [mode, count] if mode.eq_ignore_ascii_case("detail") => {
+                let Ok(detail_count) = count.parse::<usize>() else {
+                    return Ok(Self::usage(invocation.name()));
+                };
+                info!(
+                    thread_id = %thread_context.locator.thread_id,
+                    external_thread_id = %thread_context.locator.external_thread_id,
+                    mode = "detail",
+                    message_count = messages.len(),
+                    context_window_tokens = estimator.context_window_tokens(),
+                    detail_count,
+                    "inspected per-message thread context usage by command"
+                );
+                Ok(CommandReply::success(
+                    invocation.name(),
+                    format_context_detail_report(
+                        thread_context,
+                        &messages,
+                        &estimator,
+                        detail_count,
+                    ),
+                ))
+            }
+            _ => Ok(Self::usage(invocation.name())),
+        }
+    }
+}
+
 struct ClearCommand;
 
 impl ClearCommand {
@@ -472,6 +577,169 @@ fn normalize_command_name(name: &str) -> Result<String> {
         bail!("command name must not contain whitespace");
     }
     Ok(normalized)
+}
+
+fn context_budget_estimator() -> ContextBudgetEstimator {
+    if let Some(config) = try_global_config() {
+        return ContextBudgetEstimator::from_config(
+            config.llm_config(),
+            config.agent_config().compact_config(),
+        );
+    }
+
+    let default_config = AppConfig::default();
+    ContextBudgetEstimator::from_config(
+        default_config.llm_config(),
+        default_config.agent_config().compact_config(),
+    )
+}
+
+fn format_context_summary(
+    thread_context: &Thread,
+    message_count: usize,
+    report: &ContextBudgetReport,
+) -> String {
+    format!(
+        "thread=`{external_thread_id}`\npersisted_messages={message_count}\ntotal_estimated_tokens={total_estimated_tokens}/{context_window_tokens} ({utilization_percent:.2}%)\nsystem_tokens={system_tokens}, chat_tokens={chat_tokens}, visible_tool_tokens={visible_tool_tokens}, reserved_output_tokens={reserved_output_tokens}",
+        external_thread_id = thread_context.locator.external_thread_id,
+        total_estimated_tokens = report.total_estimated_tokens,
+        context_window_tokens = report.context_window_tokens,
+        utilization_percent = report.utilization_ratio * 100.0,
+        system_tokens = report.system_tokens(),
+        chat_tokens = report.chat_tokens(),
+        visible_tool_tokens = report.visible_tool_tokens(),
+        reserved_output_tokens = report.reserved_output_tokens(),
+    )
+}
+
+fn format_context_role_report(
+    thread_context: &Thread,
+    messages: &[ChatMessage],
+    estimator: &ContextBudgetEstimator,
+    report: &ContextBudgetReport,
+) -> String {
+    let context_window_tokens = estimator.context_window_tokens().max(1);
+    let mut lines = Vec::with_capacity(16);
+    lines.push(format!(
+        "thread=`{}`",
+        thread_context.locator.external_thread_id
+    ));
+    lines.push(String::new());
+    lines.push("message_role".to_string());
+    lines.push("| role | tokens | window_ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+
+    for role in ordered_chat_message_roles() {
+        let role_tokens = estimate_tokens_for_role(messages, estimator, &role);
+        let ratio_percent = role_tokens as f64 / context_window_tokens as f64 * 100.0;
+        lines.push(format!(
+            "| {role} | {role_tokens} | {ratio_percent:.2}% |",
+            role = role.as_label(),
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("context_token_kind".to_string());
+    lines.push("| kind | tokens | window_ratio |".to_string());
+    lines.push("| --- | ---: | ---: |".to_string());
+    for kind in ContextTokenKind::ALL {
+        let kind_tokens = report.tokens(kind);
+        let ratio_percent = kind_tokens as f64 / context_window_tokens as f64 * 100.0;
+        lines.push(format!(
+            "| {kind} | {kind_tokens} | {ratio_percent:.2}% |",
+            kind = kind.as_str(),
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_context_detail_report(
+    thread_context: &Thread,
+    messages: &[ChatMessage],
+    estimator: &ContextBudgetEstimator,
+    requested_count: usize,
+) -> String {
+    let context_window_tokens = estimator.context_window_tokens().max(1);
+    let detail_count = requested_count.min(messages.len());
+    let start_index = messages.len().saturating_sub(detail_count);
+    let selected_messages = &messages[start_index..];
+
+    let mut lines = Vec::with_capacity(selected_messages.len() + 4);
+    lines.push(format!(
+        "thread=`{}`",
+        thread_context.locator.external_thread_id
+    ));
+    lines.push(format!(
+        "persisted_messages={}\ncontext_window_tokens={}\ndetail_count={}",
+        messages.len(),
+        context_window_tokens,
+        detail_count,
+    ));
+
+    if selected_messages.is_empty() {
+        lines.push("no persisted messages selected for detail output".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(format!(
+        "showing_message_range={}..{}",
+        start_index + 1,
+        start_index + detail_count,
+    ));
+
+    for (offset, message) in selected_messages.iter().enumerate() {
+        let estimated_tokens = estimator.estimate_message(message);
+        let ratio_percent = estimated_tokens as f64 / context_window_tokens as f64 * 100.0;
+        lines.push(format!(
+            "{index}. role={role} tokens={estimated_tokens} window_ratio={ratio_percent:.2}% preview=\"{preview}\"",
+            index = start_index + offset + 1,
+            role = message.role.as_label(),
+            preview = message_preview(&message.content),
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn ordered_chat_message_roles() -> [ChatMessageRole; 5] {
+    [
+        ChatMessageRole::System,
+        ChatMessageRole::User,
+        ChatMessageRole::Assistant,
+        ChatMessageRole::Toolcall,
+        ChatMessageRole::ToolResult,
+    ]
+}
+
+fn estimate_tokens_for_role(
+    messages: &[ChatMessage],
+    estimator: &ContextBudgetEstimator,
+    role: &ChatMessageRole,
+) -> usize {
+    messages
+        .iter()
+        .filter(|message| &message.role == role)
+        .map(|message| estimator.estimate_message(message))
+        .sum::<usize>()
+}
+
+fn message_preview(content: &str) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let total_chars = normalized.chars().count();
+    let mut preview = normalized
+        .chars()
+        .take(CONTEXT_MESSAGE_PREVIEW_LIMIT)
+        .collect::<String>()
+        .replace('"', "'");
+    if total_chars > CONTEXT_MESSAGE_PREVIEW_LIMIT {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn remove_prefix_at_if_exist(incoming: &IncomingMessage) -> String {

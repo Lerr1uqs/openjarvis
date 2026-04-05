@@ -8,6 +8,7 @@
 - [ ] 目前turn是全量的 后续需要改成增量吗？
 - [ ] 全面异步落盘的日志库
 - [ ] context子命令
+- [ ] 当前一个turn没走完 tool_call都没办法传出来
 - [ ] [openjarvis][tool_call] write 返回内容太多了 需要做truncate
 ```
   └ {
@@ -16,6 +17,8 @@
     }
     - Generating instructions...
 ```
+- [ ] 添加metrics检测 token usage, 时间消耗
+- [ ] markdown支持
 - [ ] jarvis还在处理的时候用户发消息 接收到用户消息了才应该react
 - [ ] /? 列出全部Commands
 - [ ] command 能够解析用户输入转换为格式化的schema从而进行execute
@@ -34,7 +37,7 @@
 - [x] 主动记忆的keyword必须是非常专用的名字 不能瞎生成 比如JJJ喜欢xxx 会生成三个keyword 用户没说明的情况下需要先询问
 codex resume 019d511c-18c5-70a1-9636-87c66f63bbb5
 
-# clean
+# learn
 - [ ] sidecar
 
 # tmp

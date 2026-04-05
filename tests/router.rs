@@ -10,6 +10,7 @@ use openjarvis::{
     channels::{Channel, ChannelRegistration},
     cli::OpenJarvisCli,
     command::CommandRegistry,
+    compact::ContextBudgetEstimator,
     config::{AppConfig, BUILTIN_MCP_SERVER_NAME, DEFAULT_ASSISTANT_SYSTEM_PROMPT},
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
@@ -1048,6 +1049,142 @@ async fn router_removed_auto_compact_command_returns_unknown_reply_without_agent
 }
 
 #[tokio::test]
+async fn router_context_command_returns_summary_without_agent_dispatch() {
+    // 测试场景: `/context` 应直接在命令层返回摘要，不触发 agent dispatch，也不破坏现有线程历史。
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, mut request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive during the command test.
+    let commands = CommandRegistry::with_builtin_commands();
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let sessions = SessionManager::with_store(Arc::clone(&store))
+        .await
+        .expect("shared store session manager should build");
+    let seed_incoming = build_incoming_with(
+        "msg_context_seed",
+        "ou_thread_context",
+        Some("thread_context"),
+        "seed",
+    );
+    let locator = sessions
+        .load_or_create_thread(&seed_incoming)
+        .await
+        .expect("thread should resolve before context inspection");
+    let now = Utc::now();
+    let mut seeded_thread = Thread::new(ThreadContextLocator::from(&locator), now);
+    assert!(seeded_thread.ensure_system_prompt_snapshot("system prompt", now));
+    seeded_thread.store_turn(
+        seed_incoming.external_message_id.clone(),
+        vec![
+            ChatMessage::new(ChatMessageRole::User, "context summary user", now),
+            ChatMessage::new(ChatMessageRole::Assistant, "context summary assistant", now),
+        ],
+        now,
+        now,
+    );
+    let expected_thread = seeded_thread.clone();
+    sessions
+        .store_thread_context(&locator, seeded_thread, now)
+        .await
+        .expect("seed thread state should store");
+
+    let mut router = ChannelRouter::builder()
+        .agent_handle(AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        })
+        .session_manager(sessions)
+        .command_registry(commands)
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .take()
+        .expect("channel sender should be captured");
+    let incoming = build_incoming_with(
+        "msg_context_command",
+        "ou_thread_context",
+        Some("thread_context"),
+        "/context",
+    );
+
+    let send_task = tokio::spawn(async move {
+        channel_tx
+            .send(incoming)
+            .await
+            .expect("context command should be sent");
+    });
+
+    let driver = async {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("context command reply should be recorded");
+
+        send_task.await.expect("sender task should complete");
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+    drop(event_tx);
+
+    let recorded = sent.lock().await.clone();
+    let session = router
+        .sessions()
+        .get_session(&SessionKey {
+            channel: "feishu".to_string(),
+            user_id: "ou_thread_context".to_string(),
+        })
+        .await
+        .expect("context command should keep session state");
+    let thread = session
+        .threads
+        .values()
+        .next()
+        .expect("thread should remain addressable after context inspection");
+
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].content,
+        format!(
+            "[Command][context][SUCCESS]: {}",
+            expected_context_summary(&expected_thread)
+        )
+    );
+    assert_eq!(recorded[0].metadata["event_kind"], "Command");
+    assert_eq!(recorded[0].metadata["command_name"], "context");
+    assert_eq!(recorded[0].metadata["command_status"], "SUCCESS");
+    assert!(request_rx.try_recv().is_err());
+    assert_eq!(thread.messages(), expected_thread.messages());
+    assert_eq!(thread.load_toolsets(), expected_thread.load_toolsets());
+}
+
+#[tokio::test]
 async fn router_clear_command_resets_persisted_thread_context_without_agent_dispatch() {
     // 测试场景: /clear 应清空当前线程的持久化历史和线程状态，同时不触发 agent dispatch。
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -2002,4 +2139,28 @@ fn build_incoming_with(
 
 fn empty_thread(locator: &openjarvis::session::ThreadLocator) -> Thread {
     Thread::new(ThreadContextLocator::from(locator), Utc::now())
+}
+
+fn context_estimator() -> ContextBudgetEstimator {
+    let config = AppConfig::default();
+    ContextBudgetEstimator::from_config(config.llm_config(), config.agent_config().compact_config())
+}
+
+fn expected_context_summary(thread_context: &Thread) -> String {
+    let estimator = context_estimator();
+    let messages = thread_context.messages();
+    let report = estimator.estimate(&messages, &[]);
+
+    format!(
+        "thread=`{external_thread_id}`\npersisted_messages={message_count}\ntotal_estimated_tokens={total_estimated_tokens}/{context_window_tokens} ({utilization_percent:.2}%)\nsystem_tokens={system_tokens}, chat_tokens={chat_tokens}, visible_tool_tokens={visible_tool_tokens}, reserved_output_tokens={reserved_output_tokens}",
+        external_thread_id = thread_context.locator.external_thread_id,
+        message_count = messages.len(),
+        total_estimated_tokens = report.total_estimated_tokens,
+        context_window_tokens = report.context_window_tokens,
+        utilization_percent = report.utilization_ratio * 100.0,
+        system_tokens = report.system_tokens(),
+        chat_tokens = report.chat_tokens(),
+        visible_tool_tokens = report.visible_tool_tokens(),
+        reserved_output_tokens = report.reserved_output_tokens(),
+    )
 }

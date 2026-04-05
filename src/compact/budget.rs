@@ -247,6 +247,35 @@ impl ContextBudgetEstimator {
         report
     }
 
+    /// Estimate the deterministic token usage for one chat message.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     compact::ContextBudgetEstimator,
+    ///     config::AppConfig,
+    ///     context::{ChatMessage, ChatMessageRole},
+    /// };
+    ///
+    /// let config = AppConfig::default();
+    /// let estimator = ContextBudgetEstimator::from_config(
+    ///     config.llm_config(),
+    ///     config.agent_config().compact_config(),
+    /// );
+    ///
+    /// let tokens = estimator.estimate_message(&ChatMessage::new(
+    ///     ChatMessageRole::User,
+    ///     "hello budget",
+    ///     Utc::now(),
+    /// ));
+    ///
+    /// assert!(tokens > 0);
+    /// ```
+    pub fn estimate_message(&self, message: &ChatMessage) -> usize {
+        self.estimate_message_tokens(message)
+    }
+
     fn estimate_message_tokens(&self, message: &ChatMessage) -> usize {
         let role_overhead = 4;
         let content_tokens = self.estimate_text_tokens(&message.content);
