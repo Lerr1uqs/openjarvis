@@ -1,4 +1,4 @@
-- [ ] Session的postgralsql落盘
+- [x] Session的postgralsql落盘
 - [ ] agent的Outgoing返回
 - [ ] 飞书发送的限流阀（延时 消息缓冲层？
 - [ ] hook改为agenthook 因为可能有其他种hook后面要添加
@@ -7,7 +7,15 @@
 - [ ] session/turn/thread移动到一个模块中
 - [ ] 目前turn是全量的 后续需要改成增量吗？
 - [ ] 全面异步落盘的日志库
+- [ ] context子命令
 - [ ] [openjarvis][tool_call] write 返回内容太多了 需要做truncate
+```
+  └ {
+      "changeName": "add-command-session-tools",
+    … +12 lines
+    }
+    - Generating instructions...
+```
 - [ ] jarvis还在处理的时候用户发消息 接收到用户消息了才应该react
 - [ ] /? 列出全部Commands
 - [ ] command 能够解析用户输入转换为格式化的schema从而进行execute
