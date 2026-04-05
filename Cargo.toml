@@ -11,6 +11,7 @@ async-trait = "0.1.89"
 axum = { version = "0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 clap = { version = "4.5.39", features = ["derive"] }
+comfy-table = "7.2.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "1.2.0", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 schemars = { version = "0.8.21", features = ["derive"] }
@@ -37,3 +38,7 @@ path = "scripts/browser_bilibili_search_dump.rs"
 [[bin]]
 name = "tool_schema_dump"
 path = "scripts/tool_schema_dump.rs"
+
+[[bin]]
+name = "skill_frontmatter_dump"
+path = "scripts/skill_frontmatter_dump.rs"

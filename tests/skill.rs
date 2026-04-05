@@ -2,7 +2,7 @@ use openjarvis::{
     agent::{SkillManifest, SkillRegistry},
     skill::{
         default_skill_roots_for_workspace, install_curated_skill_from_contents,
-        uninstall_local_skill, workspace_skill_root_for,
+        list_local_skill_manifests, uninstall_local_skill, workspace_skill_root_for,
     },
 };
 use std::{
@@ -46,6 +46,14 @@ fn acpx_skill_resource_path() -> PathBuf {
 
 fn acpx_skill_resource_body() -> String {
     fs::read_to_string(acpx_skill_resource_path()).expect("acpx skill fixture should be readable")
+}
+
+fn write_local_skill(workspace_root: &Path, skill_name: &str, skill_body: &str) -> PathBuf {
+    let skill_dir = workspace_skill_root_for(workspace_root).join(skill_name);
+    fs::create_dir_all(&skill_dir).expect("local skill dir should be created");
+    let skill_file = skill_dir.join("SKILL.md");
+    fs::write(&skill_file, skill_body).expect("local skill file should be written");
+    skill_file
 }
 
 #[test]
@@ -205,5 +213,56 @@ body
         error
             .to_string()
             .contains("unsupported curated skill `missing`")
+    );
+}
+
+#[tokio::test]
+async fn list_local_skill_manifests_returns_sorted_frontmatter_from_workspace_root() {
+    // 测试场景: workspace 级 skill 列表应只返回合法 frontmatter，并按 skill name 稳定排序。
+    let fixture = SkillInstallFixture::new("openjarvis-skill-list-frontmatter");
+    write_local_skill(
+        fixture.root(),
+        "zeta",
+        r#"---
+name: zeta
+description: zeta description
+---
+zeta body
+"#,
+    );
+    write_local_skill(
+        fixture.root(),
+        "alpha",
+        r#"---
+name: alpha
+description: alpha description
+---
+alpha body
+"#,
+    );
+    write_local_skill(
+        fixture.root(),
+        "broken",
+        r#"---
+name: broken
+---
+broken body
+"#,
+    );
+
+    let manifests = list_local_skill_manifests(fixture.root())
+        .await
+        .expect("workspace skill listing should succeed");
+    let frontmatters = manifests
+        .into_iter()
+        .map(|manifest| (manifest.name, manifest.description))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        frontmatters,
+        vec![
+            ("alpha".to_string(), "alpha description".to_string()),
+            ("zeta".to_string(), "zeta description".to_string()),
+        ]
     );
 }

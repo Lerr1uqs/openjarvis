@@ -1,6 +1,9 @@
-//! Workspace-local skill path resolution and curated skill installation helpers.
+//! Workspace-local skill path resolution, discovery, and curated installation helpers.
 
-use crate::{agent::SkillManifest, cli::SkillCommand};
+use crate::{
+    agent::{SkillManifest, SkillRegistry},
+    cli::SkillCommand,
+};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use std::{
@@ -86,6 +89,44 @@ pub fn default_skill_roots_for_workspace(workspace_root: impl AsRef<Path>) -> Ve
 /// ```
 pub fn default_skill_roots() -> Vec<PathBuf> {
     default_skill_roots_for_workspace(resolve_current_workspace_root())
+}
+
+/// Discover all local skill manifests from one workspace.
+///
+/// Invalid skill packages are skipped so one broken local skill file does not block the rest of
+/// the workspace listing flow.
+///
+/// # 示例
+/// ```rust,no_run
+/// # async fn demo() -> anyhow::Result<()> {
+/// use openjarvis::skill::list_local_skill_manifests;
+/// use std::path::Path;
+///
+/// let manifests = list_local_skill_manifests(Path::new(".")).await?;
+/// for manifest in manifests {
+///     println!("{}: {}", manifest.name, manifest.description);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn list_local_skill_manifests(
+    workspace_root: impl AsRef<Path>,
+) -> Result<Vec<SkillManifest>> {
+    let workspace_root = workspace_root.as_ref().to_path_buf();
+    let skill_root = workspace_skill_root_for(&workspace_root);
+    info!(
+        workspace_root = %workspace_root.display(),
+        skill_root = %skill_root.display(),
+        "listing local skill manifests"
+    );
+    let registry = SkillRegistry::with_roots(vec![skill_root]);
+    let manifests = registry.reload().await?;
+    info!(
+        workspace_root = %workspace_root.display(),
+        skill_count = manifests.len(),
+        "listed local skill manifests"
+    );
+    Ok(manifests)
 }
 
 /// Install one curated skill by name into the provided workspace.
