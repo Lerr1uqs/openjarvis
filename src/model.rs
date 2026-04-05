@@ -26,11 +26,15 @@ pub struct IncomingMessage {
     pub user_id: String,
     pub user_name: Option<String>,
     pub content: String,
-    /// Upstream chat-software thread identifier.
+    /// Channel-defined external conversation identifier.
     ///
     /// This field is owned by the external channel implementation such as Feishu or Telegram.
     /// It is only used to resolve the internal OpenJarvis thread identity and is not itself the
     /// internal thread id persisted inside `SessionManager`.
+    ///
+    /// The concrete upstream field depends on the channel adapter. For Feishu long-connection
+    /// messages, OpenJarvis stores `chat_id` here because it identifies the whole chat
+    /// container, while Feishu `thread_id` only identifies one topic thread inside that chat.
     #[serde(default, alias = "thread_id")]
     pub external_thread_id: Option<String>,
     pub received_at: DateTime<Utc>,

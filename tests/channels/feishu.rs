@@ -43,11 +43,14 @@ fn long_connection_payload_is_mapped_to_unified_model() {
     assert_eq!(incoming.user_id, "ou_xxx");
     assert_eq!(incoming.content, "hello");
     assert_eq!(incoming.reply_target.receive_id, "oc_xxx");
-    assert_eq!(incoming.external_thread_id.as_deref(), Some("omt_xxx"));
+    // Feishu `chat_id` is the stable conversation container and should drive OpenJarvis
+    // external thread resolution even when Feishu also provides one topic `thread_id`.
+    assert_eq!(incoming.external_thread_id.as_deref(), Some("oc_xxx"));
+    assert_eq!(incoming.metadata["feishu_thread_id"], "omt_xxx");
 }
 
 #[test]
-fn long_connection_payload_without_thread_id_keeps_none() {
+fn long_connection_payload_without_thread_id_uses_chat_id_as_external_thread() {
     let channel = FeishuChannel::new(FeishuConfig::default());
     let incoming = channel.parse_long_connection_incoming(
         serde_json::from_value::<FeishuLongConnectionPayload>(json!({
@@ -65,5 +68,8 @@ fn long_connection_payload_without_thread_id_keeps_none() {
         .expect("long connection payload should deserialize"),
     );
 
-    assert_eq!(incoming.external_thread_id, None);
+    // Bug regression: missing Feishu `thread_id` must not collapse conversations into the
+    // OpenJarvis fallback `default` thread. `chat_id` is still the correct external thread id.
+    assert_eq!(incoming.external_thread_id.as_deref(), Some("oc_xxx"));
+    assert!(incoming.metadata["feishu_thread_id"].is_null());
 }

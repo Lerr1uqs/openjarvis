@@ -36,6 +36,41 @@ impl FeishuChannel {
         }
     }
 
+    /// Convert one Feishu long-connection payload into the unified incoming message model.
+    ///
+    /// OpenJarvis uses one channel-level conversation identifier as `external_thread_id`.
+    /// For Feishu, `chat_id` identifies the whole chat container, while Feishu `thread_id`
+    /// only points to one topic thread inside that chat and must not be used to split the
+    /// OpenJarvis conversation. The raw Feishu `thread_id` is preserved in `metadata`.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::{
+    ///     channels::feishu::{FeishuChannel, FeishuLongConnectionPayload},
+    ///     config::FeishuConfig,
+    /// };
+    /// use serde_json::json;
+    ///
+    /// let channel = FeishuChannel::new(FeishuConfig::default());
+    /// let incoming = channel.parse_long_connection_incoming(
+    ///     serde_json::from_value::<FeishuLongConnectionPayload>(json!({
+    ///         "event_id": "evt_ws_demo",
+    ///         "sender_open_id": "ou_demo",
+    ///         "sender_type": "user",
+    ///         "tenant_key": "tenant_demo",
+    ///         "message_id": "om_demo",
+    ///         "chat_id": "oc_demo",
+    ///         "thread_id": "omt_demo",
+    ///         "chat_type": "group",
+    ///         "message_type": "text",
+    ///         "content": "{\"text\":\"hello\"}"
+    ///     }))
+    ///     .expect("payload should deserialize"),
+    /// );
+    ///
+    /// assert_eq!(incoming.external_thread_id.as_deref(), Some("oc_demo"));
+    /// assert_eq!(incoming.metadata["feishu_thread_id"], "omt_demo");
+    /// ```
     pub fn parse_long_connection_incoming(
         &self,
         payload: FeishuLongConnectionPayload,
@@ -44,17 +79,21 @@ impl FeishuChannel {
         let message_id = payload.message_id.clone();
         let chat_id = payload.chat_id.clone();
         let raw_thread_id = payload.thread_id.clone();
-        let external_thread_id = raw_thread_id
-            .clone()
-            .filter(|value| !value.trim().is_empty());
+        // Feishu `chat_id` identifies the whole conversation container. Its `thread_id`
+        // only identifies one topic thread inside the same chat, so OpenJarvis should use
+        // `chat_id` as the stable external thread identity.
+        let external_thread_id = Some(chat_id.clone()).filter(|value| !value.trim().is_empty());
 
         debug!(
             message_id,
             chat_id,
+            message_type = %payload.message_type,
+            content = %content,
             has_thread_id = raw_thread_id.is_some(),
-            raw_thread_id = ?raw_thread_id,
-            resolved_external_thread_id = ?external_thread_id,
-            "parsed feishu long-connection external_thread_id"
+            external_thread_id_is_none = external_thread_id.is_none(),
+            raw_feishu_thread_id = ?raw_thread_id,
+            openjarvis_external_thread_id = ?external_thread_id,
+            "parsed feishu long-connection message"
         );
 
         IncomingMessage {
@@ -70,6 +109,7 @@ impl FeishuChannel {
                 "event_id": payload.event_id,
                 "event_type": "im.message.receive_v1",
                 "chat_id": chat_id,
+                "feishu_thread_id": raw_thread_id,
                 "chat_type": payload.chat_type,
                 "message_id": message_id,
                 "message_type": payload.message_type,
