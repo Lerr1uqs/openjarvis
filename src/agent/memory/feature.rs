@@ -8,7 +8,7 @@ use crate::{
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Build one stable active-memory catalog prompt from the local repository.
 pub struct ActiveMemoryCatalogFeaturePromptProvider {
@@ -41,6 +41,11 @@ impl FeaturePromptProvider for ActiveMemoryCatalogFeaturePromptProvider {
     }
 
     async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<Vec<ChatMessage>> {
+        debug!(
+            thread_id = %context.thread_context.locator.thread_id,
+            root = %self.repository.memory_root().display(),
+            "starting active memory feature prompt build"
+        );
         let prompt = self.repository.active_catalog_prompt()?;
         let Some(prompt) = prompt else {
             info!(
@@ -54,6 +59,11 @@ impl FeaturePromptProvider for ActiveMemoryCatalogFeaturePromptProvider {
             thread_id = %context.thread_context.locator.thread_id,
             root = %self.repository.memory_root().display(),
             "built active memory catalog system prompt"
+        );
+        debug!(
+            thread_id = %context.thread_context.locator.thread_id,
+            prompt_len = prompt.len(),
+            "completed active memory feature prompt build"
         );
         Ok(vec![ChatMessage::new(
             ChatMessageRole::System,

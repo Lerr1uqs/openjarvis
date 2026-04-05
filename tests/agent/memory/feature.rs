@@ -64,7 +64,7 @@ impl LLMProvider for RecordingProvider {
 
 #[tokio::test]
 async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_reinit() {
-    // 测试场景: 用户触发 active memory 写入后，记忆要落盘；当前线程不热更新 catalog，清空重初始化后才把 keyword->path 注入 system prompt。
+    // 测试场景: 用户触发 active memory 写入后，记忆要落盘；当前线程不热更新 catalog，清空重初始化后才把 grouped keywords->path 注入 system prompt。
     let fixture = MemoryWorkspaceFixture::new("openjarvis-memory-feature-worker");
     let registry = Arc::new(ToolRegistry::with_workspace_root_and_skill_roots(
         fixture.root(),
@@ -143,7 +143,9 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         !remembered_thread
             .system_prefix_messages()
             .iter()
-            .any(|message| message.content.contains("notion -> workflow/notion.md"))
+            .any(|message| message
+                .content
+                .contains("notion, 上传 -> workflow/notion.md"))
     );
 
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -170,11 +172,11 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
 
     let captured_requests = requests.lock().await;
     let same_thread_messages = &captured_requests[0].messages;
-    assert!(
-        !same_thread_messages
-            .iter()
-            .any(|message| message.content.contains("notion -> workflow/notion.md"))
-    );
+    assert!(!same_thread_messages.iter().any(|message| {
+        message
+            .content
+            .contains("notion, 上传 -> workflow/notion.md")
+    }));
     assert!(
         !same_thread_messages
             .iter()
@@ -203,13 +205,15 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         reinit_thread
             .system_prefix_messages()
             .iter()
-            .any(|message| message.content.contains("notion -> workflow/notion.md"))
+            .any(|message| message
+                .content
+                .contains("notion, 上传 -> workflow/notion.md"))
     );
-    assert!(
-        reinit_messages
-            .iter()
-            .any(|message| message.content.contains("notion -> workflow/notion.md"))
-    );
+    assert!(reinit_messages.iter().any(|message| {
+        message
+            .content
+            .contains("notion, 上传 -> workflow/notion.md")
+    }));
     assert!(
         !reinit_messages
             .iter()

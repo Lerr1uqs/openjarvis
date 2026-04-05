@@ -9,10 +9,10 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const OPENJARVIS_MEMORY_DIR: &str = ".openjarvis/memory";
-const ACTIVE_MEMORY_TOOLSET_HINT: &str = "以下是当前工作区可用的 Active Memory 关键词目录。这里只暴露 `keyword -> relative path` 词表，不直接注入正文。需要详情时，请先用 `load_toolset` 加载 `memory` toolset，再调用 `memory_get`、`memory_search`、`memory_list` 或 `memory_write`。";
+const ACTIVE_MEMORY_TOOLSET_HINT: &str = "以下是当前工作区可用的 Active Memory 关键词目录。这里只暴露 `keywords -> relative path` 词表，不直接注入正文。一个文件可能对应多个关键词，多个关键词会用英文逗号拼接后指向同一个相对路径。需要详情时，请先用 `load_toolset` 加载 `memory` toolset，再调用 `memory_get`、`memory_search`、`memory_list` 或 `memory_write`。";
 
 /// Stable memory storage namespace under the workspace-local `.openjarvis/memory` tree.
 ///
@@ -84,10 +84,10 @@ pub struct MemoryDocumentSummary {
     pub keywords: Vec<String>,
 }
 
-/// One active-memory keyword catalog entry injected during thread initialization.
+/// One active-memory catalog entry grouped by file for thread initialization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveMemoryCatalogEntry {
-    pub keyword: String,
+    pub keywords: Vec<String>,
     pub path: String,
 }
 
@@ -150,9 +150,23 @@ impl MemoryRepository {
     pub fn get(&self, memory_type: MemoryType, path: &str) -> Result<MemoryDocument> {
         let normalized_path = validate_memory_file_path(path)?;
         let absolute_path = self.type_root(memory_type).join(&normalized_path);
+        debug!(
+            memory_type = memory_type.as_dir_name(),
+            path = %normalized_path,
+            absolute_path = %absolute_path.display(),
+            "starting memory get request"
+        );
         let raw = fs::read_to_string(&absolute_path)
             .with_context(|| format!("failed to read memory file {}", absolute_path.display()))?;
-        parse_memory_document(memory_type, &normalized_path, &raw)
+        let document = parse_memory_document(memory_type, &normalized_path, &raw)?;
+        debug!(
+            memory_type = document.memory_type.as_dir_name(),
+            path = %document.path,
+            content_len = document.content.len(),
+            keyword_count = document.metadata.keywords.len(),
+            "completed memory get request"
+        );
+        Ok(document)
     }
 
     /// Write one active/passive markdown memory document to disk.
@@ -173,6 +187,14 @@ impl MemoryRepository {
     /// });
     /// ```
     pub fn write(&self, request: MemoryWriteRequest) -> Result<MemoryDocument> {
+        debug!(
+            memory_type = request.memory_type.as_dir_name(),
+            path = %request.path,
+            title_len = request.title.len(),
+            content_len = request.content.len(),
+            keyword_count = request.keywords.as_ref().map(|keywords| keywords.len()).unwrap_or_default(),
+            "starting memory write request"
+        );
         let normalized_path = validate_memory_file_path(&request.path)?;
         let title = request.title.trim();
         if title.is_empty() {
@@ -236,6 +258,14 @@ impl MemoryRepository {
             metadata,
             content: request.content,
         })
+        .inspect(|document| {
+            debug!(
+                memory_type = document.memory_type.as_dir_name(),
+                path = %document.path,
+                keyword_count = document.metadata.keywords.len(),
+                "completed memory write request"
+            );
+        })
     }
 
     /// List structured memory candidates, optionally filtered by type or directory prefix.
@@ -252,6 +282,10 @@ impl MemoryRepository {
         memory_type: Option<MemoryType>,
         dir: Option<&str>,
     ) -> Result<Vec<MemoryDocumentSummary>> {
+        debug!(
+            memory_type = memory_type.map(MemoryType::as_dir_name),
+            dir, "starting memory list request"
+        );
         let normalized_dir = match dir {
             Some(dir) => Some(validate_memory_dir_prefix(dir)?),
             None => None,
@@ -266,6 +300,12 @@ impl MemoryRepository {
             .map(|document| summary_from_document(&document))
             .collect::<Vec<_>>();
         items.sort_by(summary_sort_key);
+        debug!(
+            memory_type = memory_type.map(MemoryType::as_dir_name),
+            dir = normalized_dir.as_deref(),
+            item_count = items.len(),
+            "completed memory list request"
+        );
         Ok(items)
     }
 
@@ -293,6 +333,13 @@ impl MemoryRepository {
         }
 
         let terms = tokenize_query(query);
+        debug!(
+            query,
+            memory_type = memory_type.map(MemoryType::as_dir_name),
+            limit,
+            term_count = terms.len(),
+            "starting memory search request"
+        );
         let mut matches = self
             .load_documents(memory_type)?
             .into_iter()
@@ -316,11 +363,20 @@ impl MemoryRepository {
             .take(limit)
             .map(|(_, document)| summary_from_document(&document))
             .collect::<Vec<_>>();
-        Ok(MemorySearchResponse {
+        let response = MemorySearchResponse {
             query: query.to_string(),
             total_matches,
             items,
-        })
+        };
+        debug!(
+            query = %response.query,
+            memory_type = memory_type.map(MemoryType::as_dir_name),
+            limit,
+            total_matches = response.total_matches,
+            returned_items = response.items.len(),
+            "completed memory search request"
+        );
+        Ok(response)
     }
 
     /// Load the active keyword catalog used during thread initialization.
@@ -333,6 +389,10 @@ impl MemoryRepository {
     /// let _catalog = repository.load_active_catalog();
     /// ```
     pub fn load_active_catalog(&self) -> Result<Vec<ActiveMemoryCatalogEntry>> {
+        debug!(
+            root = %self.memory_root().display(),
+            "starting active memory catalog load"
+        );
         let documents = self.load_documents(Some(MemoryType::Active))?;
         let mut keyword_to_path = HashMap::<String, String>::new();
         let mut entries = Vec::new();
@@ -348,22 +408,28 @@ impl MemoryRepository {
                     );
                 }
                 keyword_to_path.insert(dedup_key, document.path.clone());
-                entries.push(ActiveMemoryCatalogEntry {
-                    keyword: keyword.clone(),
-                    path: document.path.clone(),
-                });
             }
+
+            entries.push(ActiveMemoryCatalogEntry {
+                keywords: document.metadata.keywords.clone(),
+                path: document.path.clone(),
+            });
         }
 
         entries.sort_by(|left, right| {
-            left.keyword
-                .cmp(&right.keyword)
-                .then_with(|| left.path.cmp(&right.path))
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.keywords.cmp(&right.keywords))
         });
         info!(
             root = %self.memory_root().display(),
             entry_count = entries.len(),
             "loaded active memory catalog"
+        );
+        debug!(
+            root = %self.memory_root().display(),
+            entry_count = entries.len(),
+            "completed active memory catalog load"
         );
         Ok(entries)
     }
@@ -378,17 +444,32 @@ impl MemoryRepository {
     /// let _prompt = repository.active_catalog_prompt();
     /// ```
     pub fn active_catalog_prompt(&self) -> Result<Option<String>> {
+        debug!(
+            root = %self.memory_root().display(),
+            "starting active memory prompt build"
+        );
         let entries = self.load_active_catalog()?;
         if entries.is_empty() {
+            debug!(
+                root = %self.memory_root().display(),
+                "active memory prompt build skipped because catalog is empty"
+            );
             return Ok(None);
         }
 
         let catalog = entries
             .iter()
-            .map(|entry| format!("- {} -> {}", entry.keyword, entry.path))
+            .map(|entry| format!("- {} -> {}", entry.keywords.join(", "), entry.path))
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(Some(format!("{ACTIVE_MEMORY_TOOLSET_HINT}\n{catalog}")))
+        let prompt = format!("{ACTIVE_MEMORY_TOOLSET_HINT}\n{catalog}");
+        debug!(
+            root = %self.memory_root().display(),
+            entry_count = entries.len(),
+            prompt_len = prompt.len(),
+            "completed active memory prompt build"
+        );
+        Ok(Some(prompt))
     }
 
     fn load_documents(&self, memory_type: Option<MemoryType>) -> Result<Vec<MemoryDocument>> {

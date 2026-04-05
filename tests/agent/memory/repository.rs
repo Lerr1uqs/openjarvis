@@ -51,11 +51,11 @@ fn memory_repository_roundtrips_active_and_passive_documents() {
     let catalog = repository
         .load_active_catalog()
         .expect("active catalog should build");
-    assert_eq!(catalog.len(), 2);
-    assert!(
-        catalog
-            .iter()
-            .any(|entry| entry.keyword == "notion" && entry.path == "workflow/notion.md")
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].path, "workflow/notion.md");
+    assert_eq!(
+        catalog[0].keywords,
+        vec!["notion".to_string(), "上传".to_string()]
     );
     assert!(
         fs::read_to_string(active_file)
@@ -66,6 +66,52 @@ fn memory_repository_roundtrips_active_and_passive_documents() {
         !fs::read_to_string(passive_file)
             .expect("passive memory file should exist")
             .contains("keywords:")
+    );
+}
+
+#[test]
+fn memory_repository_active_catalog_prompt_groups_multiple_keywords_per_file() {
+    // 测试场景: 同一个 active memory 文件声明多个关键词时，catalog prompt 必须合并成一行，
+    // 不能错误地展开成多条 `keyword -> path` 映射。
+    let fixture =
+        MemoryWorkspaceFixture::new("openjarvis-memory-repository-grouped-active-catalog-prompt");
+    let repository = MemoryRepository::new(fixture.root());
+
+    repository
+        .write(MemoryWriteRequest {
+            memory_type: MemoryType::Active,
+            path: "profile/jjj_preference.md".to_string(),
+            title: "JJJ 偏好".to_string(),
+            content: "JJJ 喜欢被叫小南梁".to_string(),
+            keywords: Some(vec![
+                "JJJ".to_string(),
+                "喜好".to_string(),
+                "小南梁".to_string(),
+            ]),
+        })
+        .expect("grouped active memory should write");
+
+    let prompt = repository
+        .active_catalog_prompt()
+        .expect("active catalog prompt should build")
+        .expect("active catalog prompt should exist");
+    let prompt_lines = prompt.lines().collect::<Vec<_>>();
+
+    assert!(prompt.contains("JJJ, 喜好, 小南梁 -> profile/jjj_preference.md"));
+    assert!(
+        !prompt_lines
+            .iter()
+            .any(|line| line.trim() == "- JJJ -> profile/jjj_preference.md")
+    );
+    assert!(
+        !prompt_lines
+            .iter()
+            .any(|line| line.trim() == "- 喜好 -> profile/jjj_preference.md")
+    );
+    assert!(
+        !prompt_lines
+            .iter()
+            .any(|line| line.trim() == "- 小南梁 -> profile/jjj_preference.md")
     );
 }
 

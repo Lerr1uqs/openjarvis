@@ -4,12 +4,14 @@ use crate::config::{FileLoggingConfig, LogRotation, LoggingConfig};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{env, fs, path::Path};
-use tracing::info;
+use tracing::{debug, info};
 use tracing_appender::{
     non_blocking::WorkerGuard,
     rolling::{RollingFileAppender, Rotation},
 };
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, fmt, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 /// Hold tracing writer guards so non-blocking file logging can flush on shutdown.
 #[derive(Debug, Default)]
@@ -31,6 +33,37 @@ struct LoggingBootstrapDocument {
     logging: LoggingConfig,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LoggingRuntimeOverrides {
+    level_filter: Option<String>,
+    stderr_enabled: Option<bool>,
+    stderr_ansi: Option<bool>,
+    debug_mode: bool,
+}
+
+impl LoggingRuntimeOverrides {
+    fn from_cli(debug_enabled: bool, log_color: bool) -> Self {
+        Self {
+            level_filter: debug_enabled.then(|| "debug".to_string()),
+            stderr_enabled: (debug_enabled || log_color).then_some(true),
+            stderr_ansi: log_color.then_some(true),
+            debug_mode: debug_enabled,
+        }
+    }
+
+    fn apply(&self, logging_config: &mut LoggingConfig) {
+        if let Some(level_filter) = self.level_filter.as_deref() {
+            logging_config.set_level_filter(level_filter);
+        }
+        if let Some(stderr_enabled) = self.stderr_enabled {
+            logging_config.set_stderr_enabled(stderr_enabled);
+        }
+        if let Some(stderr_ansi) = self.stderr_ansi {
+            logging_config.set_stderr_ansi(stderr_ansi);
+        }
+    }
+}
+
 /// Bootstrap tracing from `OPENJARVIS_CONFIG` or `config.yaml`.
 ///
 /// # 示例
@@ -40,9 +73,30 @@ struct LoggingBootstrapDocument {
 /// let _guards = init_tracing_from_default_config().expect("logging should initialize");
 /// ```
 pub fn init_tracing_from_default_config() -> Result<LoggingGuards> {
+    init_tracing_from_default_config_with_cli(false, false)
+}
+
+/// Bootstrap tracing from `OPENJARVIS_CONFIG` or `config.yaml`, then apply CLI runtime overrides.
+///
+/// `debug_enabled` forces `debug` filter level and enables stderr logs for the current process.
+/// `log_color` forces ANSI colors on stderr logs and also enables stderr output.
+///
+/// # 示例
+/// ```no_run
+/// use openjarvis::logging::init_tracing_from_default_config_with_cli;
+///
+/// let _guards = init_tracing_from_default_config_with_cli(true, true)
+///     .expect("logging should initialize");
+/// ```
+pub fn init_tracing_from_default_config_with_cli(
+    debug_enabled: bool,
+    log_color: bool,
+) -> Result<LoggingGuards> {
     let config_path = env::var("OPENJARVIS_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
-    let logging_config = load_logging_config_from_path(&config_path)?;
-    init_tracing(&logging_config)
+    let mut logging_config = load_logging_config_from_path(&config_path)?;
+    let overrides = LoggingRuntimeOverrides::from_cli(debug_enabled, log_color);
+    overrides.apply(&mut logging_config);
+    init_tracing_with_overrides(&logging_config, &overrides)
 }
 
 /// Load only the `logging` section from one YAML file.
@@ -84,16 +138,33 @@ pub fn load_logging_config_from_path(path: impl AsRef<Path>) -> Result<LoggingCo
 /// let _guards = init_tracing(&LoggingConfig::default()).expect("logging should initialize");
 /// ```
 pub fn init_tracing(logging_config: &LoggingConfig) -> Result<LoggingGuards> {
+    init_tracing_with_overrides(logging_config, &LoggingRuntimeOverrides::default())
+}
+
+fn init_tracing_with_overrides(
+    logging_config: &LoggingConfig,
+    overrides: &LoggingRuntimeOverrides,
+) -> Result<LoggingGuards> {
     logging_config.validate()?;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(logging_config.level_filter().trim()));
+    let filter = if let Some(level_filter) = overrides.level_filter.as_deref() {
+        EnvFilter::new(level_filter.trim())
+    } else {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(logging_config.level_filter().trim()))
+    };
+    let span_events = if overrides.debug_mode {
+        FmtSpan::NEW | FmtSpan::CLOSE
+    } else {
+        FmtSpan::NONE
+    };
     let stderr_layer = logging_config.stderr_enabled().then(|| {
         fmt::layer()
-            .with_target(false)
+            .with_target(overrides.debug_mode)
             .with_file(true)
             .with_line_number(true)
             .with_thread_ids(true)
             .with_thread_names(true)
+            .with_span_events(span_events.clone())
             .with_ansi(logging_config.stderr_ansi())
             .with_writer(std::io::stderr)
     });
@@ -101,11 +172,12 @@ pub fn init_tracing(logging_config: &LoggingConfig) -> Result<LoggingGuards> {
         let file_appender = build_file_appender(logging_config.file_config())?;
         let (writer, guard) = tracing_appender::non_blocking(file_appender);
         let layer = fmt::layer()
-            .with_target(false)
+            .with_target(overrides.debug_mode)
             .with_file(true)
             .with_line_number(true)
             .with_thread_ids(true)
             .with_thread_names(true)
+            .with_span_events(span_events)
             .with_ansi(false)
             .with_writer(writer);
         (Some(layer), Some(guard))
@@ -127,8 +199,18 @@ pub fn init_tracing(logging_config: &LoggingConfig) -> Result<LoggingGuards> {
         file_directory = %logging_config.file_config().directory().display(),
         rotation = %logging_config.file_config().rotation(),
         max_files = logging_config.file_config().max_files(),
+        debug_mode = overrides.debug_mode,
+        stderr_ansi = logging_config.stderr_ansi(),
         "tracing initialized"
     );
+    if overrides.debug_mode {
+        debug!(
+            level = logging_config.level_filter(),
+            stderr = logging_config.stderr_enabled(),
+            stderr_ansi = logging_config.stderr_ansi(),
+            "debug logging enabled via CLI override"
+        );
+    }
 
     Ok(LoggingGuards::new(file_guard))
 }

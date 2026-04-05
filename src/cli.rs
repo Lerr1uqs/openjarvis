@@ -7,6 +7,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openjarvis")]
 pub struct OpenJarvisCli {
+    /// Force richer debug logging on stderr for the current process.
+    #[arg(long, global = true)]
+    pub debug: bool,
+    /// Force ANSI colors on stderr logs for the current process.
+    #[arg(long = "log-color", global = true)]
+    pub log_color: bool,
     /// Load demo-only builtin MCP servers for local verification.
     #[arg(long, global = true)]
     pub builtin_mcp: bool,
@@ -34,6 +40,7 @@ impl OpenJarvisCli {
     /// let cli = OpenJarvisCli::parse_from(["openjarvis", "--builtin-mcp"]);
     /// assert!(cli.command.is_none());
     /// assert!(cli.builtin_mcp);
+    /// assert!(!cli.debug);
     /// ```
     pub fn internal_mcp_command(&self) -> Option<&InternalMcpCommand> {
         match &self.command {

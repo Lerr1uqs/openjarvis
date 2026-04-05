@@ -15,7 +15,7 @@ use openjarvis::{
     session::{MemorySessionStore, SessionManager, SessionStore, SqliteSessionStore},
 };
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,7 +28,13 @@ async fn main() -> Result<()> {
         return browser::run_internal_browser_command(command).await;
     }
 
-    let _logging_guards = logging::init_tracing_from_default_config()?;
+    let _logging_guards =
+        logging::init_tracing_from_default_config_with_cli(cli.debug, cli.log_color)?;
+    debug!(
+        debug_enabled = cli.debug,
+        log_color = cli.log_color,
+        "applied cli logging overrides"
+    );
     let mut config = AppConfig::load()?;
     if cli.builtin_mcp {
         let executable = std::env::current_exe()?;

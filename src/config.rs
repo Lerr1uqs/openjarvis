@@ -493,6 +493,18 @@ impl LoggingConfig {
         &self.file
     }
 
+    pub(crate) fn set_level_filter(&mut self, level: impl Into<String>) {
+        self.level = level.into();
+    }
+
+    pub(crate) fn set_stderr_enabled(&mut self, enabled: bool) {
+        self.stderr = enabled;
+    }
+
+    pub(crate) fn set_stderr_ansi(&mut self, enabled: bool) {
+        self.stderr_ansi = enabled;
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if self.level.trim().is_empty() {
             bail!("logging.level must not be blank");

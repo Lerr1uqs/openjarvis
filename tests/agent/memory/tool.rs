@@ -221,3 +221,47 @@ async fn memory_toolset_rejects_invalid_active_write_and_bad_paths() {
     .expect_err("absolute get path should fail");
     assert!(bad_get_path.to_string().contains("must be relative"));
 }
+
+#[tokio::test]
+async fn memory_write_schema_requires_user_provided_specific_active_keywords() {
+    // 测试场景: memory_write 的 tool schema 必须明确要求 active keywords 只能使用用户明确提供的专用名字，
+    // 如果用户没说清楚则先问，不允许模型自行脑补关键词。
+    let fixture = MemoryWorkspaceFixture::new("openjarvis-memory-toolset-schema");
+    let registry = ToolRegistry::with_workspace_root_and_skill_roots(fixture.root(), Vec::new());
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register");
+    let mut thread_context = build_thread("thread_memory_toolset_schema");
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "memory" }),
+        },
+    )
+    .await
+    .expect("memory toolset should load");
+
+    let definition = list_tools(&registry, &thread_context)
+        .await
+        .expect("loaded tool listing should succeed")
+        .into_iter()
+        .find(|definition| definition.name == "memory_write")
+        .expect("memory_write definition should exist");
+    let schema = definition.input_schema.json_schema();
+    let keywords_description = schema["properties"]["keywords"]["description"]
+        .as_str()
+        .expect("keywords description should exist");
+
+    assert!(
+        definition
+            .description
+            .contains("Do not invent extra keywords")
+    );
+    assert!(definition.description.contains("ask first"));
+    assert!(keywords_description.contains("highly specific names"));
+    assert!(keywords_description.contains("directly provided by the user"));
+    assert!(keywords_description.contains("ask first"));
+}

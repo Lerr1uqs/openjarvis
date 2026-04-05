@@ -8,8 +8,20 @@ use openjarvis::{
 fn cli_parses_builtin_mcp_flag() {
     let cli = OpenJarvisCli::parse_from(["openjarvis", "--builtin-mcp"]);
 
+    assert!(!cli.debug);
+    assert!(!cli.log_color);
     assert!(cli.builtin_mcp);
     assert!(cli.load_skills.is_empty());
+    assert!(cli.internal_mcp_command().is_none());
+}
+
+#[test]
+fn cli_parses_debug_and_log_color_flags() {
+    let cli = OpenJarvisCli::parse_from(["openjarvis", "--debug", "--log-color"]);
+
+    assert!(cli.debug);
+    assert!(cli.log_color);
+    assert!(!cli.builtin_mcp);
     assert!(cli.internal_mcp_command().is_none());
 }
 

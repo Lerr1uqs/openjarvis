@@ -24,7 +24,9 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct LLMRequest {
@@ -170,17 +172,62 @@ impl LLMProvider for OpenaiProvider {
             bail!("llm request must contain at least one message");
         }
 
-        let response = self
-            .client
-            .chat()
-            .create(build_openai_request(&self.config, request)?)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to call llm provider `{}` model `{}` at `{}`",
-                    self.config.provider, self.config.model, self.config.base_url
-                )
-            })?;
+        let message_count = request.messages.len();
+        let tool_count = request.tools.len();
+        let started_at = Instant::now();
+        debug!(
+            provider = %self.config.provider,
+            model = %self.config.model,
+            base_url = %self.config.base_url,
+            message_count,
+            tool_count,
+            "starting llm network request"
+        );
+        let openai_request = build_openai_request(&self.config, request)?;
+        let response = match self.client.chat().create(openai_request).await {
+            Ok(response) => response,
+            Err(error) => {
+                debug!(
+                    provider = %self.config.provider,
+                    model = %self.config.model,
+                    base_url = %self.config.base_url,
+                    message_count,
+                    tool_count,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "llm network request failed"
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to call llm provider `{}` model `{}` at `{}`",
+                        self.config.provider, self.config.model, self.config.base_url
+                    )
+                });
+            }
+        };
+        let usage = response.usage.clone();
+        let cached_tokens = usage
+            .as_ref()
+            .and_then(|usage| usage.prompt_tokens_details.as_ref())
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or_default();
+        debug!(
+            provider = %self.config.provider,
+            model = %self.config.model,
+            base_url = %self.config.base_url,
+            message_count,
+            tool_count,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            choice_count = response.choices.len(),
+            prompt_tokens = usage.as_ref().map(|usage| usage.prompt_tokens).unwrap_or_default(),
+            completion_tokens = usage
+                .as_ref()
+                .map(|usage| usage.completion_tokens)
+                .unwrap_or_default(),
+            total_tokens = usage.as_ref().map(|usage| usage.total_tokens).unwrap_or_default(),
+            cached_tokens,
+            "completed llm network request"
+        );
         let choice = response
             .choices
             .into_iter()

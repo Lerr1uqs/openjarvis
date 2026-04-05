@@ -201,6 +201,79 @@ llm:
 }
 
 #[test]
+fn startup_debug_flag_overrides_rust_log_and_enables_stderr_logs() {
+    let fixture = MainConfigFixture::new("openjarvis-main-debug-cli-override");
+    fixture.write_yaml(
+        r#"
+logging:
+  level: "info"
+  stderr: false
+  file:
+    enabled: true
+    directory: "debug-logs"
+    rotation: "never"
+    filename_prefix: "openjarvis-debug"
+    filename_suffix: "log"
+    max_files: 1
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("--debug")
+        .arg("--load-skill")
+        .arg("missing_local_skill")
+        .env("OPENJARVIS_CONFIG", fixture.config_path())
+        .env("RUST_LOG", "info")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DEBUG"));
+    assert!(stderr.contains("debug logging enabled via CLI override"));
+}
+
+#[test]
+fn startup_log_color_flag_emits_ansi_stderr_logs() {
+    let fixture = MainConfigFixture::new("openjarvis-main-log-color-cli");
+    fixture.write_yaml(
+        r#"
+logging:
+  level: "info"
+  stderr: false
+  file:
+    enabled: true
+    directory: "color-logs"
+    rotation: "never"
+    filename_prefix: "openjarvis-color"
+    filename_suffix: "log"
+    max_files: 1
+llm:
+  provider: "mock"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("--log-color")
+        .arg("--load-skill")
+        .arg("missing_local_skill")
+        .env("OPENJARVIS_CONFIG", fixture.config_path())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("openjarvis binary should run");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\u{1b}["));
+    assert!(stderr.contains("tracing initialized"));
+}
+
+#[test]
 fn startup_does_not_emit_missing_log_directory_noise_on_first_run() {
     let fixture = MainConfigFixture::new("openjarvis-main-log-dir-bootstrap");
     fixture.write_yaml(

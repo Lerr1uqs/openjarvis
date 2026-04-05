@@ -9,7 +9,7 @@ use chrono::{Duration, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::{path::Path, process::Stdio, sync::Arc};
+use std::{path::Path, process::Stdio, sync::Arc, time::Instant};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -249,6 +249,15 @@ impl FeishuChannel {
             "{}/open-apis/im/v1/messages",
             self.config.open_base_url.trim_end_matches('/')
         );
+        let started_at = Instant::now();
+        debug!(
+            endpoint = %endpoint,
+            message_id = %message.id,
+            receive_id = %message.target.receive_id,
+            receive_id_type = %message.target.receive_id_type,
+            content_len = message.content.len(),
+            "starting feishu send-message request"
+        );
         let response = self
             .http_client
             .post(endpoint)
@@ -269,6 +278,14 @@ impl FeishuChannel {
             .text()
             .await
             .context("failed to read feishu send-message response")?;
+        debug!(
+            message_id = %message.id,
+            receive_id = %message.target.receive_id,
+            status = %status,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            body_len = body.len(),
+            "completed feishu send-message request"
+        );
         if !status.is_success() {
             bail!("feishu send-message request failed with status {status}: {body}");
         }
@@ -306,6 +323,13 @@ impl FeishuChannel {
             self.config.open_base_url.trim_end_matches('/'),
             message_id
         );
+        let started_at = Instant::now();
+        debug!(
+            endpoint = %endpoint,
+            message_id,
+            emoji_type,
+            "starting feishu reaction request"
+        );
         let response = self
             .http_client
             .post(endpoint)
@@ -324,6 +348,14 @@ impl FeishuChannel {
             .text()
             .await
             .context("failed to read feishu reaction response")?;
+        debug!(
+            message_id,
+            emoji_type,
+            status = %status,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            body_len = body.len(),
+            "completed feishu reaction request"
+        );
         if !status.is_success() {
             bail!("feishu reaction request failed with status {status}: {body}");
         }
@@ -348,6 +380,11 @@ impl FeishuChannel {
             let cached_token = self.cached_token.lock().await;
             if let Some(cached_token) = cached_token.as_ref() {
                 if cached_token.expires_at > now {
+                    debug!(
+                        expires_at = %cached_token.expires_at,
+                        remaining_seconds = (cached_token.expires_at - now).num_seconds(),
+                        "reusing cached feishu tenant_access_token"
+                    );
                     return Ok(cached_token.value.clone());
                 }
             }
@@ -356,6 +393,12 @@ impl FeishuChannel {
         let endpoint = format!(
             "{}/open-apis/auth/v3/tenant_access_token/internal",
             self.config.open_base_url.trim_end_matches('/')
+        );
+        let started_at = Instant::now();
+        debug!(
+            endpoint = %endpoint,
+            app_id = %self.config.app_id,
+            "starting feishu tenant_access_token request"
         );
         let response = self
             .http_client
@@ -373,6 +416,12 @@ impl FeishuChannel {
             .text()
             .await
             .context("failed to read feishu tenant_access_token response")?;
+        debug!(
+            status = %status,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            body_len = body.len(),
+            "completed feishu tenant_access_token request"
+        );
         if !status.is_success() {
             bail!("feishu access-token request failed with status {status}: {body}");
         }
@@ -393,6 +442,11 @@ impl FeishuChannel {
             value: payload.tenant_access_token.clone(),
             expires_at,
         });
+        debug!(
+            expires_at = %expires_at,
+            ttl_seconds = payload.expire,
+            "cached feishu tenant_access_token"
+        );
 
         Ok(payload.tenant_access_token)
     }

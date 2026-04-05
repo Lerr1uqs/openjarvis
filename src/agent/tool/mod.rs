@@ -18,9 +18,9 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub use edit::EditTool;
 pub use mcp::{
@@ -428,6 +428,18 @@ impl ToolRegistry {
 
     /// Look up a registered tool and execute the request.
     pub async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
+        let tool_name = request.name.clone();
+        let started_at = Instant::now();
+        let argument_field_count = request
+            .arguments
+            .as_object()
+            .map(|arguments| arguments.len())
+            .unwrap_or_default();
+        debug!(
+            tool_name = %tool_name,
+            argument_field_count,
+            "starting always-visible tool action"
+        );
         let handler = self
             .always_visible_handlers
             .read()
@@ -439,9 +451,30 @@ impl ToolRegistry {
             bail!("tool `{}` is not registered", request.name);
         };
 
-        handler
+        let result = handler
             .call_with_context(ToolCallContext::default(), request)
-            .await
+            .await;
+        match &result {
+            Ok(tool_result) => debug!(
+                tool_name = %tool_name,
+                argument_field_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                is_error = tool_result.is_error,
+                event_kind = ?tool_result
+                    .metadata
+                    .get("event_kind")
+                    .and_then(|value| value.as_str()),
+                "completed always-visible tool action"
+            ),
+            Err(error) => debug!(
+                tool_name = %tool_name,
+                argument_field_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "always-visible tool action failed"
+            ),
+        }
+        result
     }
 
     /// Return all registered tool definitions.
@@ -507,35 +540,78 @@ impl ToolRegistry {
     ) -> Result<ToolCallResult> {
         let thread_id = thread_context.locator.thread_id.clone();
         let context = ToolCallContext::for_thread(thread_id.clone());
-        match request.name.as_str() {
+        let tool_name = request.name.clone();
+        let started_at = Instant::now();
+        let loaded_toolset_count = thread_context.load_toolsets().len();
+        let argument_field_count = request
+            .arguments
+            .as_object()
+            .map(|arguments| arguments.len())
+            .unwrap_or_default();
+        debug!(
+            thread_id = %thread_id,
+            tool_name = %tool_name,
+            loaded_toolset_count,
+            argument_field_count,
+            "starting thread tool action"
+        );
+        let result = match request.name.as_str() {
             "compact" => bail!("tool `compact` must be handled by the agent loop compact runtime"),
             "load_toolset" => self.load_toolset(thread_context, request).await,
             "unload_toolset" => self.unload_toolset(thread_context, request).await,
             _ => {
-                if let Some(handler) = self
+                let mut resolved_handler = self
                     .always_visible_handlers
                     .read()
                     .await
                     .get(&request.name)
-                    .cloned()
-                {
-                    return handler.call_with_context(context.clone(), request).await;
-                }
+                    .cloned();
 
-                for toolset_name in thread_context.load_toolsets() {
-                    let handlers = self.resolve_toolset_handlers(&toolset_name).await?;
-                    if let Some(handler) = handlers.get(&request.name).cloned() {
-                        return handler.call_with_context(context.clone(), request).await;
+                if resolved_handler.is_none() {
+                    for toolset_name in thread_context.load_toolsets() {
+                        let handlers = self.resolve_toolset_handlers(&toolset_name).await?;
+                        if let Some(handler) = handlers.get(&request.name).cloned() {
+                            resolved_handler = Some(handler);
+                            break;
+                        }
                     }
                 }
 
-                bail!(
-                    "tool `{}` is not registered for thread `{}`",
-                    request.name,
-                    thread_id
-                )
+                let Some(handler) = resolved_handler else {
+                    bail!(
+                        "tool `{}` is not registered for thread `{}`",
+                        request.name,
+                        thread_id
+                    )
+                };
+                handler.call_with_context(context.clone(), request).await
             }
+        };
+        match &result {
+            Ok(tool_result) => debug!(
+                thread_id = %thread_id,
+                tool_name = %tool_name,
+                loaded_toolset_count,
+                argument_field_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                is_error = tool_result.is_error,
+                event_kind = ?tool_result
+                    .metadata
+                    .get("event_kind")
+                    .and_then(|value| value.as_str()),
+                "completed thread tool action"
+            ),
+            Err(error) => debug!(
+                thread_id = %thread_id,
+                tool_name = %tool_name,
+                loaded_toolset_count,
+                argument_field_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "thread tool action failed"
+            ),
         }
+        result
     }
 
     /// Open one optional tool entry for the current thread.

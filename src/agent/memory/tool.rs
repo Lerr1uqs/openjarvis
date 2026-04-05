@@ -91,12 +91,18 @@ struct MemorySearchArguments {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(
+    description = "Write one memory markdown document. Defaults to `passive`. For `active`, `keywords` must be explicit, highly specific names directly provided by the user. Do not invent broad synonyms, preferences, traits, or related concepts. If the user did not explicitly provide suitable active keywords, ask first instead of calling this tool."
+)]
 struct MemoryWriteArguments {
     path: String,
     title: String,
     content: String,
     #[serde(rename = "type")]
     memory_type: Option<MemoryType>,
+    #[schemars(
+        description = "Only used for `active` memory. Must contain explicit, highly specific names directly provided by the user, such as an exact person, org, project, repo, or product name. Do not invent extra keywords, broad aliases, traits, or inferred concepts. If the user did not explicitly provide such names, ask first instead of writing active memory."
+    )]
     keywords: Option<Vec<String>>,
 }
 
@@ -189,7 +195,7 @@ impl ToolHandler for MemoryWriteTool {
     fn definition(&self) -> ToolDefinition {
         tool_definition_from_args::<MemoryWriteArguments>(
             "memory_write",
-            "Write one memory markdown document. Defaults to `passive`; `active` writes must include non-empty `keywords`.",
+            "Write one memory markdown document. Defaults to `passive`; `active` writes must include non-empty `keywords`, and those keywords must be explicit, highly specific names directly provided by the user. Do not invent extra keywords; if the user did not specify them, ask first.",
         )
     }
 
