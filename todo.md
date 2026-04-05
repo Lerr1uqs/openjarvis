@@ -21,6 +21,7 @@
 - [ ] mcp server as toolset?
 - [ ] 及时的阻断命令
 - [ ] 返回给用户图片
+- [x] 主动记忆的keyword必须是非常专用的名字 不能瞎生成 比如JJJ喜欢xxx 会生成三个keyword 用户没说明的情况下需要先询问
 codex resume 019d511c-18c5-70a1-9636-87c66f63bbb5
 
 # clean
