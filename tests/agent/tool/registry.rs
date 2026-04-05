@@ -49,7 +49,18 @@ async fn builtin_tools_can_be_registered_together() {
         .collect::<Vec<_>>();
     names.sort();
 
-    assert_eq!(names, vec!["bash", "edit", "read", "write"]);
+    assert_eq!(
+        names,
+        vec![
+            "bash",
+            "edit",
+            "exec_command",
+            "list_unread_command_tasks",
+            "read",
+            "write",
+            "write_stdin",
+        ]
+    );
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 mod browser;
+mod command;
 mod edit;
 pub(crate) mod mcp;
 mod read;

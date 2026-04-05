@@ -26,6 +26,7 @@ tracing = "0.1.41"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4", "v5"] }
+portable-pty = "0.9.0"
 
 [[bin]]
 name = "llm_test"
@@ -42,3 +43,7 @@ path = "scripts/tool_schema_dump.rs"
 [[bin]]
 name = "skill_frontmatter_dump"
 path = "scripts/skill_frontmatter_dump.rs"
+
+[[bin]]
+name = "command_session_manual"
+path = "scripts/command_session_manual.rs"

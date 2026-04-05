@@ -3,6 +3,7 @@
 use crate::agent::memory::{MemoryRepository, register_memory_toolset};
 use crate::skill::{default_skill_roots, default_skill_roots_for_workspace};
 pub mod browser;
+pub mod command;
 pub mod edit;
 pub mod mcp;
 pub mod read;
@@ -23,6 +24,11 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+pub use command::{
+    CommandExecutionRequest, CommandExecutionResult, CommandSessionManager, CommandTaskSnapshot,
+    CommandTaskStatus, CommandWriteRequest, ExecCommandTool, ListUnreadCommandTasksTool,
+    WriteStdinTool,
+};
 pub use edit::EditTool;
 pub use mcp::{
     McpServerDefinition, McpServerSnapshot, McpServerState, McpToolSnapshot, McpTransport,
@@ -204,6 +210,7 @@ pub struct ToolRegistry {
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
     memory_repository: Arc<MemoryRepository>,
+    command_sessions: Arc<CommandSessionManager>,
 }
 
 pub fn tool_definition_from_args<T>(
@@ -299,6 +306,7 @@ impl ToolRegistry {
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
             memory_repository: Arc::new(MemoryRepository::new(workspace_root.into())),
+            command_sessions: Arc::new(CommandSessionManager::new()),
         }
     }
 
@@ -413,11 +421,26 @@ impl ToolRegistry {
     }
 
     pub async fn register_builtin_tools(&self) -> Result<()> {
-        // Register the current built-in four-tool set.
+        // Register the current built-in tool set, including thread-scoped command sessions.
         self.register_if_missing(Arc::new(ReadTool::new())).await;
         self.register_if_missing(Arc::new(WriteTool::new())).await;
         self.register_if_missing(Arc::new(EditTool::new())).await;
-        self.register_if_missing(Arc::new(ShellTool::new())).await;
+        self.register_if_missing(Arc::new(ExecCommandTool::with_sessions(Arc::clone(
+            &self.command_sessions,
+        ))))
+        .await;
+        self.register_if_missing(Arc::new(WriteStdinTool::with_sessions(Arc::clone(
+            &self.command_sessions,
+        ))))
+        .await;
+        self.register_if_missing(Arc::new(ListUnreadCommandTasksTool::with_sessions(
+            Arc::clone(&self.command_sessions),
+        )))
+        .await;
+        self.register_if_missing(Arc::new(ShellTool::with_sessions(Arc::clone(
+            &self.command_sessions,
+        ))))
+        .await;
         if !self.toolset_registered("browser").await {
             browser::register_browser_toolset(self).await?;
         }
@@ -749,6 +772,19 @@ impl ToolRegistry {
     /// ```
     pub fn memory_repository(&self) -> Arc<MemoryRepository> {
         Arc::clone(&self.memory_repository)
+    }
+
+    /// Return the shared command session manager used by builtin command tools.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::ToolRegistry;
+    ///
+    /// let registry = ToolRegistry::new();
+    /// assert!(registry.command_session_manager().export_task_snapshots_blocking().is_empty());
+    /// ```
+    pub fn command_session_manager(&self) -> Arc<CommandSessionManager> {
+        Arc::clone(&self.command_sessions)
     }
 
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {

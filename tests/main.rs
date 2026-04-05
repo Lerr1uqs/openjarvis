@@ -6,8 +6,9 @@ use openjarvis::{
 use std::{
     env::temp_dir,
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use uuid::Uuid;
 
@@ -223,6 +224,55 @@ fn internal_browser_helper_runs_before_app_config_load_and_reports_spawn_errors(
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to spawn browser sidecar executable"));
+}
+
+#[test]
+fn command_session_manual_bin_prints_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_command_session_manual"))
+        .arg("--help")
+        .output()
+        .expect("command_session_manual binary should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("command_session_manual"));
+    assert!(stdout.contains("write_stdin"));
+}
+
+#[test]
+fn command_session_manual_bin_can_poll_once_and_exit_cleanly() {
+    // 测试场景: 手工验收二进制可以真实启动命令会话，完成一次空写轮询后正常退出。
+    let mut child = Command::new(env!("CARGO_BIN_EXE_command_session_manual"))
+        .arg("--exec-yield-time-ms")
+        .arg("50")
+        .arg("--poll-yield-time-ms")
+        .arg("600")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("command_session_manual binary should spawn");
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .expect("command_session_manual stdin should be piped");
+        stdin
+            .write_all(b"x\nq\n")
+            .expect("command_session_manual stdin should accept scripted input");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("command_session_manual binary should exit");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("=== exec_command ==="));
+    assert!(stdout.contains("=== write_stdin ==="));
+    assert!(stdout.contains("manual-poll>"));
+    assert!(stdout.contains("Process running with session ID"));
 }
 
 #[test]

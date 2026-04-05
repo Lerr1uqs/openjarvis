@@ -23,6 +23,8 @@
   渐进式工具集模型。
 - `tool/browser.md`
   浏览器工具集模型。
+- `tool/command-session-manual.md`
+  命令会话手工验收入口。
 - `tool/mcp.md`
   MCP 工具托管模型。
 - `tool/skill.md`

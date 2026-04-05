@@ -40,5 +40,6 @@
 
 - `tool/toolset.md`
 - `tool/browser.md`
+- `tool/command-session-manual.md`
 - `tool/mcp.md`
 - `tool/skill.md`
