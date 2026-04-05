@@ -7,6 +7,8 @@
 - [ ] session/turn/thread移动到一个模块中
 - [ ] 目前turn是全量的 后续需要改成增量吗？
 - [ ] 全面异步落盘的日志库
+- [ ] [openjarvis][tool_call] write 返回内容太多了 需要做truncate
+- [ ] jarvis还在处理的时候用户发消息 接收到用户消息了才应该react
 - [ ] /? 列出全部Commands
 - [ ] command 能够解析用户输入转换为格式化的schema从而进行execute
 - [ ] tiktoken + 占用图
