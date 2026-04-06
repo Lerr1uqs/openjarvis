@@ -2,14 +2,19 @@
 
 use crate::channels::{Channel, ChannelRegistration};
 use crate::config::FeishuConfig;
-use crate::model::{IncomingMessage, OutgoingMessage, ReplyTarget};
+use crate::model::{
+    IncomingMessage, OutgoingAttachment, OutgoingAttachmentKind, OutgoingMessage, ReplyTarget,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use reqwest::Client;
+use reqwest::{
+    Client,
+    multipart::{Form, Part},
+};
 use serde::Deserialize;
-use serde_json::json;
-use std::{path::Path, process::Stdio, sync::Arc, time::Instant};
+use serde_json::{Value, json};
+use std::{fs, path::Path, process::Stdio, sync::Arc, time::Instant};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -266,7 +271,23 @@ impl FeishuChannel {
             }
         }
 
-        self.send_text_message(&message).await
+        if !message.content.trim().is_empty() {
+            self.send_text_message(&message).await?;
+        }
+
+        for attachment in &message.attachments {
+            self.send_attachment(&message, attachment).await?;
+        }
+
+        if message.content.trim().is_empty() && message.attachments.is_empty() {
+            info!(
+                message_id = %message.id,
+                receive_id = message.target.receive_id,
+                "feishu outgoing message skipped because text and attachments are empty"
+            );
+        }
+
+        Ok(())
     }
 
     async fn send_text_message(&self, message: &OutgoingMessage) -> Result<()> {
@@ -280,22 +301,62 @@ impl FeishuChannel {
             return Ok(());
         }
 
-        if self.config.app_id.trim().is_empty() || self.config.app_secret.trim().is_empty() {
-            bail!("feishu app_id/app_secret are required when feishu.dry_run=false");
+        self.ensure_delivery_credentials()?;
+        self.send_message_payload(message, "text", json!({ "text": message.content }))
+            .await
+    }
+
+    async fn send_attachment(
+        &self,
+        message: &OutgoingMessage,
+        attachment: &OutgoingAttachment,
+    ) -> Result<()> {
+        match attachment.kind {
+            OutgoingAttachmentKind::Image => self.send_image_attachment(message, attachment).await,
+        }
+    }
+
+    async fn send_image_attachment(
+        &self,
+        message: &OutgoingMessage,
+        attachment: &OutgoingAttachment,
+    ) -> Result<()> {
+        if self.config.dry_run {
+            info!(
+                message_id = %message.id,
+                receive_id = message.target.receive_id,
+                path = attachment.path,
+                "feishu dry_run enabled, outgoing image skipped"
+            );
+            return Ok(());
         }
 
+        self.ensure_delivery_credentials()?;
+        let image_key = self.upload_image_attachment(attachment).await?;
+        self.send_message_payload(message, "image", json!({ "image_key": image_key }))
+            .await
+    }
+
+    async fn send_message_payload(
+        &self,
+        message: &OutgoingMessage,
+        msg_type: &str,
+        content: Value,
+    ) -> Result<()> {
         let access_token = self.get_tenant_access_token().await?;
         let endpoint = format!(
             "{}/open-apis/im/v1/messages",
             self.config.open_base_url.trim_end_matches('/')
         );
         let started_at = Instant::now();
+        let delivery_uuid = Uuid::new_v4();
         debug!(
             endpoint = %endpoint,
             message_id = %message.id,
+            delivery_uuid = %delivery_uuid,
             receive_id = %message.target.receive_id,
             receive_id_type = %message.target.receive_id_type,
-            content_len = message.content.len(),
+            msg_type,
             "starting feishu send-message request"
         );
         let response = self
@@ -305,9 +366,9 @@ impl FeishuChannel {
             .query(&[("receive_id_type", message.target.receive_id_type.clone())])
             .json(&json!({
                 "receive_id": message.target.receive_id,
-                "msg_type": "text",
-                "content": json!({ "text": message.content }).to_string(),
-                "uuid": message.id.to_string(),
+                "msg_type": msg_type,
+                "content": content.to_string(),
+                "uuid": delivery_uuid.to_string(),
             }))
             .send()
             .await
@@ -320,7 +381,9 @@ impl FeishuChannel {
             .context("failed to read feishu send-message response")?;
         debug!(
             message_id = %message.id,
+            delivery_uuid = %delivery_uuid,
             receive_id = %message.target.receive_id,
+            msg_type,
             status = %status,
             elapsed_ms = started_at.elapsed().as_millis() as u64,
             body_len = body.len(),
@@ -341,6 +404,77 @@ impl FeishuChannel {
         }
 
         Ok(())
+    }
+
+    async fn upload_image_attachment(&self, attachment: &OutgoingAttachment) -> Result<String> {
+        let image_bytes = fs::read(&attachment.path)
+            .with_context(|| format!("failed to read outgoing image {}", attachment.path))?;
+        let file_name = Path::new(&attachment.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("openjarvis-image");
+        let endpoint = format!(
+            "{}/open-apis/im/v1/images",
+            self.config.open_base_url.trim_end_matches('/')
+        );
+        let image_part = Part::bytes(image_bytes).file_name(file_name.to_string());
+        let image_part = if let Some(mime_type) = resolve_image_mime_type(attachment) {
+            image_part
+                .mime_str(&mime_type)
+                .context("failed to build feishu image upload multipart body")?
+        } else {
+            image_part
+        };
+        let form = Form::new()
+            .text("image_type", "message")
+            .part("image", image_part);
+        let access_token = self.get_tenant_access_token().await?;
+        let started_at = Instant::now();
+        debug!(
+            endpoint = %endpoint,
+            path = attachment.path,
+            "starting feishu image upload request"
+        );
+        let response = self
+            .http_client
+            .post(endpoint)
+            .bearer_auth(access_token)
+            .multipart(form)
+            .send()
+            .await
+            .context("failed to upload feishu image")?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read feishu image upload response")?;
+        debug!(
+            path = attachment.path,
+            status = %status,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            body_len = body.len(),
+            "completed feishu image upload request"
+        );
+        if !status.is_success() {
+            bail!("feishu image upload request failed with status {status}: {body}");
+        }
+
+        let payload: FeishuImageUploadResponse =
+            serde_json::from_str(&body).context("failed to decode feishu image upload response")?;
+        if payload.code != 0 {
+            bail!(
+                "feishu image upload returned code {} with message {}",
+                payload.code,
+                payload.msg
+            );
+        }
+
+        payload
+            .data
+            .map(|data| data.image_key)
+            .filter(|image_key| !image_key.trim().is_empty())
+            .context("feishu image upload response did not contain image_key")
     }
 
     async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<()> {
@@ -490,6 +624,14 @@ impl FeishuChannel {
 
         Ok(payload.tenant_access_token)
     }
+
+    fn ensure_delivery_credentials(&self) -> Result<()> {
+        if self.config.app_id.trim().is_empty() || self.config.app_secret.trim().is_empty() {
+            bail!("feishu app_id/app_secret are required when feishu.dry_run=false");
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -557,7 +699,39 @@ struct FeishuSendResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct FeishuImageUploadResponse {
+    code: i32,
+    msg: String,
+    data: Option<FeishuImageUploadResponseData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuImageUploadResponseData {
+    image_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct FeishuBaseResponse {
     code: i32,
     msg: String,
+}
+
+fn resolve_image_mime_type(attachment: &OutgoingAttachment) -> Option<String> {
+    if let Some(mime_type) = attachment.mime_type.as_ref() {
+        return Some(mime_type.clone());
+    }
+
+    match Path::new(&attachment.path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png".to_string()),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg".to_string()),
+        Some("gif") => Some("image/gif".to_string()),
+        Some("webp") => Some("image/webp".to_string()),
+        Some("bmp") => Some("image/bmp".to_string()),
+        _ => None,
+    }
 }

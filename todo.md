@@ -7,7 +7,7 @@
 - [ ] session/turn/thread移动到一个模块中
 - [ ] 目前turn是全量的 后续需要改成增量吗？
 - [ ] 全面异步落盘的日志库
-- [ ] context子命令
+- [x] context子命令
 - [ ] 当前一个turn没走完 tool_call都没办法传出来
 - [ ] [openjarvis][tool_call] write 返回内容太多了 需要做truncate
 ```
@@ -28,7 +28,7 @@
 - [ ] 需要有一个thread级别的全局状态来管理auto-compact 这种feature的开放 另外这个可以被Command打开 /auto-compact enable
 - [ ] 飞书不是先react再回复的
 - [ ] 压缩上下文的prompt注入
-- [ ] 如何发送image
+- [x] 如何发送image
 - [ ] 旧的 CompactRuntimeManager 兼容缓存 取出
 - [ ] /clear 会把该线程的 ChatMessages、tool events、loaded toolsets、/auto-compact 等线程级状态 ??? events是什么？
 - [ ] mcp server as toolset?
@@ -36,6 +36,33 @@
 - [ ] 返回给用户图片
 - [x] 主动记忆的keyword必须是非常专用的名字 不能瞎生成 比如JJJ喜欢xxx 会生成三个keyword 用户没说明的情况下需要先询问
 codex resume 019d511c-18c5-70a1-9636-87c66f63bbb5
+- [ ] 疯狂调用相同的toolcall 如何反制？agent_loop 增加重复 toolcall guard
+```
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+[openjarvis][tool_result] Navigated to https://passport.bilibili.com/login.
+[openjarvis][tool_call] browser__navigate {"url":"https://passport.bilibili.com/login"}
+
+```
+- [ ] 莫名其妙的之前的message还会注入进来？飞书机制？
+```
+```json
+asdsa
+```
+```
 
 # learn
 - [ ] sidecar

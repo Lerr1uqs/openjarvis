@@ -6,6 +6,9 @@ use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentLoopEventKind, AgentRequest, AgentRuntime, AgentWorker,
         AgentWorkerEvent, AgentWorkerHandle, CompletedAgentCommit, FailedAgentCommit,
+        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
+        agent_loop::{TOOL_EVENT_PREVIEW_MAX_CHARS, truncate_tool_message},
+        empty_tool_input_schema,
     },
     channels::{Channel, ChannelRegistration},
     cli::OpenJarvisCli,
@@ -49,10 +52,32 @@ struct SequenceProvider {
     responses: Arc<Mutex<Vec<LLMResponse>>>,
 }
 
+struct LongResultTool;
+
 #[async_trait]
 impl LLMProvider for SequenceProvider {
     async fn generate(&self, _request: LLMRequest) -> Result<LLMResponse> {
         Ok(self.responses.lock().await.remove(0))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for LongResultTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__long_echo".to_string(),
+            description: "Long tool result for router truncation tests".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "R".repeat(128),
+            metadata: json!({}),
+            is_error: false,
+        })
     }
 }
 
@@ -193,6 +218,285 @@ async fn router_ignores_duplicate_messages() {
         "default"
     );
     assert_eq!(recorded[0].reply_to_message_id.as_deref(), Some("msg_1"));
+    assert!(recorded[0].attachments.is_empty());
+}
+
+#[tokio::test]
+async fn router_parses_attachment_syntax_before_channel_dispatch() {
+    let agent = AgentWorker::builder()
+        .llm(Arc::new(MockLLMProvider::new(
+            "这是生成的图片\n#!openjarvis[image:/tmp/router-image.png]",
+        )))
+        .system_prompt("system")
+        .build()
+        .expect("worker should build");
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .clone()
+        .expect("channel sender should be captured");
+
+    let driver = async {
+        channel_tx
+            .send(build_incoming())
+            .await
+            .expect("incoming message should be sent");
+
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outgoing message should be recorded");
+
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+
+    let recorded = sent.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].content,
+        "这是生成的图片\n#!openjarvis[image:/tmp/router-image.png]"
+    );
+    assert_eq!(recorded[0].attachments.len(), 1);
+    assert_eq!(recorded[0].attachments[0].path, "/tmp/router-image.png");
+}
+
+#[tokio::test]
+async fn router_preserves_full_outgoing_text_before_channel_dispatch() {
+    // 测试场景: 普通 assistant 回复发给 channel 时必须保持原文，router 不能截断正常文本回复。
+    let agent = AgentWorker::builder()
+        .llm(Arc::new(MockLLMProvider::new("unused")))
+        .system_prompt("system")
+        .build()
+        .expect("worker should build");
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    router
+        .dispatch_outgoing(OutgoingMessage {
+            id: Uuid::new_v4(),
+            channel: "feishu".to_string(),
+            content: "A".repeat(5_000),
+            external_thread_id: Some("thread_truncate".to_string()),
+            metadata: json!({
+                "event_kind": "TextOutput",
+                "summary": "B".repeat(5_000),
+                "nested": {
+                    "items": [
+                        "C".repeat(5_000)
+                    ]
+                }
+            }),
+            reply_to_message_id: Some("msg_truncate".to_string()),
+            attachments: Vec::new(),
+            target: ReplyTarget {
+                receive_id: "oc_truncate".to_string(),
+                receive_id_type: "chat_id".to_string(),
+            },
+        })
+        .await
+        .expect("router should dispatch outgoing message");
+
+    timeout(Duration::from_millis(500), async {
+        loop {
+            if sent.lock().await.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("outgoing message should be recorded");
+
+    let recorded = sent.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].content, "A".repeat(5_000));
+    assert_eq!(
+        recorded[0].metadata["summary"]
+            .as_str()
+            .expect("summary should remain a string")
+            .chars()
+            .count(),
+        5_000
+    );
+    assert!(
+        !recorded[0].metadata["summary"]
+            .as_str()
+            .expect("summary should remain a string")
+            .contains("...(truncated, total_chars=5000)")
+    );
+    assert_eq!(
+        recorded[0].metadata["nested"]["items"][0]
+            .as_str()
+            .expect("nested item should remain a string")
+            .chars()
+            .count(),
+        5_000
+    );
+    assert_eq!(
+        recorded[0].reply_to_message_id.as_deref(),
+        Some("msg_truncate")
+    );
+}
+
+#[tokio::test]
+async fn router_delivers_truncated_tool_events_but_full_final_reply() {
+    // 测试场景: 真实 agent loop 产生的 tool_call/tool_result 事件发给 channel 时应被截断，但最终 assistant 回复必须保留全量。
+    let runtime = AgentRuntime::new();
+    runtime
+        .tools()
+        .register(Arc::new(LongResultTool))
+        .await
+        .expect("long result tool should register");
+    let long_arguments = json!({
+        "path": "X".repeat(128),
+    });
+    let agent = AgentWorker::with_runtime(
+        Arc::new(SequenceProvider {
+            responses: Arc::new(Mutex::new(vec![
+                LLMResponse {
+                    message: Some(ChatMessage::new(
+                        ChatMessageRole::Assistant,
+                        "开始执行",
+                        Utc::now(),
+                    )),
+                    tool_calls: vec![openjarvis::llm::LLMToolCall {
+                        id: "call_router_long_1".to_string(),
+                        name: "demo__long_echo".to_string(),
+                        arguments: long_arguments.clone(),
+                    }],
+                },
+                LLMResponse {
+                    message: Some(ChatMessage::new(
+                        ChatMessageRole::Assistant,
+                        "done",
+                        Utc::now(),
+                    )),
+                    tool_calls: Vec::new(),
+                },
+            ])),
+        }),
+        "system",
+        runtime,
+    );
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let mut router = ChannelRouter::builder()
+        .agent(agent)
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let channel_tx = incoming_tx
+        .lock()
+        .await
+        .clone()
+        .expect("channel sender should be captured");
+
+    let driver = async {
+        channel_tx
+            .send(build_incoming())
+            .await
+            .expect("incoming message should be sent");
+
+        timeout(Duration::from_millis(800), async {
+            loop {
+                if sent.lock().await.len() == 4 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tool events and final reply should be recorded");
+
+        shutdown_tx
+            .send(())
+            .expect("test shutdown should be delivered");
+        Ok::<(), anyhow::Error>(())
+    };
+    let (router_result, driver_result) = tokio::join!(
+        router.run_until_shutdown(wait_for_test_shutdown(shutdown_rx)),
+        driver
+    );
+    driver_result.expect("driver task should complete");
+    router_result.expect("router loop should exit cleanly");
+
+    let recorded = sent.lock().await;
+    assert_eq!(recorded.len(), 4);
+    assert_eq!(recorded[0].content, "开始执行");
+    assert_eq!(recorded[0].metadata["event_kind"], "TextOutput");
+    assert_eq!(
+        recorded[1].content,
+        format!(
+            "[openjarvis][tool_call] demo__long_echo {}",
+            truncate_tool_message(&long_arguments.to_string(), TOOL_EVENT_PREVIEW_MAX_CHARS)
+        )
+    );
+    assert_eq!(recorded[1].metadata["event_kind"], "ToolCall");
+    assert_eq!(
+        recorded[2].content,
+        format!(
+            "[openjarvis][tool_result] {}",
+            truncate_tool_message(&"R".repeat(128), TOOL_EVENT_PREVIEW_MAX_CHARS)
+        )
+    );
+    assert_eq!(recorded[2].metadata["event_kind"], "ToolResult");
+    assert_eq!(recorded[3].content, "done");
+    assert_eq!(recorded[3].metadata["event_kind"], "TextOutput");
 }
 
 #[test]

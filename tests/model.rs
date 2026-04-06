@@ -1,5 +1,8 @@
 use chrono::Utc;
-use openjarvis::model::{IncomingAttachment, IncomingMessage, OutgoingMessage, ReplyTarget};
+use openjarvis::model::{
+    IncomingAttachment, IncomingMessage, OutgoingAttachment, OutgoingAttachmentKind,
+    OutgoingMessage, ReplyTarget,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -33,6 +36,11 @@ fn message_models_roundtrip_with_serde() {
         external_thread_id: Some("thread_1".to_string()),
         metadata: json!({ "kind": "reply" }),
         reply_to_message_id: Some("msg_1".to_string()),
+        attachments: vec![OutgoingAttachment {
+            kind: OutgoingAttachmentKind::Image,
+            path: "/tmp/demo.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+        }],
         target: ReplyTarget {
             receive_id: "oc_xxx".to_string(),
             receive_id_type: "chat_id".to_string(),
@@ -51,6 +59,11 @@ fn message_models_roundtrip_with_serde() {
     assert_eq!(decoded_incoming.attachments.len(), 1);
     assert_eq!(decoded_incoming.resolved_thread_id(), "thread_1");
     assert_eq!(decoded_outgoing.content, "reply");
+    assert_eq!(decoded_outgoing.attachments.len(), 1);
+    assert_eq!(
+        decoded_outgoing.attachments[0].kind,
+        OutgoingAttachmentKind::Image
+    );
     assert_eq!(
         decoded_outgoing.reply_to_message_id.as_deref(),
         Some("msg_1")

@@ -442,6 +442,8 @@ llm:
 #[test]
 fn default_assistant_system_prompt_is_not_empty() {
     assert!(!DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim().is_empty());
+    assert!(DEFAULT_ASSISTANT_SYSTEM_PROMPT.contains("#!openjarvis[image:"));
+    assert!(DEFAULT_ASSISTANT_SYSTEM_PROMPT.contains("绝对路径"));
 }
 
 #[test]

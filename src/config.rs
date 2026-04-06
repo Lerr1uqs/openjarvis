@@ -11,7 +11,7 @@ use std::{
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。";
+pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。当你需要回复图片时，必须在回复中使用 `#!openjarvis[image:/绝对路径/图片.png]` 语法传递图片绝对路径，可以与普通文本同时输出；不要改写该语法，不要输出相对路径，也不要解释这个协议本身。";
 pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
 const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 8_192;

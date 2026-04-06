@@ -81,7 +81,10 @@ async fn browser_toolset_exposes_thread_loaded_tools_and_runs_mock_actions() {
     .await
     .expect("screenshot should succeed");
 
+    // Bug regression: navigate 结果必须直接返回轻量 snapshot，避免模型在没有页面观察结果时重复 navigate。
     assert!(navigate.content.contains("example.com"));
+    assert!(navigate.content.contains("Current page snapshot:"));
+    assert!(navigate.content.contains("[1]"));
     assert!(snapshot.content.contains("[1]"));
     assert!(PathBuf::from(&screenshot.content).exists());
 }

@@ -4,7 +4,11 @@ use chrono::Utc;
 use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime,
-        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, empty_tool_input_schema,
+        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
+        agent_loop::{
+            TOOL_EVENT_PREVIEW_MAX_CHARS, truncate_tool_log_preview, truncate_tool_message,
+        },
+        empty_tool_input_schema,
     },
     config::{AgentCompactConfig, LLMConfig},
     context::{ChatMessage, ChatMessageRole},
@@ -42,6 +46,8 @@ impl LLMProvider for ScriptedLLMProvider {
 
 struct EchoTool;
 
+struct LongResultTool;
+
 #[async_trait]
 impl ToolHandler for EchoTool {
     fn definition(&self) -> ToolDefinition {
@@ -56,6 +62,26 @@ impl ToolHandler for EchoTool {
     async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
         Ok(ToolCallResult {
             content: "echo-result".to_string(),
+            metadata: json!({}),
+            is_error: false,
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for LongResultTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__long_echo".to_string(),
+            description: "Long tool result for event truncation tests".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "R".repeat(128),
             metadata: json!({}),
             is_error: false,
         })
@@ -209,6 +235,107 @@ async fn run_v1_executes_tool_calls_and_records_tool_events() {
         output.tool_events[0].tool_name.as_deref(),
         Some("demo__echo")
     );
+}
+
+#[tokio::test]
+async fn run_v1_truncates_tool_event_content_but_keeps_full_tool_result_history() {
+    // 测试场景: tool_call/tool_result 发给 router 的事件内容必须截断，但写入历史供模型继续推理的 tool result 必须保留完整内容。
+    let runtime = AgentRuntime::new();
+    runtime
+        .tools()
+        .register(Arc::new(LongResultTool))
+        .await
+        .expect("long result tool should register");
+    let long_arguments = json!({
+        "path": "X".repeat(128),
+    });
+    let provider = ScriptedLLMProvider::new(vec![
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "开始执行",
+                Utc::now(),
+            )),
+            tool_calls: vec![LLMToolCall {
+                id: "call_long_1".to_string(),
+                name: "demo__long_echo".to_string(),
+                arguments: long_arguments.clone(),
+            }],
+        },
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "done",
+                Utc::now(),
+            )),
+            tool_calls: Vec::new(),
+        },
+    ]);
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(provider),
+        runtime,
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+    );
+    let thread_context = build_thread("thread_loop_tool_truncate");
+    let incoming = build_incoming("run tool", "thread_loop_tool_truncate");
+    let (event_tx, mut event_rx) = build_event_sender(&incoming, &thread_context);
+
+    let output = loop_runner
+        .run_v1(event_tx, &incoming, thread_context)
+        .await
+        .expect("loop should succeed");
+
+    let mut events = Vec::new();
+    while let Ok(event) =
+        tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv()).await
+    {
+        let Some(event) = event else {
+            break;
+        };
+        events.push(event);
+    }
+
+    let tool_call_event = events
+        .iter()
+        .find(|event| event.kind == AgentLoopEventKind::ToolCall)
+        .expect("tool_call event should be emitted");
+    let tool_result_event = events
+        .iter()
+        .find(|event| event.kind == AgentLoopEventKind::ToolResult)
+        .expect("tool_result event should be emitted");
+
+    assert_eq!(
+        tool_call_event.content,
+        format!(
+            "[openjarvis][tool_call] demo__long_echo {}",
+            truncate_tool_message(&long_arguments.to_string(), TOOL_EVENT_PREVIEW_MAX_CHARS)
+        )
+    );
+    assert_eq!(
+        tool_result_event.content,
+        format!(
+            "[openjarvis][tool_result] {}",
+            truncate_tool_message(&"R".repeat(128), TOOL_EVENT_PREVIEW_MAX_CHARS)
+        )
+    );
+    assert_eq!(output.commit_messages.len(), 3);
+    assert_eq!(
+        output.commit_messages[1].tool_call_id.as_deref(),
+        Some("call_long_1")
+    );
+    assert_eq!(output.commit_messages[1].content, "R".repeat(128));
+    assert_eq!(output.reply, "done");
+}
+
+#[test]
+fn tool_log_preview_truncates_long_content() {
+    // 测试场景: tool 日志预览必须对超长内容进行截断，避免 arguments/result 把日志撑爆。
+    let preview = truncate_tool_log_preview(&"A".repeat(700), 32);
+
+    assert!(preview.starts_with("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    assert!(preview.contains("...(truncated, total_chars=700)"));
+    assert!(preview.len() < 100);
 }
 
 #[tokio::test]

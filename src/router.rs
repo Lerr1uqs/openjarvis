@@ -4,6 +4,7 @@ use crate::agent::{
     AgentDispatchEvent, AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle,
     CompletedAgentCommit, FailedAgentCommit,
 };
+use crate::attachment_syntax::AttachmentSyntaxParser;
 use crate::channels::feishu::FeishuChannel;
 use crate::channels::{Channel, ChannelRegistration};
 use crate::command::{CommandRegistry, CommandReply};
@@ -492,6 +493,7 @@ impl ChannelRouter {
             } else {
                 None
             },
+            attachments: Vec::new(),
             target: event.target,
         };
         self.dispatch_outgoing(outgoing).await
@@ -523,6 +525,7 @@ impl ChannelRouter {
                 "command_status": if reply.is_success() { "SUCCESS" } else { "FAILED" },
             }),
             reply_to_message_id: incoming.external_message_id.clone(),
+            attachments: Vec::new(),
             target: incoming.reply_target.clone(),
         })
         .await
@@ -530,13 +533,15 @@ impl ChannelRouter {
 
     /// Dispatch one outbound message to the matching registered channel.
     pub async fn dispatch_outgoing(&self, message: OutgoingMessage) -> Result<()> {
+        let message = AttachmentSyntaxParser::parse_message(message);
         let channel_name = message.channel.clone();
         let Some(channel_tx) = self.channels.get(&channel_name) else {
             bail!("no registered channel found for `{channel_name}`");
         };
-
         debug!(
-            channel = channel_name,
+            channel = %channel_name,
+            message_id = %message.id,
+            attachment_count = message.attachments.len(),
             "router dispatching outgoing message"
         );
         channel_tx
@@ -588,6 +593,7 @@ impl ChannelRouter {
                 "session_thread_id": commit.locator.thread_id.to_string(),
             }),
             reply_to_message_id: commit.incoming.external_message_id.clone(),
+            attachments: Vec::new(),
             target: commit.incoming.reply_target.clone(),
         })
         .await?;

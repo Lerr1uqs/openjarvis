@@ -365,7 +365,7 @@ impl ToolHandler for BrowserNavigateTool {
     fn definition(&self) -> ToolDefinition {
         tool_definition_from_args::<BrowserNavigateArguments>(
             "browser__navigate",
-            "Open one URL inside the current thread-scoped browser session.",
+            "Open one URL inside the current thread-scoped browser session and return a lightweight snapshot for the next action.",
         )
     }
 
@@ -381,7 +381,14 @@ impl ToolHandler for BrowserNavigateTool {
         let thread_id = self.base.require_thread_id(&context, "browser__navigate")?;
         let args: BrowserNavigateArguments = parse_tool_arguments(request, "browser__navigate")?;
         let result = self.base.sessions.navigate(thread_id, &args.url).await?;
-        Ok(render_navigate_result(result))
+        // Bug fix: include an immediate page snapshot after navigation so the model can observe
+        // refs and page structure instead of repeatedly navigating to the same URL.
+        let snapshot = self
+            .base
+            .sessions
+            .snapshot(thread_id, Some(NAVIGATE_SNAPSHOT_MAX_ELEMENTS))
+            .await?;
+        Ok(render_navigate_result(result, snapshot))
     }
 }
 
@@ -610,13 +617,27 @@ impl ToolHandler for BrowserCloseTool {
     }
 }
 
-fn render_navigate_result(result: BrowserNavigateResult) -> ToolCallResult {
+fn render_navigate_result(
+    result: BrowserNavigateResult,
+    snapshot: BrowserSnapshotResult,
+) -> ToolCallResult {
     ToolCallResult {
-        content: format!("Navigated to {}.", result.url),
+        content: format!(
+            "Navigated to {}.\nCurrent page snapshot:\n{}",
+            result.url, snapshot.snapshot_text
+        ),
         metadata: json!({
             "toolset": "browser",
             "url": result.url,
             "title": result.title,
+            "snapshot": {
+                "url": snapshot.url,
+                "title": snapshot.title,
+                "elements": snapshot.elements,
+                "element_count": snapshot.elements.len(),
+                "total_candidate_count": snapshot.total_candidate_count,
+                "truncated": snapshot.truncated,
+            },
         }),
         is_error: false,
     }
@@ -800,6 +821,7 @@ async fn run_smoke_flow(manager: &BrowserSessionManager, url: &str) -> Result<()
 }
 
 const DEFAULT_MATCH_MAX_ELEMENTS: usize = 500;
+const NAVIGATE_SNAPSHOT_MAX_ELEMENTS: usize = 24;
 
 fn resolve_match_limit(args: &BrowserElementMatchArguments) -> usize {
     args.max_elements

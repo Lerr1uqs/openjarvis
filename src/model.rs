@@ -12,6 +12,22 @@ pub struct IncomingAttachment {
     pub mime_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Structured outgoing attachment kinds supported by channel adapters.
+pub enum OutgoingAttachmentKind {
+    Image,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One structured outgoing attachment extracted from assistant reply syntax.
+pub struct OutgoingAttachment {
+    pub kind: OutgoingAttachmentKind,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyTarget {
     pub receive_id: String,
@@ -97,5 +113,7 @@ pub struct OutgoingMessage {
     pub external_thread_id: Option<String>,
     pub metadata: Value,
     pub reply_to_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<OutgoingAttachment>,
     pub target: ReplyTarget,
 }

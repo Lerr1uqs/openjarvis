@@ -25,7 +25,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{debug, info};
+
+const TOOL_LOG_PREVIEW_MAX_CHARS: usize = 512;
+/// Default max character count used for channel-facing `ToolCall` and `ToolResult` event text.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::agent::agent_loop::TOOL_EVENT_PREVIEW_MAX_CHARS;
+///
+/// assert_eq!(TOOL_EVENT_PREVIEW_MAX_CHARS, 100);
+/// ```
+pub const TOOL_EVENT_PREVIEW_MAX_CHARS: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct AgentDispatchEvent {
@@ -397,7 +408,24 @@ impl AgentLoop {
                     budget_report,
                 } = request_state;
 
+                info!(
+                    last_content = %messages
+                                    .last()
+                                    .map(|m| m.content.chars().take(50).collect::<String>())
+                                    .unwrap_or("None".into()),
+                    "[LLM-GENERATE] before",
+                );
+
                 let response = self.llm.generate(LLMRequest { messages, tools }).await?;
+
+                info!(
+                    toolcalls_count = %response.tool_calls.len(),
+                    content = response.message
+                                    .as_ref()
+                                    .map(|m| m.content.chars().take(50).collect::<String>())
+                                    .unwrap_or("None".into()),
+                    "[LLM-GENERATE] after"
+                );
 
                 if response.tool_calls.is_empty() {
                     let assistant_message = response
@@ -450,11 +478,25 @@ impl AgentLoop {
                         name: provider_tool_call.name.clone(),
                         arguments: provider_tool_call.arguments.clone(),
                     };
+                    let tool_call_arguments = tool_call.arguments.to_string();
+                    let truncated_tool_call_arguments =
+                        truncate_tool_message(&tool_call_arguments, TOOL_EVENT_PREVIEW_MAX_CHARS);
+                    if truncated_tool_call_arguments != tool_call_arguments {
+                        debug!(
+                            thread_id = %thread_id,
+                            tool_name = %tool_call.name,
+                            tool_call_id = %provider_tool_call.id,
+                            original_chars = tool_call_arguments.chars().count(),
+                            truncated_chars = truncated_tool_call_arguments.chars().count(),
+                            max_chars = TOOL_EVENT_PREVIEW_MAX_CHARS,
+                            "agent loop truncated tool call event content"
+                        );
+                    }
                     let tool_call_event = AgentLoopEvent {
                         kind: AgentLoopEventKind::ToolCall,
                         content: format!(
                             "[openjarvis][tool_call] {} {}",
-                            tool_call.name, tool_call.arguments
+                            tool_call.name, truncated_tool_call_arguments
                         ),
                         metadata: json!({
                             "tool": tool_call.name,
@@ -470,6 +512,16 @@ impl AgentLoop {
                             payload: tool_call_event.metadata.clone(),
                         })
                         .await?;
+                    info!(
+                        thread_id = %thread_id,
+                        tool_name = %tool_call.name,
+                        tool_call_id = %provider_tool_call.id,
+                        arguments_preview = %truncate_tool_log_preview(
+                            &tool_call.arguments.to_string(),
+                            TOOL_LOG_PREVIEW_MAX_CHARS,
+                        ),
+                        "agent loop starting tool call"
+                    );
 
                     used_tool_names.push(tool_call.name.clone());
                     if tool_call.name == "compact" {
@@ -633,12 +685,40 @@ impl AgentLoop {
                         &provider_tool_call.id,
                         &tool_result,
                     ));
+                    info!(
+                        thread_id = %thread_id,
+                        tool_name = %tool_call.name,
+                        tool_call_id = %provider_tool_call.id,
+                        is_error = tool_result.is_error,
+                        result_preview = %truncate_tool_log_preview(
+                            &tool_result.content,
+                            TOOL_LOG_PREVIEW_MAX_CHARS,
+                        ),
+                        "agent loop completed tool call"
+                    );
 
                     let tool_result_content =
                         format_tool_result_content(&tool_result.content, tool_result.is_error);
+                    let truncated_tool_result_content =
+                        truncate_tool_message(&tool_result_content, TOOL_EVENT_PREVIEW_MAX_CHARS);
+                    if truncated_tool_result_content != tool_result_content {
+                        debug!(
+                            thread_id = %thread_id,
+                            tool_name = %tool_call.name,
+                            tool_call_id = %provider_tool_call.id,
+                            is_error = tool_result.is_error,
+                            original_chars = tool_result_content.chars().count(),
+                            truncated_chars = truncated_tool_result_content.chars().count(),
+                            max_chars = TOOL_EVENT_PREVIEW_MAX_CHARS,
+                            "agent loop truncated tool result event content"
+                        );
+                    }
                     let tool_result_event = AgentLoopEvent {
                         kind: AgentLoopEventKind::ToolResult,
-                        content: format!("[openjarvis][tool_result] {}", tool_result_content),
+                        content: format!(
+                            "[openjarvis][tool_result] {}",
+                            truncated_tool_result_content
+                        ),
                         metadata: json!({
                             "tool": tool_call.name.clone(),
                             "is_error": tool_result.is_error,
@@ -950,6 +1030,42 @@ fn format_tool_result_content(content: &str, is_error: bool) -> String {
     }
 
     content.to_string()
+}
+
+/// Truncate channel-facing tool event content without affecting the full tool history kept for
+/// subsequent model turns.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::agent::agent_loop::truncate_tool_message;
+///
+/// assert_eq!(
+///     truncate_tool_message("123456", 4),
+///     "1234...(truncated, total_chars=6)"
+/// );
+/// ```
+#[doc(hidden)]
+pub fn truncate_tool_message(content: &str, max_chars: usize) -> String {
+    truncate_text_with_total_chars(content, max_chars)
+}
+
+#[doc(hidden)]
+pub fn truncate_tool_log_preview(content: &str, max_chars: usize) -> String {
+    truncate_text_with_total_chars(content, max_chars)
+}
+
+fn truncate_text_with_total_chars(content: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return format!("...(truncated, total_chars={})", content.chars().count());
+    }
+
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
+        return content.to_string();
+    }
+
+    let truncated = content.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...(truncated, total_chars={char_count})")
 }
 
 fn build_compact_event(
