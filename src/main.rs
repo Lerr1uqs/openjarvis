@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         warn!("feishu.dry_run=true, outgoing messages will be logged instead of delivered");
     }
     info!(
+        llm_protocol = config.llm_config().effective_protocol(),
         llm_provider = %config.llm_config().provider,
         llm_model = %config.llm_config().model,
         context_window_tokens = config.llm_config().context_window_tokens(),

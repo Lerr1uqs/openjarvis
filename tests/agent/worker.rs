@@ -201,6 +201,7 @@ agent:
   hook:
     notification: ["echo", "hook loaded"]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -222,6 +223,7 @@ agent:
   hook:
     notification: ["echo", "worker-hook"]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )

@@ -33,6 +33,10 @@ name = "llm_test"
 path = "scripts/llm_test.rs"
 
 [[bin]]
+name = "llm_provider_ping"
+path = "scripts/llm_provider_ping.rs"
+
+[[bin]]
 name = "browser_bilibili_search_dump"
 path = "scripts/browser_bilibili_search_dump.rs"
 

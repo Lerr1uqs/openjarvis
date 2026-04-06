@@ -58,6 +58,7 @@ async fn hook_registry_loads_script_handlers_from_config_and_executes_them() {
             }
         },
         "llm": {
+            "protocol": "mock",
             "provider": "mock"
         }
     }))

@@ -16,7 +16,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     // TODO: 改动注释 符合rust规范
-    // 作用: 单独读取 LLM 配置并发起一次测试请求，用于验证 provider/base_url/api_key_path 是否可用。
+    // 作用: 单独读取 LLM 配置并发起一次测试请求，用于验证 protocol/provider/base_url/api_key_path 是否可用。
     // 参数: 支持 `--config <path>` 覆盖配置文件路径，位置参数为测试消息，默认发送 `Hello`。
     let args = parse_args()?;
     let config = load_config(args.config_path.as_deref())?;
@@ -25,8 +25,11 @@ async fn main() -> Result<()> {
     let system_prompt = resolve_system_prompt(&args);
 
     eprintln!(
-        "llm_test: provider={}, model={}, base_url={}",
-        llm_config.provider, llm_config.model, llm_config.base_url
+        "llm_test: protocol={}, provider={}, model={}, base_url={}",
+        llm_config.effective_protocol(),
+        llm_config.provider,
+        llm_config.model,
+        llm_config.base_url
     );
     if !llm_config.api_key_path.as_os_str().is_empty() {
         eprintln!(
@@ -105,14 +108,13 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<AppConfig> {
 }
 
 fn ensure_real_provider_config(config: &LLMConfig) -> Result<()> {
-    // 作用: 校验当前配置适合做真实 LLM 连通性测试，避免误走 mock provider。
+    // 作用: 校验当前配置适合做真实 LLM 连通性测试，避免误走 mock protocol。
     // 参数: config 为当前加载出的 llm 子配置。
-    match config.provider.as_str() {
-        "deepseek" | "openai" | "openai_compatible" => {}
-        "mock" | "mock_llm" => {
-            bail!("llm_test expects a real provider, but config.llm.provider is mock")
-        }
-        other => bail!("llm_test does not support provider `{other}`"),
+    match config.effective_protocol() {
+        "openai_compatible" => {}
+        "mock" => bail!("llm_test expects a real provider, but llm.protocol resolved to mock"),
+        "anthropic" => bail!("llm_test does not support anthropic providers yet"),
+        other => bail!("llm_test does not support llm protocol `{other}`"),
     }
 
     if config.model.trim().is_empty() {

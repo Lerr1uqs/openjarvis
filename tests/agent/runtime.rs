@@ -53,6 +53,7 @@ agent:
   hook:
     notification: ["echo", "hello"]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )

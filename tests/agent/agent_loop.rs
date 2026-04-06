@@ -6,7 +6,10 @@ use openjarvis::{
         AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime,
         ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
         agent_loop::{
-            TOOL_EVENT_PREVIEW_MAX_CHARS, truncate_tool_log_preview, truncate_tool_message,
+            AgentLoopUTLLMResponseSnapshot, AgentLoopUTLoopState, AgentLoopUTProber,
+            AgentLoopUTRequestSnapshot, AgentLoopUTToolCallSnapshot, AgentLoopUTToolResultSnapshot,
+            TOOL_EVENT_PREVIEW_MAX_CHARS, UTProbe, truncate_tool_log_preview,
+            truncate_tool_message,
         },
         empty_tool_input_schema,
     },
@@ -131,6 +134,42 @@ fn build_event_sender(
     )
 }
 
+#[derive(Default)]
+struct RecordingUTProbe {
+    loop_begin: Vec<AgentLoopUTLoopState>,
+    request_prepared: Vec<AgentLoopUTRequestSnapshot>,
+    llm_responses: Vec<AgentLoopUTLLMResponseSnapshot>,
+    tool_calls: Vec<AgentLoopUTToolCallSnapshot>,
+    tool_results: Vec<AgentLoopUTToolResultSnapshot>,
+    loop_end: Vec<AgentLoopUTLoopState>,
+}
+
+impl AgentLoopUTProber for RecordingUTProbe {
+    fn on_loop_begin(&mut self, state: &AgentLoopUTLoopState) {
+        self.loop_begin.push(state.clone());
+    }
+
+    fn on_request_prepared(&mut self, snapshot: &AgentLoopUTRequestSnapshot) {
+        self.request_prepared.push(snapshot.clone());
+    }
+
+    fn on_llm_response(&mut self, snapshot: &AgentLoopUTLLMResponseSnapshot) {
+        self.llm_responses.push(snapshot.clone());
+    }
+
+    fn on_tool_call_start(&mut self, snapshot: &AgentLoopUTToolCallSnapshot) {
+        self.tool_calls.push(snapshot.clone());
+    }
+
+    fn on_tool_result(&mut self, snapshot: &AgentLoopUTToolResultSnapshot) {
+        self.tool_results.push(snapshot.clone());
+    }
+
+    fn on_loop_end(&mut self, state: &AgentLoopUTLoopState) {
+        self.loop_end.push(state.clone());
+    }
+}
+
 #[tokio::test]
 async fn run_v1_emits_text_output_and_returns_commit_messages() {
     // 测试场景: 主入口只消费 Thread + incoming，loop 负责事件化最终文本并返回待提交消息。
@@ -161,6 +200,153 @@ async fn run_v1_emits_text_output_and_returns_commit_messages() {
         "system"
     );
     assert!(output.thread_context.load_messages().is_empty());
+}
+
+#[tokio::test]
+async fn run_v1_with_ut_probe_captures_intermediate_loop_state() {
+    // 测试场景: UTProbe 需要在不改动生产语义的前提下，暴露 loop 中间态供集成测试断言。
+    let runtime = AgentRuntime::new();
+    runtime
+        .tools()
+        .register(Arc::new(EchoTool))
+        .await
+        .expect("echo tool should register");
+    let provider = ScriptedLLMProvider::new(vec![
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "我先查一下",
+                Utc::now(),
+            )),
+            tool_calls: vec![LLMToolCall {
+                id: "call_demo_probe_1".to_string(),
+                name: "demo__echo".to_string(),
+                arguments: json!({"query": "demo"}),
+            }],
+        },
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "done",
+                Utc::now(),
+            )),
+            tool_calls: Vec::new(),
+        },
+    ]);
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(provider),
+        runtime,
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+    );
+    let thread_context = build_thread("thread_loop_ut_probe");
+    let incoming = build_incoming("run tool", "thread_loop_ut_probe");
+    let (event_tx, _event_rx) = build_event_sender(&incoming, &thread_context);
+    let mut probe = RecordingUTProbe::default();
+
+    let output = loop_runner
+        .run_v1_with_ut_probe(
+            event_tx,
+            &incoming,
+            thread_context,
+            Some(&mut probe as UTProbe<'_>),
+        )
+        .await
+        .expect("loop should succeed");
+
+    assert_eq!(probe.loop_begin.len(), 2);
+    assert_eq!(probe.request_prepared.len(), 2);
+    assert_eq!(probe.llm_responses.len(), 2);
+    assert_eq!(probe.tool_calls.len(), 1);
+    assert_eq!(probe.tool_results.len(), 1);
+    assert_eq!(probe.loop_end.len(), 2);
+
+    assert_eq!(probe.loop_begin[0].iteration, 0);
+    assert!(probe.loop_begin[0].thread_messages.is_empty());
+    assert_eq!(probe.loop_begin[0].live_chat_messages.len(), 1);
+    assert_eq!(
+        probe.loop_begin[0].live_chat_messages[0].content,
+        "run tool"
+    );
+    assert!(probe.loop_begin[0].commit_messages.is_empty());
+
+    assert_eq!(probe.request_prepared[0].iteration, 0);
+    assert_eq!(
+        probe.request_prepared[0]
+            .messages
+            .last()
+            .expect("user message should exist")
+            .content,
+        "run tool"
+    );
+    assert!(!probe.request_prepared[0].tools.is_empty());
+
+    assert_eq!(probe.llm_responses[0].iteration, 0);
+    assert_eq!(probe.llm_responses[0].tool_calls.len(), 1);
+    assert_eq!(
+        probe.llm_responses[0]
+            .message
+            .as_ref()
+            .expect("assistant text should exist")
+            .content,
+        "我先查一下"
+    );
+
+    assert_eq!(probe.tool_calls[0].iteration, 0);
+    assert_eq!(probe.tool_calls[0].tool_call_id, "call_demo_probe_1");
+    assert_eq!(probe.tool_calls[0].request.name, "demo__echo");
+
+    assert_eq!(probe.tool_results[0].iteration, 0);
+    assert_eq!(probe.tool_results[0].tool_call_id, "call_demo_probe_1");
+    assert_eq!(probe.tool_results[0].result.content, "echo-result");
+    assert!(!probe.tool_results[0].result.is_error);
+
+    assert_eq!(probe.loop_end[0].iteration, 0);
+    assert_eq!(probe.loop_end[0].commit_messages.len(), 2);
+    assert_eq!(probe.loop_end[0].commit_messages[0].content, "我先查一下");
+    assert_eq!(probe.loop_end[0].commit_messages[1].content, "echo-result");
+    assert_eq!(
+        probe.loop_end[0].commit_messages[1].tool_call_id.as_deref(),
+        Some("call_demo_probe_1")
+    );
+
+    assert_eq!(probe.loop_begin[1].iteration, 1);
+    assert_eq!(probe.loop_begin[1].live_chat_messages.len(), 3);
+    assert_eq!(
+        probe.loop_begin[1].live_chat_messages[1].content,
+        "我先查一下"
+    );
+    assert_eq!(
+        probe.loop_begin[1].live_chat_messages[1].tool_calls.len(),
+        1
+    );
+    assert_eq!(
+        probe.loop_begin[1].live_chat_messages[2].content,
+        "echo-result"
+    );
+
+    assert_eq!(probe.llm_responses[1].iteration, 1);
+    assert_eq!(probe.llm_responses[1].tool_calls.len(), 0);
+    assert_eq!(
+        probe.llm_responses[1]
+            .message
+            .as_ref()
+            .expect("final assistant text should exist")
+            .content,
+        "done"
+    );
+
+    assert_eq!(probe.loop_end[1].iteration, 1);
+    assert_eq!(
+        probe.loop_end[1]
+            .commit_messages
+            .last()
+            .expect("final assistant message should exist")
+            .content,
+        "done"
+    );
+    assert!(probe.loop_end[1].persist_incoming_user);
+    assert_eq!(output.reply, "done");
 }
 
 #[tokio::test]

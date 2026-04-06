@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn mock_provider_returns_configured_response() {
     let config = LLMConfig {
-        provider: "mock".to_string(),
+        protocol: "mock".to_string(),
         mock_response: "收到".to_string(),
         ..LLMConfig::default()
     };
@@ -33,20 +33,21 @@ async fn mock_provider_returns_configured_response() {
 }
 
 #[tokio::test]
-async fn mock_llm_alias_builds_same_provider() {
+async fn mock_protocol_builds_same_provider_even_with_vendor_style_provider_name() {
     let config = LLMConfig {
+        protocol: "mock".to_string(),
         provider: "mock_llm".to_string(),
         mock_response: "pong".to_string(),
         ..LLMConfig::default()
     };
-    let provider = build_provider(&config).expect("mock_llm alias should build");
+    let provider = build_provider(&config).expect("mock protocol should build");
     let reply = provider
         .generate(LLMRequest {
             messages: build_messages("system", "ping"),
             tools: Vec::new(),
         })
         .await
-        .expect("mock_llm alias should reply");
+        .expect("mock protocol should reply");
 
     assert_eq!(
         reply
@@ -61,7 +62,7 @@ async fn mock_llm_alias_builds_same_provider() {
 async fn provider_can_build_from_explicit_and_global_config_paths() {
     // 测试场景: build_provider 继续支持显式配置，主启动链路也可以改走全局配置便捷入口。
     let llm_config = LLMConfig {
-        provider: "mock".to_string(),
+        protocol: "mock".to_string(),
         mock_response: "from-global-config".to_string(),
         ..LLMConfig::default()
     };
@@ -113,6 +114,7 @@ fn openai_compatible_provider_can_read_api_key_from_path() {
     fs::write(&path, "sk-test-token\n").expect("api key file should be written");
 
     let config = LLMConfig {
+        protocol: "openai".to_string(),
         provider: "deepseek".to_string(),
         model: "deepseek-chat".to_string(),
         base_url: "https://api.deepseek.com/v1".to_string(),
@@ -127,7 +129,7 @@ fn openai_compatible_provider_can_read_api_key_from_path() {
 #[tokio::test]
 async fn mock_provider_does_not_require_api_key_path() {
     let config = LLMConfig {
-        provider: "mock".to_string(),
+        protocol: "mock".to_string(),
         mock_response: "still-mock".to_string(),
         api_key_path: PathBuf::from("Z:/this/path/should/not/be/read.txt"),
         ..LLMConfig::default()
@@ -154,7 +156,8 @@ async fn mock_provider_does_not_require_api_key_path() {
 #[tokio::test]
 async fn anthropic_provider_builds_but_generate_is_not_implemented() {
     let config = LLMConfig {
-        provider: "anthropic".to_string(),
+        protocol: "anthropic".to_string(),
+        provider: "claude".to_string(),
         model: "claude-3-7-sonnet".to_string(),
         base_url: "https://api.anthropic.com".to_string(),
         api_key: "test-key".to_string(),
@@ -180,6 +183,7 @@ async fn anthropic_provider_builds_but_generate_is_not_implemented() {
 #[test]
 fn kimi_k2_5_known_model_exposes_official_token_limits() {
     let config = LLMConfig {
+        protocol: "openai".to_string(),
         provider: "ark".to_string(),
         model: "kimi-k2.5".to_string(),
         base_url: "https://ark.cn-beijing.volces.com/api/coding/v3".to_string(),
@@ -188,6 +192,21 @@ fn kimi_k2_5_known_model_exposes_official_token_limits() {
 
     assert_eq!(config.context_window_tokens(), 262144);
     assert_eq!(config.max_output_tokens(), 32768);
+}
+
+#[test]
+fn zai_alias_builds_openai_compatible_provider() {
+    // 测试场景: provider 应允许任意上游厂商名，只要 protocol 明确为 openai 兼容即可构建。
+    let config = LLMConfig {
+        protocol: "openai".to_string(),
+        provider: "zai".to_string(),
+        model: "glm-5".to_string(),
+        base_url: "https://open.bigmodel.cn/api/coding/paas/v4".to_string(),
+        api_key: "test-key".to_string(),
+        ..LLMConfig::default()
+    };
+
+    build_provider(&config).expect("zai alias should build as openai-compatible provider");
 }
 
 fn build_messages(system_prompt: &str, user_message: &str) -> Vec<ChatMessage> {

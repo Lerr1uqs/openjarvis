@@ -118,7 +118,8 @@ fn missing_config_path_returns_default_config() {
     let config =
         AppConfig::from_yaml_path(&path).expect("missing path should fall back to defaults");
 
-    assert_eq!(config.llm_config().provider, "mock");
+    assert_eq!(config.llm_config().provider, "unknown");
+    assert_eq!(config.llm_config().effective_protocol(), "mock");
     assert_eq!(
         config.channel_config().feishu_config().mode,
         "long_connection"
@@ -134,6 +135,7 @@ fn yaml_config_can_be_loaded_from_path() {
 feishu:
   mode: ""
 llm:
+  protocol: "mock"
   provider: "mock_llm"
   mock_response: "pong"
 "#,
@@ -145,6 +147,7 @@ llm:
 
     assert_eq!(config.channel_config().feishu_config().mode, "");
     assert_eq!(config.llm_config().provider, "mock_llm");
+    assert_eq!(config.llm_config().effective_protocol(), "mock");
     assert_eq!(config.llm_config().mock_response, "pong");
 }
 
@@ -153,6 +156,7 @@ fn yaml_config_can_be_loaded_from_string() {
     let config = AppConfig::from_yaml_str(
         r#"
 llm:
+  protocol: "mock"
   provider: "mock_llm"
   mock_response: "from-yaml-str"
 "#,
@@ -160,6 +164,7 @@ llm:
     .expect("yaml string should parse");
 
     assert_eq!(config.llm_config().provider, "mock_llm");
+    assert_eq!(config.llm_config().effective_protocol(), "mock");
     assert_eq!(config.llm_config().mock_response, "from-yaml-str");
 }
 
@@ -167,14 +172,15 @@ llm:
 fn builder_for_test_builds_minimal_validated_config() {
     let config = AppConfig::builder_for_test()
         .llm(LLMConfig {
-            provider: "mock".to_string(),
+            protocol: "mock".to_string(),
             mock_response: "builder-mock".to_string(),
             ..LLMConfig::default()
         })
         .build()
         .expect("builder config should validate");
 
-    assert_eq!(config.llm_config().provider, "mock");
+    assert_eq!(config.llm_config().provider, "unknown");
+    assert_eq!(config.llm_config().effective_protocol(), "mock");
     assert_eq!(config.llm_config().mock_response, "builder-mock");
 }
 
@@ -189,7 +195,7 @@ fn global_config_installation_is_single_assignment_and_fail_fast() {
     let installed = install_global_config(
         AppConfig::builder_for_test()
             .llm(LLMConfig {
-                provider: "mock".to_string(),
+                protocol: "mock".to_string(),
                 mock_response: "installed".to_string(),
                 ..LLMConfig::default()
             })
@@ -212,6 +218,39 @@ fn global_config_installation_is_single_assignment_and_fail_fast() {
             .to_string()
             .contains("already been installed")
     );
+}
+
+#[test]
+fn yaml_llm_provider_without_protocol_is_rejected() {
+    let error = AppConfig::from_yaml_str(
+        r#"
+llm:
+  provider: "zai"
+  model: "glm-5"
+  base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+  api_key: "test-key"
+"#,
+    )
+    .expect_err("provider-only llm config should be rejected");
+
+    assert!(format!("{error:#}").contains("llm.protocol is required"));
+}
+
+#[test]
+fn yaml_llm_legacy_protocal_key_is_rejected() {
+    let error = AppConfig::from_yaml_str(
+        r#"
+llm:
+  protocal: "openai"
+  provider: "zai"
+  model: "glm-5"
+  base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+  api_key: "test-key"
+"#,
+    )
+    .expect_err("legacy protocal key should be rejected");
+
+    assert!(format!("{error:#}").contains("llm.protocol is required"));
 }
 
 #[test]
@@ -246,6 +285,7 @@ session:
     sqlite:
       path: "runtime/session.sqlite3"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -271,6 +311,7 @@ session:
   persistence:
     backend: "memory"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -296,6 +337,7 @@ logging:
     filename_suffix: "txt"
     max_files: 3
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -386,6 +428,7 @@ agent:
           command: "openjarvis"
           args: ["internal-mcp", "demo-stdio"]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -413,6 +456,7 @@ fn missing_external_mcp_json_logs_note_and_keeps_mcp_empty() {
     fixture.write_yaml(
         r#"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -466,6 +510,7 @@ agent:
   hook:
     not_a_real_event: ["echo", "hello"]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -486,6 +531,7 @@ fn malformed_logging_config_with_blank_level_is_rejected() {
 logging:
   level: "   "
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -507,6 +553,7 @@ logging:
   file:
     enabled: false
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -531,6 +578,7 @@ agent:
   hook:
     notification: []
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -556,6 +604,7 @@ agent:
   hook:
     notification: ["powershell", "   "]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -581,6 +630,7 @@ fn malformed_hook_config_with_wrong_type_is_rejected() {
 agent:
   hook: "invalid"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -611,6 +661,7 @@ agent:
           transport: http
           url: "http://127.0.0.1:39090/mcp"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -636,6 +687,7 @@ agent:
           transport: streamable_http
           url: "   "
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )
@@ -663,6 +715,7 @@ agent:
           command: "openjarvis"
           args: ["internal-mcp", "demo-stdio"]
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -719,6 +772,7 @@ agent:
     reserved_output_tokens: 512
     mock_compacted_assistant: "这是压缩后的上下文，使用 mock 固定摘要。"
 llm:
+  protocol: "mock"
   provider: "mock"
   context_window_tokens: 16384
   tokenizer: "chars_div4"
@@ -765,6 +819,7 @@ fn kimi_k2_5_token_limits_fall_back_to_official_defaults_when_omitted() {
     let config: AppConfig = serde_yaml::from_str(
         r#"
 llm:
+  protocol: "openai"
   provider: "ark"
   model: "kimi-k2.5"
   base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"
@@ -789,6 +844,7 @@ agent:
     runtime_threshold_ratio: 0.7
     tool_visible_threshold_ratio: 0.8
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -811,6 +867,7 @@ agent:
     enabled: true
     mock_compacted_assistant: "   "
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );

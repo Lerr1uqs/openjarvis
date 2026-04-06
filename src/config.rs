@@ -34,7 +34,7 @@ static GLOBAL_APP_CONFIG: OnceLock<AppConfig> = OnceLock::new();
 ///     .expect("test config should build");
 /// let installed = install_global_config(config).expect("config should install once");
 ///
-/// assert_eq!(installed.llm_config().provider, "mock");
+/// assert_eq!(installed.llm_config().effective_protocol(), "mock");
 /// ```
 pub fn install_global_config(config: AppConfig) -> Result<&'static AppConfig> {
     config
@@ -48,6 +48,7 @@ pub fn install_global_config(config: AppConfig) -> Result<&'static AppConfig> {
         .get()
         .expect("global app config should be readable immediately after installation");
     info!(
+        llm_protocol = installed.llm_config().effective_protocol(),
         llm_provider = %installed.llm_config().provider,
         llm_model = %installed.llm_config().model,
         builtin_mcp_enabled = installed
@@ -77,7 +78,7 @@ pub fn install_global_config(config: AppConfig) -> Result<&'static AppConfig> {
 ///     .expect("test config should build");
 /// install_global_config(config).expect("config should install");
 ///
-/// assert_eq!(global_config().llm_config().provider, "mock");
+/// assert_eq!(global_config().llm_config().effective_protocol(), "mock");
 /// ```
 pub fn global_config() -> &'static AppConfig {
     GLOBAL_APP_CONFIG.get().expect(
@@ -157,7 +158,8 @@ impl AppConfig {
     ///
     /// let config =
     ///     AppConfig::from_yaml_path("missing-config.yaml").expect("missing config should use defaults");
-    /// assert_eq!(config.llm_config().provider, "mock");
+    /// assert_eq!(config.llm_config().provider, "unknown");
+    /// assert_eq!(config.llm_config().effective_protocol(), "mock");
     /// ```
     pub fn from_yaml_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -191,7 +193,7 @@ impl AppConfig {
     /// let config = AppConfig::from_yaml_str(
     ///     r#"
     /// llm:
-    ///   provider: "mock"
+    ///   protocol: "mock"
     ///   mock_response: "pong"
     /// "#,
     /// )
@@ -219,7 +221,7 @@ impl AppConfig {
     ///
     /// let config = AppConfig::builder_for_test()
     ///     .llm(LLMConfig {
-    ///         provider: "mock".to_string(),
+    ///         protocol: "mock".to_string(),
     ///         mock_response: "builder".to_string(),
     ///         ..LLMConfig::default()
     ///     })
@@ -426,7 +428,7 @@ impl AppConfigBuilderForTest {
     ///
     /// let config = AppConfig::builder_for_test()
     ///     .llm(LLMConfig {
-    ///         provider: "mock".to_string(),
+    ///         protocol: "mock".to_string(),
     ///         mock_response: "pong".to_string(),
     ///         ..LLMConfig::default()
     ///     })
@@ -1461,37 +1463,118 @@ fn resolve_external_mcp_config_path(config_path: &Path) -> PathBuf {
     config_root.join(EXTERNAL_MCP_CONFIG_RELATIVE_PATH)
 }
 
+fn default_deserialized_llm_protocol() -> String {
+    String::new()
+}
+
+fn default_runtime_llm_protocol() -> String {
+    "mock".to_string()
+}
+
+fn default_llm_provider() -> String {
+    "unknown".to_string()
+}
+
+fn default_llm_model() -> String {
+    "mock-received".to_string()
+}
+
+fn default_llm_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_llm_api_key() -> String {
+    String::new()
+}
+
+fn default_llm_api_key_path() -> PathBuf {
+    PathBuf::new()
+}
+
+fn default_llm_mock_response() -> String {
+    "[openjarvis][DEBUG] 测试回复".to_string()
+}
+
+fn default_llm_context_window_tokens() -> Option<usize> {
+    None
+}
+
+fn default_llm_max_output_tokens() -> Option<usize> {
+    None
+}
+
+fn default_llm_tokenizer() -> String {
+    "chars_div4".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
 pub struct LLMConfig {
+    #[serde(default = "default_deserialized_llm_protocol")]
+    pub protocol: String,
+    #[serde(default = "default_llm_provider")]
     pub provider: String,
+    #[serde(default = "default_llm_model")]
     pub model: String,
+    #[serde(default = "default_llm_base_url")]
     pub base_url: String,
+    #[serde(default = "default_llm_api_key")]
     pub api_key: String,
+    #[serde(default = "default_llm_api_key_path")]
     pub api_key_path: PathBuf,
+    #[serde(default = "default_llm_mock_response")]
     pub mock_response: String,
+    #[serde(default = "default_llm_context_window_tokens")]
     pub context_window_tokens: Option<usize>,
+    #[serde(default = "default_llm_max_output_tokens")]
     pub max_output_tokens: Option<usize>,
+    #[serde(default = "default_llm_tokenizer")]
     pub tokenizer: String,
 }
 
 impl Default for LLMConfig {
     fn default() -> Self {
         Self {
-            provider: "mock".to_string(),
-            model: "mock-received".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: String::new(),
-            api_key_path: PathBuf::new(),
-            mock_response: "[openjarvis][DEBUG] 测试回复".to_string(),
-            context_window_tokens: None,
-            max_output_tokens: None,
-            tokenizer: "chars_div4".to_string(),
+            protocol: default_runtime_llm_protocol(),
+            provider: default_llm_provider(),
+            model: default_llm_model(),
+            base_url: default_llm_base_url(),
+            api_key: default_llm_api_key(),
+            api_key_path: default_llm_api_key_path(),
+            mock_response: default_llm_mock_response(),
+            context_window_tokens: default_llm_context_window_tokens(),
+            max_output_tokens: default_llm_max_output_tokens(),
+            tokenizer: default_llm_tokenizer(),
         }
     }
 }
 
 impl LLMConfig {
+    /// Return the normalized protocol used to choose the concrete LLM transport implementation.
+    ///
+    /// 当前只接受 `llm.protocol`，用于决定具体走哪条 LLM 传输实现；未知协议会返回
+    /// `unknown`，并在配置校验或 provider 构建阶段被拒绝。
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::LLMConfig;
+    ///
+    /// let config = LLMConfig {
+    ///     protocol: "openai".to_string(),
+    ///     ..LLMConfig::default()
+    /// };
+    ///
+    /// assert_eq!(config.effective_protocol(), "openai_compatible");
+    /// ```
+    pub fn effective_protocol(&self) -> &'static str {
+        let normalized_protocol = self.protocol.trim().to_ascii_lowercase();
+        match normalized_protocol.as_str() {
+            "mock" | "mock_llm" => "mock",
+            "openai" | "openai_compatible" => "openai_compatible",
+            "anthropic" | "claude" => "anthropic",
+            _ => "unknown",
+        }
+    }
+
     /// Return the effective context window tokens for the configured model.
     ///
     /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
@@ -1517,6 +1600,12 @@ impl LLMConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.protocol.trim().is_empty() {
+            bail!("llm.protocol is required");
+        }
+        if matches!(self.effective_protocol(), "unknown") {
+            bail!("llm.protocol `{}` is not supported", self.protocol.trim());
+        }
         if self
             .context_window_tokens
             .is_some_and(|context_window_tokens| context_window_tokens == 0)

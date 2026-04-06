@@ -44,6 +44,7 @@ agent:
             - internal-mcp
             - demo-stdio
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
         command = openjarvis_bin().display(),
@@ -63,6 +64,7 @@ agent:
           transport: streamable_http
           url: "{url}"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#
     ))
@@ -351,6 +353,7 @@ agent:
           transport: stdio
           command: "openjarvis-missing-demo-mcp-command"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     )

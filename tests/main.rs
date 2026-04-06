@@ -93,6 +93,7 @@ fn startup_exits_when_external_mcp_json_cannot_be_parsed() {
     fixture.write_yaml(
         r#"
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -291,6 +292,7 @@ logging:
     filename_suffix: "log"
     max_files: 2
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -339,6 +341,7 @@ logging:
     filename_suffix: "log"
     max_files: 1
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -376,6 +379,7 @@ logging:
     filename_suffix: "log"
     max_files: 1
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );
@@ -412,6 +416,7 @@ logging:
     filename_suffix: "log"
     max_files: 2
 llm:
+  protocol: "mock"
   provider: "mock"
 "#,
     );

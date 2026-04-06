@@ -88,13 +88,12 @@ enum LLMProviderProtocol {
 
 impl LLMProviderProtocol {
     fn from_config(config: &LLMConfig) -> Result<Self> {
-        // Normalize configured provider aliases into one internal protocol enum.
-        // TODO: 这里的check有问题 Provider很多 应该限制协议
-        match config.provider.trim().to_ascii_lowercase().as_str() {
-            "mock" | "mock_llm" => Ok(Self::Mock),
-            "openai_compatible" | "openai" | "deepseek" | "ark" => Ok(Self::OpenAiCompatible),
-            "anthropic" | "claude" => Ok(Self::Anthropic),
-            other => bail!("unsupported llm provider `{other}`"),
+        // Resolve the protocol from config so provider names can stay vendor-specific.
+        match config.effective_protocol() {
+            "mock" => Ok(Self::Mock),
+            "openai_compatible" => Ok(Self::OpenAiCompatible),
+            "anthropic" => Ok(Self::Anthropic),
+            other => bail!("unsupported llm protocol `{other}`"),
         }
     }
 }
@@ -136,10 +135,10 @@ impl OpenaiProvider {
     fn new(config: LLMConfig) -> Result<Self> {
         // Validate the required fields and build an OpenAI-compatible client.
         if config.api_key.trim().is_empty() {
-            bail!("llm.api_key is required when provider=openai_compatible");
+            bail!("llm.api_key is required when llm.protocol=openai_compatible");
         }
         if config.model.trim().is_empty() {
-            bail!("llm.model is required when provider=openai_compatible");
+            bail!("llm.model is required when llm.protocol=openai_compatible");
         }
 
         let client_config = OpenAIConfig::new()
@@ -176,6 +175,7 @@ impl LLMProvider for OpenaiProvider {
         let tool_count = request.tools.len();
         let started_at = Instant::now();
         debug!(
+            protocol = self.config.effective_protocol(),
             provider = %self.config.provider,
             model = %self.config.model,
             base_url = %self.config.base_url,
@@ -188,6 +188,7 @@ impl LLMProvider for OpenaiProvider {
             Ok(response) => response,
             Err(error) => {
                 debug!(
+                    protocol = self.config.effective_protocol(),
                     provider = %self.config.provider,
                     model = %self.config.model,
                     base_url = %self.config.base_url,
@@ -212,6 +213,7 @@ impl LLMProvider for OpenaiProvider {
             .and_then(|details| details.cached_tokens)
             .unwrap_or_default();
         debug!(
+            protocol = self.config.effective_protocol(),
             provider = %self.config.provider,
             model = %self.config.model,
             base_url = %self.config.base_url,

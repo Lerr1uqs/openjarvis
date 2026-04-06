@@ -17,6 +17,7 @@ agent:
     enabled: true
     reserved_output_tokens: 32
 llm:
+  protocol: "mock"
   provider: "mock"
   context_window_tokens: 256
   tokenizer: "chars_div4"
@@ -75,6 +76,7 @@ agent:
   compact:
     enabled: true
 llm:
+  protocol: "openai"
   provider: "ark"
   model: "kimi-k2.5"
   base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"

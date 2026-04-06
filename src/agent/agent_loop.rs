@@ -29,14 +29,7 @@ use tracing::{debug, info};
 
 const TOOL_LOG_PREVIEW_MAX_CHARS: usize = 512;
 /// Default max character count used for channel-facing `ToolCall` and `ToolResult` event text.
-///
-/// # 示例
-/// ```rust
-/// use openjarvis::agent::agent_loop::TOOL_EVENT_PREVIEW_MAX_CHARS;
-///
-/// assert_eq!(TOOL_EVENT_PREVIEW_MAX_CHARS, 100);
-/// ```
-pub const TOOL_EVENT_PREVIEW_MAX_CHARS: usize = 100;
+pub const TOOL_EVENT_PREVIEW_MAX_CHARS: usize = 300;
 
 #[derive(Debug, Clone)]
 pub struct AgentDispatchEvent {
@@ -210,6 +203,210 @@ pub struct AgentLoopOutput {
     pub tool_events: Vec<ThreadToolEvent>,
 }
 
+/// Integration-test probe state captured at one agent-loop iteration boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentLoopUTLoopState {
+    pub iteration: usize,
+    pub thread_messages: Vec<ChatMessage>,
+    pub request_system_messages: Vec<ChatMessage>,
+    pub live_chat_messages: Vec<ChatMessage>,
+    pub commit_messages: Vec<ChatMessage>,
+    pub persist_incoming_user: bool,
+}
+
+/// Integration-test snapshot captured after request preparation.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentLoopUTRequestSnapshot {
+    pub iteration: usize,
+    pub messages: Messages,
+    pub tools: Vec<ToolDefinition>,
+    pub budget_report: ContextBudgetReport,
+}
+
+/// Integration-test snapshot captured after one LLM response returns.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentLoopUTLLMResponseSnapshot {
+    pub iteration: usize,
+    pub message: Option<ChatMessage>,
+    pub tool_calls: Vec<crate::llm::LLMToolCall>,
+}
+
+/// Integration-test snapshot captured before one tool execution starts.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentLoopUTToolCallSnapshot {
+    pub iteration: usize,
+    pub tool_call_id: String,
+    pub request: ToolCallRequest,
+}
+
+/// Integration-test snapshot captured after one tool execution completes.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentLoopUTToolResultSnapshot {
+    pub iteration: usize,
+    pub tool_call_id: String,
+    pub request: ToolCallRequest,
+    pub result: super::ToolCallResult,
+}
+
+/// Integration-test snapshot captured after one compact action is handled.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentLoopUTCompactSnapshot {
+    pub iteration: usize,
+    pub reason: String,
+    pub requested_by_model: bool,
+    pub is_error: bool,
+    pub budget_report: ContextBudgetReport,
+    pub outcome: Option<MessageCompactionOutcome>,
+    pub error: Option<String>,
+    pub thread_messages: Vec<ChatMessage>,
+    pub request_system_messages: Vec<ChatMessage>,
+    pub live_chat_messages: Vec<ChatMessage>,
+    pub commit_messages: Vec<ChatMessage>,
+    pub persist_incoming_user: bool,
+}
+
+/// Integration-test probe hooks for observing intermediate agent-loop state.
+#[doc(hidden)]
+pub trait AgentLoopUTProber: Send {
+    fn on_loop_begin(&mut self, _state: &AgentLoopUTLoopState) {}
+
+    fn on_request_prepared(&mut self, _snapshot: &AgentLoopUTRequestSnapshot) {}
+
+    fn on_llm_response(&mut self, _snapshot: &AgentLoopUTLLMResponseSnapshot) {}
+
+    fn on_tool_call_start(&mut self, _snapshot: &AgentLoopUTToolCallSnapshot) {}
+
+    fn on_tool_result(&mut self, _snapshot: &AgentLoopUTToolResultSnapshot) {}
+
+    fn on_compact(&mut self, _snapshot: &AgentLoopUTCompactSnapshot) {}
+
+    fn on_loop_end(&mut self, _state: &AgentLoopUTLoopState) {}
+}
+
+/// Alias used by integration tests when passing one mutable loop probe.
+#[doc(hidden)]
+pub type UTProbe<'a> = &'a mut dyn AgentLoopUTProber;
+
+struct AgentLoopUTProberHandle<'a> {
+    probe: Option<UTProbe<'a>>,
+}
+
+impl<'a> AgentLoopUTProberHandle<'a> {
+    fn new(probe: Option<UTProbe<'a>>) -> Self {
+        Self { probe }
+    }
+
+    fn build_loop_state(
+        &self,
+        iteration: usize,
+        thread_context: &Thread,
+        request_system_messages: &[ChatMessage],
+        live_chat_messages: &[ChatMessage],
+        commit_messages: &[ChatMessage],
+        persist_incoming_user: bool,
+    ) -> AgentLoopUTLoopState {
+        AgentLoopUTLoopState {
+            iteration,
+            thread_messages: thread_context.load_messages(),
+            request_system_messages: request_system_messages.to_vec(),
+            live_chat_messages: live_chat_messages.to_vec(),
+            commit_messages: commit_messages.to_vec(),
+            persist_incoming_user,
+        }
+    }
+
+    fn on_loop_begin(
+        &mut self,
+        iteration: usize,
+        thread_context: &Thread,
+        request_system_messages: &[ChatMessage],
+        live_chat_messages: &[ChatMessage],
+        commit_messages: &[ChatMessage],
+        persist_incoming_user: bool,
+    ) {
+        let state = self.build_loop_state(
+            iteration,
+            thread_context,
+            request_system_messages,
+            live_chat_messages,
+            commit_messages,
+            persist_incoming_user,
+        );
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_loop_begin(&state);
+        }
+    }
+
+    fn on_request_prepared(&mut self, iteration: usize, request_state: &RequestState) {
+        let snapshot = AgentLoopUTRequestSnapshot {
+            iteration,
+            messages: request_state.messages.clone(),
+            tools: request_state.tools.clone(),
+            budget_report: request_state.budget_report.clone(),
+        };
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_request_prepared(&snapshot);
+        }
+    }
+
+    fn on_llm_response(&mut self, iteration: usize, response: &crate::llm::LLMResponse) {
+        let snapshot = AgentLoopUTLLMResponseSnapshot {
+            iteration,
+            message: response.message.clone(),
+            tool_calls: response.tool_calls.clone(),
+        };
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_llm_response(&snapshot);
+        }
+    }
+
+    fn on_tool_call_start(&mut self, snapshot: AgentLoopUTToolCallSnapshot) {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_tool_call_start(&snapshot);
+        }
+    }
+
+    fn on_tool_result(&mut self, snapshot: AgentLoopUTToolResultSnapshot) {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_tool_result(&snapshot);
+        }
+    }
+
+    fn on_compact(&mut self, snapshot: AgentLoopUTCompactSnapshot) {
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_compact(&snapshot);
+        }
+    }
+
+    fn on_loop_end(
+        &mut self,
+        iteration: usize,
+        thread_context: &Thread,
+        request_system_messages: &[ChatMessage],
+        live_chat_messages: &[ChatMessage],
+        commit_messages: &[ChatMessage],
+        persist_incoming_user: bool,
+    ) {
+        let state = self.build_loop_state(
+            iteration,
+            thread_context,
+            request_system_messages,
+            live_chat_messages,
+            commit_messages,
+            persist_incoming_user,
+        );
+        if let Some(probe) = self.probe.as_deref_mut() {
+            probe.on_loop_end(&state);
+        }
+    }
+}
+
 pub struct AgentLoop {
     llm: Arc<dyn LLMProvider>,
     runtime: AgentRuntime,
@@ -312,20 +509,78 @@ impl AgentLoop {
         &self.runtime
     }
 
+    /// Run one ReAct loop from `Thread + incoming`, and stream user-visible events to the router.
+    ///
     /// ReAct contract:
     /// 1. `run_v1` 接收 `Thread + 当前 incoming`，由 loop 自己维护本轮可变 `messages` 历史。
     /// 2. 每次循环只调用一次 `llm.generate(messages)`，禁止再走“first/final”两段式专用请求。
     /// 3. 当前轮只要模型返回了可见文本，就立刻通过已绑定用户上下文的 `router_tx` 发送 `text_output` 事件。
     /// 4. 当前轮返回的全部 `tool_calls` 都要逐个发送 `tool_call`、执行工具、发送 `tool_result`，并把 assistant/tool 消息追加回 `messages`。
     /// 5. 只有当本次 `generate` 返回空 `tool_calls` 时才能结束循环；最终回复就是最后一次文本输出。
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use openjarvis::{agent::AgentLoop, llm::MockLLMProvider};
+    /// use std::sync::Arc;
+    ///
+    /// # async fn demo(loop_runner: AgentLoop, event_tx: openjarvis::agent::AgentEventSender, incoming: openjarvis::model::IncomingMessage, thread: openjarvis::thread::Thread) -> anyhow::Result<()> {
+    /// let output = loop_runner.run_v1(event_tx, &incoming, thread).await?;
+    /// assert!(!output.reply.is_empty());
+    /// # Ok(())
+    /// # }
+    /// let _ = Arc::new(MockLLMProvider::new("reply"));
+    /// ```
     pub async fn run_v1(
         &self,
         event_tx: AgentEventSender,
         incoming: &IncomingMessage,
         thread_context: Thread,
     ) -> Result<AgentLoopOutput> {
-        self.run_live_thread(event_tx, thread_context, incoming_message(incoming))
+        self.run_v1_with_ut_probe(event_tx, incoming, thread_context, None)
             .await
+    }
+
+    /// Run one agent loop while exposing doc-hidden UT probe hooks for integration tests.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use openjarvis::agent::{
+    ///     AgentLoop,
+    ///     agent_loop::{AgentLoopUTLoopState, AgentLoopUTProber, UTProbe},
+    /// };
+    ///
+    /// struct Probe;
+    ///
+    /// impl AgentLoopUTProber for Probe {
+    ///     fn on_loop_begin(&mut self, state: &AgentLoopUTLoopState) {
+    ///         assert!(state.iteration <= 16);
+    ///     }
+    /// }
+    ///
+    /// # async fn demo(loop_runner: AgentLoop, event_tx: openjarvis::agent::AgentEventSender, incoming: openjarvis::model::IncomingMessage, thread: openjarvis::thread::Thread) -> anyhow::Result<()> {
+    /// let mut probe = Probe;
+    /// let _output = loop_runner
+    ///     .run_v1_with_ut_probe(event_tx, &incoming, thread, Some(&mut probe as UTProbe<'_>))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(hidden)]
+    pub async fn run_v1_with_ut_probe(
+        &self,
+        event_tx: AgentEventSender,
+        incoming: &IncomingMessage,
+        thread_context: Thread,
+        ut_probe: Option<UTProbe<'_>>,
+    ) -> Result<AgentLoopOutput> {
+        let mut ut_probe = AgentLoopUTProberHandle::new(ut_probe);
+        self.run_live_thread(
+            event_tx,
+            thread_context,
+            incoming_message(incoming),
+            &mut ut_probe,
+        )
+        .await
     }
 
     async fn run_live_thread(
@@ -333,6 +588,7 @@ impl AgentLoop {
         event_tx: AgentEventSender,
         thread_context: Thread,
         current_message: ChatMessage,
+        ut_probe: &mut AgentLoopUTProberHandle<'_>,
     ) -> Result<AgentLoopOutput> {
         let mut thread_context = thread_context;
         let mut request_system_messages = Vec::new();
@@ -359,9 +615,18 @@ impl AgentLoop {
         let mut used_tool_names = Vec::new();
         let mut last_visible_tools = Vec::new();
         let mut last_budget_report = None;
+        let mut loop_iteration = 0usize;
 
         let loop_result = async {
             let reply = loop {
+                ut_probe.on_loop_begin(
+                    loop_iteration,
+                    &thread_context,
+                    &request_system_messages,
+                    &live_chat_messages,
+                    &commit_messages,
+                    persist_incoming_user,
+                );
                 let request_state = self
                     .prepare_request_state(
                         &thread_context,
@@ -369,6 +634,7 @@ impl AgentLoop {
                         &live_chat_messages,
                     )
                     .await?;
+                ut_probe.on_request_prepared(loop_iteration, &request_state);
                 last_visible_tools = request_state.tools.clone();
                 last_budget_report = Some(request_state.budget_report.clone());
 
@@ -398,6 +664,29 @@ impl AgentLoop {
                         );
                         event_tx.send(compact_event.clone()).await?;
                         events.push(compact_event);
+                        ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                            iteration: loop_iteration,
+                            reason: "runtime_threshold".to_string(),
+                            requested_by_model: false,
+                            is_error: false,
+                            budget_report: request_state.budget_report.clone(),
+                            outcome: Some(outcome),
+                            error: None,
+                            thread_messages: thread_context.load_messages(),
+                            request_system_messages: request_system_messages.clone(),
+                            live_chat_messages: live_chat_messages.clone(),
+                            commit_messages: commit_messages.clone(),
+                            persist_incoming_user,
+                        });
+                        ut_probe.on_loop_end(
+                            loop_iteration,
+                            &thread_context,
+                            &request_system_messages,
+                            &live_chat_messages,
+                            &commit_messages,
+                            persist_incoming_user,
+                        );
+                        loop_iteration += 1;
                         continue;
                     }
                 }
@@ -417,6 +706,7 @@ impl AgentLoop {
                 );
 
                 let response = self.llm.generate(LLMRequest { messages, tools }).await?;
+                ut_probe.on_llm_response(loop_iteration, &response);
 
                 info!(
                     toolcalls_count = %response.tool_calls.len(),
@@ -447,6 +737,14 @@ impl AgentLoop {
                     events.push(text_event);
                     live_chat_messages.push(assistant_message.clone());
                     commit_messages.push(assistant_message.clone());
+                    ut_probe.on_loop_end(
+                        loop_iteration,
+                        &thread_context,
+                        &request_system_messages,
+                        &live_chat_messages,
+                        &commit_messages,
+                        persist_incoming_user,
+                    );
                     break assistant_message.content;
                 }
 
@@ -512,6 +810,11 @@ impl AgentLoop {
                             payload: tool_call_event.metadata.clone(),
                         })
                         .await?;
+                    ut_probe.on_tool_call_start(AgentLoopUTToolCallSnapshot {
+                        iteration: loop_iteration,
+                        tool_call_id: provider_tool_call.id.clone(),
+                        request: tool_call.clone(),
+                    });
                     info!(
                         thread_id = %thread_id,
                         tool_name = %tool_call.name,
@@ -553,6 +856,20 @@ impl AgentLoop {
                                 compact_event.metadata.clone(),
                                 true,
                             ));
+                            ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                                iteration: loop_iteration,
+                                reason: "tool_requested".to_string(),
+                                requested_by_model: true,
+                                is_error: true,
+                                budget_report: budget_report.clone(),
+                                outcome: None,
+                                error: Some(error_message),
+                                thread_messages: thread_context.load_messages(),
+                                request_system_messages: request_system_messages.clone(),
+                                live_chat_messages: live_chat_messages.clone(),
+                                commit_messages: commit_messages.clone(),
+                                persist_incoming_user,
+                            });
                             continue;
                         }
 
@@ -608,6 +925,20 @@ impl AgentLoop {
                                     compact_event.metadata.clone(),
                                     false,
                                 ));
+                                ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                                    iteration: loop_iteration,
+                                    reason: "tool_requested".to_string(),
+                                    requested_by_model: true,
+                                    is_error: false,
+                                    budget_report: budget_report.clone(),
+                                    outcome: outcome.clone(),
+                                    error: None,
+                                    thread_messages: thread_context.load_messages(),
+                                    request_system_messages: request_system_messages.clone(),
+                                    live_chat_messages: live_chat_messages.clone(),
+                                    commit_messages: commit_messages.clone(),
+                                    persist_incoming_user,
+                                });
                                 if outcome.is_some() {
                                     restart_loop_after_compaction = true;
                                     break;
@@ -641,6 +972,20 @@ impl AgentLoop {
                                     compact_event.metadata.clone(),
                                     true,
                                 ));
+                                ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                                    iteration: loop_iteration,
+                                    reason: "tool_requested".to_string(),
+                                    requested_by_model: true,
+                                    is_error: true,
+                                    budget_report: budget_report.clone(),
+                                    outcome: None,
+                                    error: Some(error_message),
+                                    thread_messages: thread_context.load_messages(),
+                                    request_system_messages: request_system_messages.clone(),
+                                    live_chat_messages: live_chat_messages.clone(),
+                                    commit_messages: commit_messages.clone(),
+                                    persist_incoming_user,
+                                });
                             }
                         }
                         continue;
@@ -659,6 +1004,13 @@ impl AgentLoop {
                                         }),
                                     })
                                     .await?;
+
+                                info!(
+                                    toolcall = %tool_call.name,
+                                    result = %result_metadata,
+                                    "[toolcall]"
+                                );
+
                                 result
                             }
                             Err(error) => {
@@ -737,11 +1089,36 @@ impl AgentLoop {
                     .with_tool_call_id(provider_tool_call.id.clone());
                     live_chat_messages.push(tool_result_message.clone());
                     commit_messages.push(tool_result_message);
+                    ut_probe.on_tool_result(AgentLoopUTToolResultSnapshot {
+                        iteration: loop_iteration,
+                        tool_call_id: provider_tool_call.id,
+                        request: tool_call,
+                        result: tool_result,
+                    });
                 }
 
                 if restart_loop_after_compaction {
+                    ut_probe.on_loop_end(
+                        loop_iteration,
+                        &thread_context,
+                        &request_system_messages,
+                        &live_chat_messages,
+                        &commit_messages,
+                        persist_incoming_user,
+                    );
+                    loop_iteration += 1;
                     continue;
                 }
+
+                ut_probe.on_loop_end(
+                    loop_iteration,
+                    &thread_context,
+                    &request_system_messages,
+                    &live_chat_messages,
+                    &commit_messages,
+                    persist_incoming_user,
+                );
+                loop_iteration += 1;
             };
 
             let mcp_server_count = self.runtime.tools().mcp().list_servers().await.len();
