@@ -10,7 +10,9 @@ pub mod store;
 
 use crate::context::ChatMessage;
 use crate::model::IncomingMessage;
-use crate::thread::{Thread, ThreadContextLocator, ThreadToolEvent, derive_internal_thread_id};
+use crate::thread::{
+    Thread, ThreadContextLocator, ThreadFinalizedTurn, ThreadToolEvent, derive_internal_thread_id,
+};
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -574,6 +576,64 @@ impl SessionManager {
         self.store
             .save_external_message_record(locator, &record)
             .await
+    }
+
+    /// Persist one finalized thread-owned turn snapshot and bind dedup to the same store write.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo(
+    /// #     manager: openjarvis::session::SessionManager,
+    /// #     locator: openjarvis::session::ThreadLocator,
+    /// #     finalized_turn: openjarvis::thread::ThreadFinalizedTurn,
+    /// # ) -> openjarvis::session::SessionStoreResult<()> {
+    /// manager.commit_finalized_turn(&locator, &finalized_turn).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn commit_finalized_turn(
+        &self,
+        locator: &ThreadLocator,
+        finalized_turn: &ThreadFinalizedTurn,
+    ) -> SessionStoreResult<Uuid> {
+        let session_key = locator.session_key();
+        let _ = self
+            .store
+            .resolve_or_create_session(&session_key, finalized_turn.completed_at)
+            .await?;
+        let mut thread_context = finalized_turn.snapshot.clone();
+        thread_context.rebind_locator(ThreadContextLocator::from(locator));
+        let dedup_record = finalized_turn
+            .external_message_id
+            .as_ref()
+            .map(|external_message_id| ExternalMessageDedupRecord {
+                thread_id: locator.thread_id,
+                external_message_id: external_message_id.clone(),
+                turn_id: Some(finalized_turn.turn_id),
+                completed_at: finalized_turn.completed_at,
+            });
+        let persisted = self
+            .save_turn_snapshot_with_retry(
+                locator,
+                thread_context,
+                finalized_turn.completed_at,
+                dedup_record.as_ref(),
+            )
+            .await?;
+        self.sync_thread_context_to_cache(
+            &session_key,
+            locator,
+            &persisted,
+            finalized_turn.completed_at,
+        )
+        .await;
+        info!(
+            thread_id = %locator.thread_id,
+            turn_id = %finalized_turn.turn_id,
+            has_dedup_record = dedup_record.is_some(),
+            "committed finalized thread-owned turn"
+        );
+        Ok(finalized_turn.turn_id)
     }
 
     /// Persist one completed message commit for the provided channel/user/thread tuple.

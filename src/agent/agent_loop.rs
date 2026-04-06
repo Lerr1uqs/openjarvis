@@ -1,4 +1,5 @@
-//! ReAct-style agent loop that calls the LLM, executes tools, and streams events to the router.
+//! ReAct-style agent loop that finalizes one thread-owned turn per LLM interaction and only
+//! releases turn event batches after each turn finalization.
 
 use super::{
     feature::AutoCompactor,
@@ -15,21 +16,23 @@ use crate::{
     config::{AgentCompactConfig, LLMConfig},
     llm::{LLMProvider, LLMRequest},
     model::{IncomingMessage, ReplyTarget},
-    thread::{Thread, ThreadToolEvent, ThreadToolEventKind},
+    thread::{
+        Thread, ThreadFinalizedTurn, ThreadToolEvent, ThreadToolEventKind, ThreadTurnEvent,
+        ThreadTurnEventKind,
+    },
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use std::sync::Arc;
+use tracing::{error, info};
 
 const TOOL_LOG_PREVIEW_MAX_CHARS: usize = 512;
 /// Default max character count used for channel-facing `ToolCall` and `ToolResult` event text.
 pub const TOOL_EVENT_PREVIEW_MAX_CHARS: usize = 300;
+
+pub type AgentLoopEvent = ThreadTurnEvent;
+pub type AgentLoopEventKind = ThreadTurnEventKind;
 
 #[derive(Debug, Clone)]
 pub struct AgentDispatchEvent {
@@ -48,9 +51,9 @@ pub struct AgentDispatchEvent {
     pub reply_to_source: bool,
 }
 
+/// Bind agent turn events to one resolved router/session context.
 #[derive(Clone)]
 pub struct AgentEventSender {
-    router_tx: mpsc::Sender<AgentDispatchEvent>,
     channel: String,
     external_thread_id: Option<String>,
     source_message_id: Option<String>,
@@ -60,39 +63,10 @@ pub struct AgentEventSender {
     session_user_id: String,
     session_external_thread_id: String,
     session_thread_id: String,
-    should_reply_to_source: Arc<AtomicBool>,
 }
 
 impl AgentEventSender {
-    /// Bind the router sender to one user/session context so agent events can be emitted directly.
-    pub fn new(
-        router_tx: mpsc::Sender<AgentDispatchEvent>,
-        channel: impl Into<String>,
-        external_thread_id: Option<String>,
-        source_message_id: Option<String>,
-        target: ReplyTarget,
-        session_id: impl Into<String>,
-        session_channel: impl Into<String>,
-        session_user_id: impl Into<String>,
-        session_external_thread_id: impl Into<String>,
-        session_thread_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            router_tx,
-            channel: channel.into(),
-            external_thread_id,
-            source_message_id,
-            target,
-            session_id: session_id.into(),
-            session_channel: session_channel.into(),
-            session_user_id: session_user_id.into(),
-            session_external_thread_id: session_external_thread_id.into(),
-            session_thread_id: session_thread_id.into(),
-            should_reply_to_source: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    /// Bind the router sender from one resolved thread locator and the current incoming message.
+    /// Bind one event sender from the current incoming message and resolved thread locator.
     ///
     /// # 示例
     /// ```rust
@@ -100,13 +74,11 @@ impl AgentEventSender {
     /// use openjarvis::{
     ///     agent::AgentEventSender,
     ///     model::{IncomingMessage, ReplyTarget},
-    ///     thread::ThreadContextLocator,
+    ///     thread::{ThreadContextLocator, ThreadTurnEvent, ThreadTurnEventKind},
     /// };
     /// use serde_json::json;
-    /// use tokio::sync::mpsc;
     /// use uuid::Uuid;
     ///
-    /// let (tx, _rx) = mpsc::channel(1);
     /// let incoming = IncomingMessage {
     ///     id: Uuid::new_v4(),
     ///     external_message_id: Some("msg_1".to_string()),
@@ -131,76 +103,70 @@ impl AgentEventSender {
     ///     "thread_internal",
     /// );
     ///
-    /// let _sender = AgentEventSender::from_incoming_and_locator(tx, &incoming, &locator);
+    /// let sender = AgentEventSender::from_incoming_and_locator(&incoming, &locator);
+    /// let batch = sender.prepare_dispatch_batch(&[ThreadTurnEvent {
+    ///     kind: ThreadTurnEventKind::TextOutput,
+    ///     content: "done".to_string(),
+    ///     metadata: json!({}),
+    /// }]);
+    /// assert_eq!(batch[0].session_thread_id, "thread_internal");
     /// ```
     pub fn from_incoming_and_locator(
-        router_tx: mpsc::Sender<AgentDispatchEvent>,
         incoming: &IncomingMessage,
         locator: &crate::thread::ThreadContextLocator,
     ) -> Self {
-        Self::new(
-            router_tx,
-            incoming.channel.clone(),
-            incoming.external_thread_id.clone(),
-            incoming.external_message_id.clone(),
-            incoming.reply_target.clone(),
-            locator.session_id.clone().unwrap_or_default(),
-            locator.channel.clone(),
-            locator.user_id.clone(),
-            locator.external_thread_id.clone(),
-            locator.thread_id.clone(),
-        )
+        Self {
+            channel: incoming.channel.clone(),
+            external_thread_id: incoming.external_thread_id.clone(),
+            source_message_id: incoming.external_message_id.clone(),
+            target: incoming.reply_target.clone(),
+            session_id: locator.session_id.clone().unwrap_or_default(),
+            session_channel: locator.channel.clone(),
+            session_user_id: locator.user_id.clone(),
+            session_external_thread_id: locator.external_thread_id.clone(),
+            session_thread_id: locator.thread_id.clone(),
+        }
     }
 
-    /// Convert one agent-loop event into a structured dispatch event for the router.
-    pub async fn send(&self, event: AgentLoopEvent) -> Result<()> {
-        let reply_to_source = self.should_reply_to_source.swap(false, Ordering::AcqRel);
-
-        self.router_tx
-            .send(AgentDispatchEvent {
-                kind: event.kind,
-                content: event.content,
-                metadata: event.metadata,
-                channel: self.channel.clone(),
-                external_thread_id: self.external_thread_id.clone(),
-                source_message_id: self.source_message_id.clone(),
-                target: self.target.clone(),
-                session_id: self.session_id.clone(),
-                session_channel: self.session_channel.clone(),
-                session_user_id: self.session_user_id.clone(),
-                session_external_thread_id: self.session_external_thread_id.clone(),
-                session_thread_id: self.session_thread_id.clone(),
-                reply_to_source,
+    /// Materialize one finalized turn event batch into router-ready dispatch payloads.
+    pub fn prepare_dispatch_batch(&self, events: &[AgentLoopEvent]) -> Vec<AgentDispatchEvent> {
+        let mut reply_to_source = true;
+        events
+            .iter()
+            .cloned()
+            .map(|event| {
+                let dispatch = AgentDispatchEvent {
+                    kind: event.kind,
+                    content: event.content,
+                    metadata: event.metadata,
+                    channel: self.channel.clone(),
+                    external_thread_id: self.external_thread_id.clone(),
+                    source_message_id: self.source_message_id.clone(),
+                    target: self.target.clone(),
+                    session_id: self.session_id.clone(),
+                    session_channel: self.session_channel.clone(),
+                    session_user_id: self.session_user_id.clone(),
+                    session_external_thread_id: self.session_external_thread_id.clone(),
+                    session_thread_id: self.session_thread_id.clone(),
+                    reply_to_source,
+                };
+                reply_to_source = false;
+                dispatch
             })
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to forward agent event to router: {}", error))
+            .collect()
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentLoopEventKind {
-    TextOutput,
-    ToolCall,
-    ToolResult,
-    Compact,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentLoopEvent {
-    pub kind: AgentLoopEventKind,
-    pub content: String,
-    pub metadata: Value,
 }
 
 pub struct AgentLoopOutput {
     pub reply: String,
     pub metadata: Value,
-    pub events: Vec<AgentLoopEvent>,
-    pub commit_messages: Vec<ChatMessage>,
-    pub persist_incoming_user: bool,
-    pub thread_context: Thread,
-    pub loaded_toolsets: Vec<String>,
-    pub tool_events: Vec<ThreadToolEvent>,
+    pub turns: Vec<CompletedAgentTurn>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedAgentTurn {
+    pub turn: ThreadFinalizedTurn,
+    pub dispatch_batch: Vec<AgentDispatchEvent>,
 }
 
 /// Integration-test probe state captured at one agent-loop iteration boundary.
@@ -208,11 +174,10 @@ pub struct AgentLoopOutput {
 #[derive(Debug, Clone)]
 pub struct AgentLoopUTLoopState {
     pub iteration: usize,
-    pub thread_messages: Vec<ChatMessage>,
-    pub request_system_messages: Vec<ChatMessage>,
-    pub live_chat_messages: Vec<ChatMessage>,
-    pub commit_messages: Vec<ChatMessage>,
-    pub persist_incoming_user: bool,
+    pub request_messages: Vec<ChatMessage>,
+    pub active_non_system_messages: Vec<ChatMessage>,
+    pub current_turn_working_messages: Vec<ChatMessage>,
+    pub turn_events: Vec<AgentLoopEvent>,
 }
 
 /// Integration-test snapshot captured after request preparation.
@@ -264,11 +229,10 @@ pub struct AgentLoopUTCompactSnapshot {
     pub budget_report: ContextBudgetReport,
     pub outcome: Option<MessageCompactionOutcome>,
     pub error: Option<String>,
-    pub thread_messages: Vec<ChatMessage>,
-    pub request_system_messages: Vec<ChatMessage>,
-    pub live_chat_messages: Vec<ChatMessage>,
-    pub commit_messages: Vec<ChatMessage>,
-    pub persist_incoming_user: bool,
+    pub request_messages: Vec<ChatMessage>,
+    pub active_non_system_messages: Vec<ChatMessage>,
+    pub current_turn_working_messages: Vec<ChatMessage>,
+    pub turn_events: Vec<AgentLoopEvent>,
 }
 
 /// Integration-test probe hooks for observing intermediate agent-loop state.
@@ -302,42 +266,18 @@ impl<'a> AgentLoopUTProberHandle<'a> {
         Self { probe }
     }
 
-    fn build_loop_state(
-        &self,
-        iteration: usize,
-        thread_context: &Thread,
-        request_system_messages: &[ChatMessage],
-        live_chat_messages: &[ChatMessage],
-        commit_messages: &[ChatMessage],
-        persist_incoming_user: bool,
-    ) -> AgentLoopUTLoopState {
+    fn build_loop_state(&self, iteration: usize, thread_context: &Thread) -> AgentLoopUTLoopState {
         AgentLoopUTLoopState {
             iteration,
-            thread_messages: thread_context.load_messages(),
-            request_system_messages: request_system_messages.to_vec(),
-            live_chat_messages: live_chat_messages.to_vec(),
-            commit_messages: commit_messages.to_vec(),
-            persist_incoming_user,
+            request_messages: thread_context.messages(),
+            active_non_system_messages: thread_context.active_non_system_messages(),
+            current_turn_working_messages: thread_context.current_turn_working_messages(),
+            turn_events: thread_context.current_turn_events(),
         }
     }
 
-    fn on_loop_begin(
-        &mut self,
-        iteration: usize,
-        thread_context: &Thread,
-        request_system_messages: &[ChatMessage],
-        live_chat_messages: &[ChatMessage],
-        commit_messages: &[ChatMessage],
-        persist_incoming_user: bool,
-    ) {
-        let state = self.build_loop_state(
-            iteration,
-            thread_context,
-            request_system_messages,
-            live_chat_messages,
-            commit_messages,
-            persist_incoming_user,
-        );
+    fn on_loop_begin(&mut self, iteration: usize, thread_context: &Thread) {
+        let state = self.build_loop_state(iteration, thread_context);
         if let Some(probe) = self.probe.as_deref_mut() {
             probe.on_loop_begin(&state);
         }
@@ -384,23 +324,8 @@ impl<'a> AgentLoopUTProberHandle<'a> {
         }
     }
 
-    fn on_loop_end(
-        &mut self,
-        iteration: usize,
-        thread_context: &Thread,
-        request_system_messages: &[ChatMessage],
-        live_chat_messages: &[ChatMessage],
-        commit_messages: &[ChatMessage],
-        persist_incoming_user: bool,
-    ) {
-        let state = self.build_loop_state(
-            iteration,
-            thread_context,
-            request_system_messages,
-            live_chat_messages,
-            commit_messages,
-            persist_incoming_user,
-        );
+    fn on_loop_end(&mut self, iteration: usize, thread_context: &Thread) {
+        let state = self.build_loop_state(iteration, thread_context);
         if let Some(probe) = self.probe.as_deref_mut() {
             probe.on_loop_end(&state);
         }
@@ -509,27 +434,8 @@ impl AgentLoop {
         &self.runtime
     }
 
-    /// Run one ReAct loop from `Thread + incoming`, and stream user-visible events to the router.
-    ///
-    /// ReAct contract:
-    /// 1. `run_v1` 接收 `Thread + 当前 incoming`，由 loop 自己维护本轮可变 `messages` 历史。
-    /// 2. 每次循环只调用一次 `llm.generate(messages)`，禁止再走“first/final”两段式专用请求。
-    /// 3. 当前轮只要模型返回了可见文本，就立刻通过已绑定用户上下文的 `router_tx` 发送 `text_output` 事件。
-    /// 4. 当前轮返回的全部 `tool_calls` 都要逐个发送 `tool_call`、执行工具、发送 `tool_result`，并把 assistant/tool 消息追加回 `messages`。
-    /// 5. 只有当本次 `generate` 返回空 `tool_calls` 时才能结束循环；最终回复就是最后一次文本输出。
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// use openjarvis::{agent::AgentLoop, llm::MockLLMProvider};
-    /// use std::sync::Arc;
-    ///
-    /// # async fn demo(loop_runner: AgentLoop, event_tx: openjarvis::agent::AgentEventSender, incoming: openjarvis::model::IncomingMessage, thread: openjarvis::thread::Thread) -> anyhow::Result<()> {
-    /// let output = loop_runner.run_v1(event_tx, &incoming, thread).await?;
-    /// assert!(!output.reply.is_empty());
-    /// # Ok(())
-    /// # }
-    /// let _ = Arc::new(MockLLMProvider::new("reply"));
-    /// ```
+    /// Run one agent request from `Thread + incoming` and return every finalized turn produced by
+    /// the internal loop.
     pub async fn run_v1(
         &self,
         event_tx: AgentEventSender,
@@ -541,30 +447,6 @@ impl AgentLoop {
     }
 
     /// Run one agent loop while exposing doc-hidden UT probe hooks for integration tests.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// use openjarvis::agent::{
-    ///     AgentLoop,
-    ///     agent_loop::{AgentLoopUTLoopState, AgentLoopUTProber, UTProbe},
-    /// };
-    ///
-    /// struct Probe;
-    ///
-    /// impl AgentLoopUTProber for Probe {
-    ///     fn on_loop_begin(&mut self, state: &AgentLoopUTLoopState) {
-    ///         assert!(state.iteration <= 16);
-    ///     }
-    /// }
-    ///
-    /// # async fn demo(loop_runner: AgentLoop, event_tx: openjarvis::agent::AgentEventSender, incoming: openjarvis::model::IncomingMessage, thread: openjarvis::thread::Thread) -> anyhow::Result<()> {
-    /// let mut probe = Probe;
-    /// let _output = loop_runner
-    ///     .run_v1_with_ut_probe(event_tx, &incoming, thread, Some(&mut probe as UTProbe<'_>))
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     #[doc(hidden)]
     pub async fn run_v1_with_ut_probe(
         &self,
@@ -578,6 +460,7 @@ impl AgentLoop {
             event_tx,
             thread_context,
             incoming_message(incoming),
+            incoming.external_message_id.clone(),
             &mut ut_probe,
         )
         .await
@@ -587,14 +470,13 @@ impl AgentLoop {
         &self,
         event_tx: AgentEventSender,
         thread_context: Thread,
-        current_message: ChatMessage,
+        initial_message: ChatMessage,
+        external_message_id: Option<String>,
         ut_probe: &mut AgentLoopUTProberHandle<'_>,
     ) -> Result<AgentLoopOutput> {
         let mut thread_context = thread_context;
-        let mut request_system_messages = Vec::new();
-        let mut live_chat_messages = Vec::new();
         self.prepare_thread_runtime(&mut thread_context).await?;
-        live_chat_messages.push(current_message);
+
         let hooks = self.runtime.hooks();
         let thread_locator = thread_context.locator.clone();
         let thread_id = thread_locator.thread_id.clone();
@@ -609,87 +491,60 @@ impl AgentLoop {
             })
             .await?;
 
-        let mut events = Vec::new();
-        let mut commit_messages = Vec::new();
-        let mut persist_incoming_user = true;
         let mut used_tool_names = Vec::new();
         let mut last_visible_tools = Vec::new();
         let mut last_budget_report = None;
+        let mut completed_turns = Vec::new();
+        let mut pending_turn_input_messages = vec![initial_message];
         let mut loop_iteration = 0usize;
 
-        let loop_result = async {
-            let reply = loop {
-                ut_probe.on_loop_begin(
-                    loop_iteration,
-                    &thread_context,
-                    &request_system_messages,
-                    &live_chat_messages,
-                    &commit_messages,
-                    persist_incoming_user,
-                );
-                let request_state = self
-                    .prepare_request_state(
-                        &thread_context,
-                        &mut request_system_messages,
-                        &live_chat_messages,
+        let reply = loop {
+            ut_probe.on_loop_begin(loop_iteration, &thread_context);
+            let pre_turn_request_state = self.prepare_request_state(&thread_context).await?;
+            if self.should_runtime_compact(&thread_context, &pre_turn_request_state.budget_report) {
+                if let Some(outcome) = self
+                    .execute_turn_compaction(
+                        &hooks,
+                        &thread_id,
+                        &mut thread_context,
+                        "runtime_threshold",
+                        false,
+                        None,
+                        &pre_turn_request_state.budget_report,
                     )
-                    .await?;
+                    .await?
+                {
+                    ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                        iteration: loop_iteration,
+                        reason: "runtime_threshold".to_string(),
+                        requested_by_model: false,
+                        is_error: false,
+                        budget_report: pre_turn_request_state.budget_report.clone(),
+                        outcome: Some(outcome),
+                        error: None,
+                        request_messages: thread_context.messages(),
+                        active_non_system_messages: thread_context.active_non_system_messages(),
+                        current_turn_working_messages: thread_context
+                            .current_turn_working_messages(),
+                        turn_events: thread_context.current_turn_events(),
+                    });
+                }
+            }
+
+            let started_at = pending_turn_input_messages
+                .first()
+                .map(|message| message.created_at)
+                .unwrap_or_else(Utc::now);
+            thread_context.begin_turn(external_message_id.clone(), started_at)?;
+            for message in pending_turn_input_messages.drain(..) {
+                thread_context.push_turn_message(message)?;
+            }
+
+            let turn_result = async {
+                let request_state = self.prepare_request_state(&thread_context).await?;
                 ut_probe.on_request_prepared(loop_iteration, &request_state);
                 last_visible_tools = request_state.tools.clone();
                 last_budget_report = Some(request_state.budget_report.clone());
-
-                if self.should_runtime_compact(&live_chat_messages, &request_state.budget_report) {
-                    if let Some(outcome) = self
-                        .execute_working_chat_compaction(
-                            &hooks,
-                            &thread_id,
-                            &mut thread_context,
-                            &mut request_system_messages,
-                            &mut live_chat_messages,
-                            &mut commit_messages,
-                            &mut persist_incoming_user,
-                            "runtime_threshold",
-                            &request_state.budget_report,
-                        )
-                        .await?
-                    {
-                        let compact_event = build_compact_event(
-                            "runtime_threshold",
-                            false,
-                            false,
-                            &request_state.budget_report,
-                            Some(&outcome),
-                            None,
-                            None,
-                        );
-                        event_tx.send(compact_event.clone()).await?;
-                        events.push(compact_event);
-                        ut_probe.on_compact(AgentLoopUTCompactSnapshot {
-                            iteration: loop_iteration,
-                            reason: "runtime_threshold".to_string(),
-                            requested_by_model: false,
-                            is_error: false,
-                            budget_report: request_state.budget_report.clone(),
-                            outcome: Some(outcome),
-                            error: None,
-                            thread_messages: thread_context.load_messages(),
-                            request_system_messages: request_system_messages.clone(),
-                            live_chat_messages: live_chat_messages.clone(),
-                            commit_messages: commit_messages.clone(),
-                            persist_incoming_user,
-                        });
-                        ut_probe.on_loop_end(
-                            loop_iteration,
-                            &thread_context,
-                            &request_system_messages,
-                            &live_chat_messages,
-                            &commit_messages,
-                            persist_incoming_user,
-                        );
-                        loop_iteration += 1;
-                        continue;
-                    }
-                }
 
                 let RequestState {
                     messages,
@@ -699,9 +554,9 @@ impl AgentLoop {
 
                 info!(
                     last_content = %messages
-                                    .last()
-                                    .map(|m| m.content.chars().take(50).collect::<String>())
-                                    .unwrap_or("None".into()),
+                        .last()
+                        .map(|m| m.content.chars().take(50).collect::<String>())
+                        .unwrap_or("None".into()),
                     "[LLM-GENERATE] before",
                 );
 
@@ -710,10 +565,11 @@ impl AgentLoop {
 
                 info!(
                     toolcalls_count = %response.tool_calls.len(),
-                    content = response.message
-                                    .as_ref()
-                                    .map(|m| m.content.chars().take(50).collect::<String>())
-                                    .unwrap_or("None".into()),
+                    content = response
+                        .message
+                        .as_ref()
+                        .map(|m| m.content.chars().take(50).collect::<String>())
+                        .unwrap_or("None".into()),
                     "[LLM-GENERATE] after"
                 );
 
@@ -725,89 +581,62 @@ impl AgentLoop {
                         bail!("llm final response did not contain assistant text");
                     }
 
-                    let text_event = AgentLoopEvent {
+                    thread_context.push_turn_message(assistant_message.clone())?;
+                    thread_context.buffer_turn_event(AgentLoopEvent {
                         kind: AgentLoopEventKind::TextOutput,
                         content: assistant_message.content.clone(),
                         metadata: json!({
                             "source": "llm_response",
                             "is_final": true,
                         }),
-                    };
-                    event_tx.send(text_event.clone()).await?;
-                    events.push(text_event);
-                    live_chat_messages.push(assistant_message.clone());
-                    commit_messages.push(assistant_message.clone());
-                    ut_probe.on_loop_end(
-                        loop_iteration,
-                        &thread_context,
-                        &request_system_messages,
-                        &live_chat_messages,
-                        &commit_messages,
-                        persist_incoming_user,
-                    );
-                    break assistant_message.content;
+                    })?;
+                    return Ok::<TurnLoopSuccess, anyhow::Error>(TurnLoopSuccess {
+                        reply: assistant_message.content,
+                        has_more_turns: false,
+                    });
                 }
 
                 let assistant_tool_message = build_assistant_tool_call_message(
                     response.message.as_ref(),
                     &response.tool_calls,
                 );
+                let turn_reply = response
+                    .message
+                    .as_ref()
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default();
                 if let Some(message) = response.message.as_ref()
                     && !message.content.trim().is_empty()
                 {
-                    let text_event = AgentLoopEvent {
+                    thread_context.buffer_turn_event(AgentLoopEvent {
                         kind: AgentLoopEventKind::TextOutput,
                         content: message.content.clone(),
                         metadata: json!({
                             "source": "llm_response",
                             "is_final": false,
                         }),
-                    };
-                    event_tx.send(text_event.clone()).await?;
-                    events.push(text_event);
+                    })?;
                 }
+                thread_context.push_turn_message(assistant_tool_message)?;
 
-                live_chat_messages.push(assistant_tool_message.clone());
-                commit_messages.push(assistant_tool_message);
-
-                let mut restart_loop_after_compaction = false;
                 for provider_tool_call in response.tool_calls {
                     let tool_call = ToolCallRequest {
                         name: provider_tool_call.name.clone(),
                         arguments: provider_tool_call.arguments.clone(),
                     };
-                    let tool_call_arguments = tool_call.arguments.to_string();
-                    let truncated_tool_call_arguments =
-                        truncate_tool_message(&tool_call_arguments, TOOL_EVENT_PREVIEW_MAX_CHARS);
-                    if truncated_tool_call_arguments != tool_call_arguments {
-                        debug!(
-                            thread_id = %thread_id,
-                            tool_name = %tool_call.name,
-                            tool_call_id = %provider_tool_call.id,
-                            original_chars = tool_call_arguments.chars().count(),
-                            truncated_chars = truncated_tool_call_arguments.chars().count(),
-                            max_chars = TOOL_EVENT_PREVIEW_MAX_CHARS,
-                            "agent loop truncated tool call event content"
-                        );
-                    }
-                    let tool_call_event = AgentLoopEvent {
-                        kind: AgentLoopEventKind::ToolCall,
-                        content: format!(
-                            "[openjarvis][tool_call] {} {}",
-                            tool_call.name, truncated_tool_call_arguments
-                        ),
-                        metadata: json!({
-                            "tool": tool_call.name,
-                            "arguments": tool_call.arguments,
-                            "tool_call_id": provider_tool_call.id.clone(),
-                        }),
-                    };
-                    event_tx.send(tool_call_event.clone()).await?;
-                    events.push(tool_call_event.clone());
+                    used_tool_names.push(tool_call.name.clone());
+                    thread_context.buffer_turn_event(build_tool_call_event(
+                        &tool_call,
+                        &provider_tool_call.id,
+                    ))?;
                     hooks
                         .emit(HookEvent {
                             kind: HookEventKind::PreToolUse,
-                            payload: tool_call_event.metadata.clone(),
+                            payload: json!({
+                                "tool": tool_call.name.clone(),
+                                "arguments": tool_call.arguments.clone(),
+                                "tool_call_id": provider_tool_call.id.clone(),
+                            }),
                         })
                         .await?;
                     ut_probe.on_tool_call_start(AgentLoopUTToolCallSnapshot {
@@ -826,269 +655,85 @@ impl AgentLoop {
                         "agent loop starting tool call"
                     );
 
-                    used_tool_names.push(tool_call.name.clone());
-                    if tool_call.name == "compact" {
-                        if !self.compact_config.enabled() {
-                            let error_message = "compact runtime is disabled".to_string();
-                            hooks
-                                .emit(HookEvent {
-                                    kind: HookEventKind::PostToolUseFailure,
-                                    payload: json!({
-                                        "tool": tool_call.name.clone(),
-                                        "error": error_message.clone(),
-                                    }),
-                                })
-                                .await?;
-                            let compact_event = build_compact_event(
-                                "tool_requested",
-                                true,
-                                true,
-                                &budget_report,
-                                None,
-                                Some(&provider_tool_call.id),
-                                Some(&error_message),
-                            );
-                            event_tx.send(compact_event.clone()).await?;
-                            events.push(compact_event.clone());
-                            thread_context.record_tool_event(build_compact_thread_tool_event(
-                                &tool_call,
-                                &provider_tool_call.id,
-                                compact_event.metadata.clone(),
-                                true,
-                            ));
-                            ut_probe.on_compact(AgentLoopUTCompactSnapshot {
-                                iteration: loop_iteration,
-                                reason: "tool_requested".to_string(),
-                                requested_by_model: true,
-                                is_error: true,
-                                budget_report: budget_report.clone(),
-                                outcome: None,
-                                error: Some(error_message),
-                                thread_messages: thread_context.load_messages(),
-                                request_system_messages: request_system_messages.clone(),
-                                live_chat_messages: live_chat_messages.clone(),
-                                commit_messages: commit_messages.clone(),
-                                persist_incoming_user,
-                            });
-                            continue;
-                        }
-
-                        match self
-                            .execute_working_chat_compaction(
-                                &hooks,
-                                &thread_id,
-                                &mut thread_context,
-                                &mut request_system_messages,
-                                &mut live_chat_messages,
-                                &mut commit_messages,
-                                &mut persist_incoming_user,
-                                "tool_requested",
-                                &budget_report,
-                            )
-                            .await
-                        {
-                            Ok(outcome) => {
-                                let compact_metadata = build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    false,
-                                    &budget_report,
-                                    outcome.as_ref(),
-                                    Some(&provider_tool_call.id),
-                                    None,
-                                )
-                                .metadata
-                                .clone();
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUse,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "result": compact_metadata,
-                                        }),
-                                    })
-                                    .await?;
-                                let compact_event = build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    false,
-                                    &budget_report,
-                                    outcome.as_ref(),
-                                    Some(&provider_tool_call.id),
-                                    None,
-                                );
-                                event_tx.send(compact_event.clone()).await?;
-                                events.push(compact_event.clone());
-                                thread_context.record_tool_event(build_compact_thread_tool_event(
-                                    &tool_call,
-                                    &provider_tool_call.id,
-                                    compact_event.metadata.clone(),
-                                    false,
-                                ));
-                                ut_probe.on_compact(AgentLoopUTCompactSnapshot {
-                                    iteration: loop_iteration,
-                                    reason: "tool_requested".to_string(),
-                                    requested_by_model: true,
-                                    is_error: false,
-                                    budget_report: budget_report.clone(),
-                                    outcome: outcome.clone(),
-                                    error: None,
-                                    thread_messages: thread_context.load_messages(),
-                                    request_system_messages: request_system_messages.clone(),
-                                    live_chat_messages: live_chat_messages.clone(),
-                                    commit_messages: commit_messages.clone(),
-                                    persist_incoming_user,
-                                });
-                                if outcome.is_some() {
-                                    restart_loop_after_compaction = true;
-                                    break;
+                    let tool_result = if tool_call.name == "compact" {
+                        self.handle_model_requested_compact(
+                            &hooks,
+                            &thread_id,
+                            &mut thread_context,
+                            &tool_call,
+                            &provider_tool_call.id,
+                            &budget_report,
+                            ut_probe,
+                            loop_iteration,
+                        )
+                        .await?
+                    } else {
+                        let tool_result =
+                            match self.call_thread_tool(&mut thread_context, &tool_call).await {
+                                Ok(result) => {
+                                    hooks
+                                        .emit(HookEvent {
+                                            kind: HookEventKind::PostToolUse,
+                                            payload: json!({
+                                                "tool": tool_call.name.clone(),
+                                                "result": result.metadata.clone(),
+                                            }),
+                                        })
+                                        .await?;
+                                    result
                                 }
-                            }
-                            Err(error) => {
-                                let error_message = error.to_string();
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUseFailure,
-                                        payload: json!({
+                                Err(error) => {
+                                    hooks
+                                        .emit(HookEvent {
+                                            kind: HookEventKind::PostToolUseFailure,
+                                            payload: json!({
+                                                "tool": tool_call.name.clone(),
+                                                "error": error.to_string(),
+                                            }),
+                                        })
+                                        .await?;
+                                    super::ToolCallResult {
+                                        content: error.to_string(),
+                                        metadata: json!({
                                             "tool": tool_call.name.clone(),
-                                            "error": error_message.clone(),
                                         }),
-                                    })
-                                    .await?;
-                                let compact_event = build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    true,
-                                    &budget_report,
-                                    None,
-                                    Some(&provider_tool_call.id),
-                                    Some(&error_message),
-                                );
-                                event_tx.send(compact_event.clone()).await?;
-                                events.push(compact_event.clone());
-                                thread_context.record_tool_event(build_compact_thread_tool_event(
-                                    &tool_call,
-                                    &provider_tool_call.id,
-                                    compact_event.metadata.clone(),
-                                    true,
-                                ));
-                                ut_probe.on_compact(AgentLoopUTCompactSnapshot {
-                                    iteration: loop_iteration,
-                                    reason: "tool_requested".to_string(),
-                                    requested_by_model: true,
-                                    is_error: true,
-                                    budget_report: budget_report.clone(),
-                                    outcome: None,
-                                    error: Some(error_message),
-                                    thread_messages: thread_context.load_messages(),
-                                    request_system_messages: request_system_messages.clone(),
-                                    live_chat_messages: live_chat_messages.clone(),
-                                    commit_messages: commit_messages.clone(),
-                                    persist_incoming_user,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-
-                    let tool_result =
-                        match self.call_thread_tool(&mut thread_context, &tool_call).await {
-                            Ok(result) => {
-                                let result_metadata = result.metadata.clone();
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUse,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "result": result_metadata,
-                                        }),
-                                    })
-                                    .await?;
-
-                                info!(
-                                    toolcall = %tool_call.name,
-                                    result = %result_metadata,
-                                    "[toolcall]"
-                                );
-
-                                result
-                            }
-                            Err(error) => {
-                                hooks
-                                    .emit(HookEvent {
-                                        kind: HookEventKind::PostToolUseFailure,
-                                        payload: json!({
-                                            "tool": tool_call.name.clone(),
-                                            "error": error.to_string(),
-                                        }),
-                                    })
-                                    .await?;
-                                super::ToolCallResult {
-                                    content: error.to_string(),
-                                    metadata: json!({
-                                        "tool": tool_call.name.clone(),
-                                    }),
-                                    is_error: true,
+                                        is_error: true,
+                                    }
                                 }
-                            }
-                        };
-                    thread_context.record_tool_event(build_thread_tool_event(
-                        &tool_call,
-                        &provider_tool_call.id,
-                        &tool_result,
-                    ));
-                    info!(
-                        thread_id = %thread_id,
-                        tool_name = %tool_call.name,
-                        tool_call_id = %provider_tool_call.id,
-                        is_error = tool_result.is_error,
-                        result_preview = %truncate_tool_log_preview(
-                            &tool_result.content,
-                            TOOL_LOG_PREVIEW_MAX_CHARS,
-                        ),
-                        "agent loop completed tool call"
-                    );
-
-                    let tool_result_content =
-                        format_tool_result_content(&tool_result.content, tool_result.is_error);
-                    let truncated_tool_result_content =
-                        truncate_tool_message(&tool_result_content, TOOL_EVENT_PREVIEW_MAX_CHARS);
-                    if truncated_tool_result_content != tool_result_content {
-                        debug!(
+                            };
+                        thread_context.record_tool_event(build_thread_tool_event(
+                            &tool_call,
+                            &provider_tool_call.id,
+                            &tool_result,
+                        ));
+                        info!(
                             thread_id = %thread_id,
                             tool_name = %tool_call.name,
                             tool_call_id = %provider_tool_call.id,
                             is_error = tool_result.is_error,
-                            original_chars = tool_result_content.chars().count(),
-                            truncated_chars = truncated_tool_result_content.chars().count(),
-                            max_chars = TOOL_EVENT_PREVIEW_MAX_CHARS,
-                            "agent loop truncated tool result event content"
+                            result_preview = %truncate_tool_log_preview(
+                                &tool_result.content,
+                                TOOL_LOG_PREVIEW_MAX_CHARS,
+                            ),
+                            "agent loop completed tool call"
                         );
-                    }
-                    let tool_result_event = AgentLoopEvent {
-                        kind: AgentLoopEventKind::ToolResult,
-                        content: format!(
-                            "[openjarvis][tool_result] {}",
-                            truncated_tool_result_content
-                        ),
-                        metadata: json!({
-                            "tool": tool_call.name.clone(),
-                            "is_error": tool_result.is_error,
-                            "metadata": tool_result.metadata,
-                            "tool_call_id": provider_tool_call.id.clone(),
-                        }),
-                    };
-                    event_tx.send(tool_result_event.clone()).await?;
-                    events.push(tool_result_event);
 
-                    let tool_result_message = ChatMessage::new(
-                        ChatMessageRole::ToolResult,
-                        tool_result_content,
-                        Utc::now(),
-                    )
-                    .with_tool_call_id(provider_tool_call.id.clone());
-                    live_chat_messages.push(tool_result_message.clone());
-                    commit_messages.push(tool_result_message);
+                        thread_context.buffer_turn_event(build_tool_result_event(
+                            &tool_call,
+                            &provider_tool_call.id,
+                            &tool_result,
+                        ))?;
+                        tool_result
+                    };
+
+                    thread_context.push_turn_message(
+                        ChatMessage::new(
+                            ChatMessageRole::ToolResult,
+                            format_tool_result_content(&tool_result.content, tool_result.is_error),
+                            Utc::now(),
+                        )
+                        .with_tool_call_id(provider_tool_call.id.clone()),
+                    )?;
                     ut_probe.on_tool_result(AgentLoopUTToolResultSnapshot {
                         iteration: loop_iteration,
                         tool_call_id: provider_tool_call.id,
@@ -1097,66 +742,69 @@ impl AgentLoop {
                     });
                 }
 
-                if restart_loop_after_compaction {
-                    ut_probe.on_loop_end(
-                        loop_iteration,
-                        &thread_context,
-                        &request_system_messages,
-                        &live_chat_messages,
-                        &commit_messages,
-                        persist_incoming_user,
-                    );
-                    loop_iteration += 1;
-                    continue;
-                }
-
-                ut_probe.on_loop_end(
-                    loop_iteration,
-                    &thread_context,
-                    &request_system_messages,
-                    &live_chat_messages,
-                    &commit_messages,
-                    persist_incoming_user,
-                );
-                loop_iteration += 1;
-            };
-
-            let mcp_server_count = self.runtime.tools().mcp().list_servers().await.len();
-            let hook_handler_count = hooks.len().await;
-            let metadata = json!({
-                "tool_count": last_visible_tools.len(),
-                "mcp_server_count": mcp_server_count,
-                "hook_handler_count": hook_handler_count,
-                "used_tool_name": used_tool_names.first().cloned(),
-                "used_tool_names": used_tool_names,
-                "loaded_toolsets": thread_context.load_toolsets(),
-                "event_count": events.len(),
-                "context_budget": last_budget_report,
-            });
-
-            hooks
-                .emit(HookEvent {
-                    kind: HookEventKind::Notification,
-                    payload: json!({
-                        "reply_preview": reply,
-                        "runtime": metadata,
-                    }),
+                Ok::<TurnLoopSuccess, anyhow::Error>(TurnLoopSuccess {
+                    reply: turn_reply,
+                    has_more_turns: true,
                 })
-                .await?;
+            }
+            .await;
 
-            Ok(AgentLoopOutput {
-                reply,
-                metadata,
-                events,
-                commit_messages,
-                persist_incoming_user,
-                loaded_toolsets: thread_context.load_toolsets(),
-                tool_events: thread_context.pending_tool_events().to_vec(),
-                thread_context,
-            })
-        }
+            let completed_at = Utc::now();
+            match turn_result {
+                Ok(turn_result) => {
+                    ut_probe.on_loop_end(loop_iteration, &thread_context);
+                    let turn = thread_context
+                        .finalize_turn_success(turn_result.reply.clone(), completed_at)?;
+                    completed_turns.push(finalize_completed_turn(&event_tx, turn));
+                    if !turn_result.has_more_turns {
+                        break turn_result.reply;
+                    }
+                }
+                Err(error) => {
+                    let error_message = format!("{error:#}");
+                    error!(
+                        thread_id = %thread_context.locator.thread_id,
+                        external_thread_id = %thread_context.locator.external_thread_id,
+                        error = %error_message,
+                        "agent loop encountered one unexpected turn failure"
+                    );
+                    ut_probe.on_loop_end(loop_iteration, &thread_context);
+                    let turn = thread_context.finalize_turn_failure(error_message, completed_at)?;
+                    let failure_reply = turn.reply.clone();
+                    completed_turns.push(finalize_completed_turn(&event_tx, turn));
+                    break failure_reply;
+                }
+            }
+
+            loop_iteration += 1;
+        };
+
+        let last_turn = completed_turns
+            .last()
+            .context("agent loop did not finalize any turn")?;
+        let metadata = build_loop_output_metadata(
+            &self.runtime,
+            &last_turn.turn,
+            &used_tool_names,
+            &last_visible_tools,
+            last_budget_report.clone(),
+        )
         .await;
-        loop_result
+        hooks
+            .emit(HookEvent {
+                kind: HookEventKind::Notification,
+                payload: json!({
+                    "reply_preview": reply.clone(),
+                    "runtime": metadata,
+                }),
+            })
+            .await?;
+
+        Ok(AgentLoopOutput {
+            reply,
+            metadata,
+            turns: completed_turns,
+        })
     }
 
     fn auto_compact_enabled_for_thread(&self, thread_context: &Thread) -> bool {
@@ -1173,78 +821,32 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn prepare_request_tools_ex(&self, thread_context: &Thread) -> Result<ThreadInitStateEx> {
-        let auto_compact_enabled = self.auto_compact_enabled_for_thread(thread_context);
-
-        let tools = if auto_compact_enabled {
+    async fn prepare_request_state(&self, thread_context: &Thread) -> Result<RequestState> {
+        let base_tools = self.runtime.list_tools(thread_context, false).await?;
+        let messages = thread_context.messages();
+        let base_budget_report = self.budget_estimator.estimate(&messages, &base_tools);
+        let compact_visible = self.auto_compact_enabled_for_thread(thread_context)
+            && self
+                .auto_compactor
+                .compact_tool_visible(&base_budget_report);
+        let tools = if compact_visible {
             self.runtime.list_tools(thread_context, true).await?
         } else {
-            self.runtime.list_tools(thread_context, false).await?
+            base_tools
         };
-
+        let budget_report = if compact_visible {
+            self.budget_estimator.estimate(&messages, &tools)
+        } else {
+            base_budget_report
+        };
         info!(
             thread_id = %thread_context.locator.thread_id,
-            auto_compact_enabled,
+            total_estimated_tokens = budget_report.total_estimated_tokens,
+            utilization_ratio = budget_report.utilization_ratio,
             tool_count = tools.len(),
-            "initialized experimental agent-loop thread request state"
+            compact_visible,
+            "prepared thread-owned request budget"
         );
-
-        // TODO: auto_compact 后续应改成只能在创建新 Thread 时决定，
-        // 不再允许在已有 ctx 生命周期中途打开，避免 request-state 分支继续膨胀。
-        Ok(ThreadInitStateEx {
-            auto_compact_enabled,
-            tools,
-        })
-    }
-
-    async fn prepare_request_state(
-        &self,
-        thread_context: &Thread,
-        request_system_messages: &mut Vec<ChatMessage>,
-        live_chat_messages: &[ChatMessage],
-    ) -> Result<RequestState> {
-        let init_state = self.prepare_request_tools_ex(thread_context).await?;
-        let ThreadInitStateEx {
-            auto_compact_enabled,
-            tools,
-        } = init_state;
-
-        let (messages, budget_report) = if auto_compact_enabled {
-            self.refresh_auto_compact_request_ex(
-                thread_context,
-                request_system_messages,
-                live_chat_messages,
-                &tools,
-            )
-        } else {
-            self.auto_compactor
-                .notify_capacity(request_system_messages, None);
-            let messages =
-                build_request_messages(thread_context, request_system_messages, live_chat_messages);
-            let budget_report = self.budget_estimator.estimate(&messages, &tools);
-            (messages, budget_report)
-        };
-
-        if auto_compact_enabled {
-            info!(
-                thread_id = %thread_context.locator.thread_id,
-                total_estimated_tokens = budget_report.total_estimated_tokens,
-                utilization_ratio = budget_report.utilization_ratio,
-                tool_count = tools.len(),
-                early_warning_reached =
-                    budget_report.reaches_ratio(self.compact_config.tool_visible_threshold_ratio()),
-                "prepared auto-compact request budget"
-            );
-        } else {
-            info!(
-                thread_id = %thread_context.locator.thread_id,
-                total_estimated_tokens = budget_report.total_estimated_tokens,
-                utilization_ratio = budget_report.utilization_ratio,
-                tool_count = tools.len(),
-                "prepared request budget"
-            );
-        }
-
         Ok(RequestState {
             messages,
             tools,
@@ -1254,12 +856,14 @@ impl AgentLoop {
 
     fn should_runtime_compact(
         &self,
-        live_chat_messages: &[ChatMessage],
+        thread_context: &Thread,
         budget_report: &ContextBudgetReport,
     ) -> bool {
         self.compact_config.enabled()
-            && !live_chat_messages.is_empty()
-            && budget_report.reaches_ratio(self.compact_config.runtime_threshold_ratio())
+            && !thread_context.active_non_system_messages().is_empty()
+            && self
+                .auto_compactor
+                .runtime_compaction_required(budget_report)
     }
 
     async fn call_thread_tool(
@@ -1272,21 +876,28 @@ impl AgentLoop {
             .await
     }
 
-    async fn execute_working_chat_compaction(
+    async fn execute_turn_compaction(
         &self,
         hooks: &Arc<super::HookRegistry>,
         thread_id: &str,
         thread_context: &mut Thread,
-        request_system_messages: &mut Vec<ChatMessage>,
-        live_chat_messages: &mut Vec<ChatMessage>,
-        commit_messages: &mut Vec<ChatMessage>,
-        persist_incoming_user: &mut bool,
         reason: &str,
+        requested_by_model: bool,
+        tool_call_id: Option<&str>,
         budget_report: &ContextBudgetReport,
     ) -> Result<Option<MessageCompactionOutcome>> {
-        let mut compactable_messages = thread_context.load_messages();
-        compactable_messages.extend(live_chat_messages.iter().cloned());
+        let compactable_messages = thread_context.active_non_system_messages();
         if compactable_messages.is_empty() {
+            let compact_event = build_compact_event(
+                reason,
+                requested_by_model,
+                false,
+                budget_report,
+                None,
+                tool_call_id,
+                None,
+            );
+            thread_context.buffer_turn_event(compact_event)?;
             return Ok(None);
         }
 
@@ -1301,7 +912,6 @@ impl AgentLoop {
                 }),
             })
             .await?;
-
         info!(
             thread_id,
             reason,
@@ -1318,77 +928,314 @@ impl AgentLoop {
         else {
             return Ok(None);
         };
-        thread_context.replace_non_system_messages(outcome.compacted_messages.clone(), Utc::now());
-        request_system_messages.clear();
-        live_chat_messages.clear();
-        commit_messages.clear();
-        *persist_incoming_user = false;
-
+        thread_context.apply_turn_compaction(outcome.compacted_messages.clone())?;
+        thread_context.buffer_turn_event(build_compact_event(
+            reason,
+            requested_by_model,
+            false,
+            budget_report,
+            Some(&outcome),
+            tool_call_id,
+            None,
+        ))?;
         info!(
             thread_id,
             reason,
-            compacted_message_count = thread_context.load_messages().len(),
+            compacted_message_count = thread_context.active_non_system_messages().len(),
             "thread compact completed"
         );
-
         Ok(Some(outcome))
     }
-    fn refresh_auto_compact_request_ex(
-        &self,
-        thread_context: &Thread,
-        request_system_messages: &mut Vec<ChatMessage>,
-        live_chat_messages: &[ChatMessage],
-        visible_tools: &[ToolDefinition],
-    ) -> (Messages, ContextBudgetReport) {
-        let mut budget_report = self.budget_estimator.estimate(
-            &build_request_messages(thread_context, request_system_messages, live_chat_messages),
-            visible_tools,
-        );
 
-        // 动态容量提示本身也会消耗上下文，所以这里固定进行两轮收敛，
-        // 让最终预算快照和最终请求消息尽量一致。
-        for _ in 0..2 {
-            self.auto_compactor
-                .notify_capacity(request_system_messages, Some(&budget_report));
-            budget_report = self.budget_estimator.estimate(
-                &build_request_messages(
-                    thread_context,
-                    request_system_messages,
-                    live_chat_messages,
-                ),
-                visible_tools,
-            );
+    async fn handle_model_requested_compact(
+        &self,
+        hooks: &Arc<super::HookRegistry>,
+        thread_id: &str,
+        thread_context: &mut Thread,
+        tool_call: &ToolCallRequest,
+        tool_call_id: &str,
+        budget_report: &ContextBudgetReport,
+        ut_probe: &mut AgentLoopUTProberHandle<'_>,
+        loop_iteration: usize,
+    ) -> Result<super::ToolCallResult> {
+        if !self.compact_config.enabled() {
+            let error_message = "compact runtime is disabled".to_string();
+            hooks
+                .emit(HookEvent {
+                    kind: HookEventKind::PostToolUseFailure,
+                    payload: json!({
+                        "tool": tool_call.name.clone(),
+                        "error": error_message.clone(),
+                    }),
+                })
+                .await?;
+            thread_context.record_tool_event(build_compact_thread_tool_event(
+                tool_call,
+                tool_call_id,
+                build_compact_event(
+                    "tool_requested",
+                    true,
+                    true,
+                    budget_report,
+                    None,
+                    Some(tool_call_id),
+                    Some(&error_message),
+                )
+                .metadata
+                .clone(),
+                true,
+            ));
+            thread_context.buffer_turn_event(build_compact_event(
+                "tool_requested",
+                true,
+                true,
+                budget_report,
+                None,
+                Some(tool_call_id),
+                Some(&error_message),
+            ))?;
+            let result = super::ToolCallResult {
+                content: error_message.clone(),
+                metadata: json!({
+                    "event_kind": "compact",
+                    "tool_call_id": tool_call_id,
+                }),
+                is_error: true,
+            };
+            ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                iteration: loop_iteration,
+                reason: "tool_requested".to_string(),
+                requested_by_model: true,
+                is_error: true,
+                budget_report: budget_report.clone(),
+                outcome: None,
+                error: Some(error_message),
+                request_messages: thread_context.messages(),
+                active_non_system_messages: thread_context.active_non_system_messages(),
+                current_turn_working_messages: thread_context.current_turn_working_messages(),
+                turn_events: thread_context.current_turn_events(),
+            });
+            return Ok(result);
         }
 
-        self.auto_compactor
-            .notify_capacity(request_system_messages, Some(&budget_report));
-
-        (
-            build_request_messages(thread_context, request_system_messages, live_chat_messages),
-            budget_report,
-        )
+        match self
+            .execute_turn_compaction(
+                hooks,
+                thread_id,
+                thread_context,
+                "tool_requested",
+                true,
+                Some(tool_call_id),
+                budget_report,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                hooks
+                    .emit(HookEvent {
+                        kind: HookEventKind::PostToolUse,
+                        payload: json!({
+                            "tool": tool_call.name.clone(),
+                            "result": thread_context.current_turn_events().last().map(|event| event.metadata.clone()),
+                        }),
+                    })
+                    .await?;
+                thread_context.record_tool_event(build_compact_thread_tool_event(
+                    tool_call,
+                    tool_call_id,
+                    thread_context
+                        .current_turn_events()
+                        .last()
+                        .map(|event| event.metadata.clone())
+                        .unwrap_or_else(default_compact_event_metadata),
+                    false,
+                ));
+                ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                    iteration: loop_iteration,
+                    reason: "tool_requested".to_string(),
+                    requested_by_model: true,
+                    is_error: false,
+                    budget_report: budget_report.clone(),
+                    outcome: outcome.clone(),
+                    error: None,
+                    request_messages: thread_context.messages(),
+                    active_non_system_messages: thread_context.active_non_system_messages(),
+                    current_turn_working_messages: thread_context.current_turn_working_messages(),
+                    turn_events: thread_context.current_turn_events(),
+                });
+                let content = outcome
+                    .as_ref()
+                    .map(|value| {
+                        format!(
+                            "compact completed: compacted {} messages from current chat history",
+                            value.source_message_count
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "compact skipped: no chat history was available to compact".to_string()
+                    });
+                Ok(super::ToolCallResult {
+                    content,
+                    metadata: json!({
+                        "event_kind": "compact",
+                        "tool_call_id": tool_call_id,
+                    }),
+                    is_error: false,
+                })
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                hooks
+                    .emit(HookEvent {
+                        kind: HookEventKind::PostToolUseFailure,
+                        payload: json!({
+                            "tool": tool_call.name.clone(),
+                            "error": error_message.clone(),
+                        }),
+                    })
+                    .await?;
+                thread_context.record_tool_event(build_compact_thread_tool_event(
+                    tool_call,
+                    tool_call_id,
+                    build_compact_event(
+                        "tool_requested",
+                        true,
+                        true,
+                        budget_report,
+                        None,
+                        Some(tool_call_id),
+                        Some(&error_message),
+                    )
+                    .metadata
+                    .clone(),
+                    true,
+                ));
+                thread_context.buffer_turn_event(build_compact_event(
+                    "tool_requested",
+                    true,
+                    true,
+                    budget_report,
+                    None,
+                    Some(tool_call_id),
+                    Some(&error_message),
+                ))?;
+                ut_probe.on_compact(AgentLoopUTCompactSnapshot {
+                    iteration: loop_iteration,
+                    reason: "tool_requested".to_string(),
+                    requested_by_model: true,
+                    is_error: true,
+                    budget_report: budget_report.clone(),
+                    outcome: None,
+                    error: Some(error_message),
+                    request_messages: thread_context.messages(),
+                    active_non_system_messages: thread_context.active_non_system_messages(),
+                    current_turn_working_messages: thread_context.current_turn_working_messages(),
+                    turn_events: thread_context.current_turn_events(),
+                });
+                Ok(super::ToolCallResult {
+                    content: error_message,
+                    metadata: json!({
+                        "event_kind": "compact",
+                        "tool_call_id": tool_call_id,
+                    }),
+                    is_error: true,
+                })
+            }
+        }
     }
 }
 
-fn build_request_messages(
-    thread_context: &Thread,
-    request_system_messages: &[ChatMessage],
-    live_chat_messages: &[ChatMessage],
-) -> Messages {
-    let mut messages = Vec::with_capacity(
-        thread_context.messages().len() + request_system_messages.len() + live_chat_messages.len(),
-    );
-    messages.extend(thread_context.messages());
-    messages.extend(request_system_messages.iter().cloned());
-    messages.extend(live_chat_messages.iter().cloned());
-    messages
+struct RequestState {
+    messages: Messages,
+    tools: Vec<ToolDefinition>,
+    budget_report: ContextBudgetReport,
+}
+
+struct TurnLoopSuccess {
+    reply: String,
+    has_more_turns: bool,
+}
+
+fn build_tool_call_event(tool_call: &ToolCallRequest, tool_call_id: &str) -> AgentLoopEvent {
+    let tool_call_arguments = tool_call.arguments.to_string();
+    let truncated_tool_call_arguments =
+        truncate_tool_message(&tool_call_arguments, TOOL_EVENT_PREVIEW_MAX_CHARS);
+    AgentLoopEvent {
+        kind: AgentLoopEventKind::ToolCall,
+        content: format!(
+            "[openjarvis][tool_call] {} {}",
+            tool_call.name, truncated_tool_call_arguments
+        ),
+        metadata: json!({
+            "tool": tool_call.name,
+            "arguments": tool_call.arguments,
+            "tool_call_id": tool_call_id,
+        }),
+    }
+}
+
+fn build_tool_result_event(
+    tool_call: &ToolCallRequest,
+    tool_call_id: &str,
+    tool_result: &super::ToolCallResult,
+) -> AgentLoopEvent {
+    let tool_result_content =
+        format_tool_result_content(&tool_result.content, tool_result.is_error);
+    let truncated_tool_result_content =
+        truncate_tool_message(&tool_result_content, TOOL_EVENT_PREVIEW_MAX_CHARS);
+    AgentLoopEvent {
+        kind: AgentLoopEventKind::ToolResult,
+        content: format!(
+            "[openjarvis][tool_result] {}",
+            truncated_tool_result_content
+        ),
+        metadata: json!({
+            "tool": tool_call.name.clone(),
+            "is_error": tool_result.is_error,
+            "metadata": tool_result.metadata,
+            "tool_call_id": tool_call_id,
+        }),
+    }
+}
+
+fn finalize_completed_turn(
+    event_tx: &AgentEventSender,
+    turn: ThreadFinalizedTurn,
+) -> CompletedAgentTurn {
+    let dispatch_batch = event_tx.prepare_dispatch_batch(&turn.events);
+    CompletedAgentTurn {
+        turn,
+        dispatch_batch,
+    }
+}
+
+async fn build_loop_output_metadata(
+    runtime: &AgentRuntime,
+    turn: &ThreadFinalizedTurn,
+    used_tool_names: &[String],
+    last_visible_tools: &[ToolDefinition],
+    last_budget_report: Option<ContextBudgetReport>,
+) -> Value {
+    let mcp_server_count = runtime.tools().mcp().list_servers().await.len();
+    let hook_handler_count = runtime.hooks().len().await;
+    json!({
+        "tool_count": last_visible_tools.len(),
+        "mcp_server_count": mcp_server_count,
+        "hook_handler_count": hook_handler_count,
+        "used_tool_name": used_tool_names.first().cloned(),
+        "used_tool_names": used_tool_names,
+        "loaded_toolsets": turn.snapshot.load_toolsets(),
+        "event_count": turn.events.len(),
+        "context_budget": last_budget_report,
+        "turn_status": turn.status,
+        "turn_id": turn.turn_id,
+    })
 }
 
 fn build_assistant_tool_call_message(
     assistant_message: Option<&ChatMessage>,
     tool_calls: &[crate::llm::LLMToolCall],
 ) -> ChatMessage {
-    // Preserve the original assistant tool-call message so persisted history can be replayed verbatim.
     let created_at = assistant_message
         .map(|message| message.created_at)
         .unwrap_or_else(Utc::now);
@@ -1401,7 +1248,6 @@ fn build_assistant_tool_call_message(
 }
 
 fn format_tool_result_content(content: &str, is_error: bool) -> String {
-    // Keep tool result text identical between immediate replies and persisted history.
     if is_error {
         return format!("Tool execution failed: {content}");
     }
@@ -1411,16 +1257,6 @@ fn format_tool_result_content(content: &str, is_error: bool) -> String {
 
 /// Truncate channel-facing tool event content without affecting the full tool history kept for
 /// subsequent model turns.
-///
-/// # 示例
-/// ```rust
-/// use openjarvis::agent::agent_loop::truncate_tool_message;
-///
-/// assert_eq!(
-///     truncate_tool_message("123456", 4),
-///     "1234...(truncated, total_chars=6)"
-/// );
-/// ```
 #[doc(hidden)]
 pub fn truncate_tool_message(content: &str, max_chars: usize) -> String {
     truncate_text_with_total_chars(content, max_chars)
@@ -1485,23 +1321,18 @@ fn build_compact_event(
     }
 }
 
+fn default_compact_event_metadata() -> Value {
+    json!({
+        "event_kind": "compact",
+    })
+}
+
 fn incoming_message(incoming: &IncomingMessage) -> ChatMessage {
     ChatMessage::new(
         ChatMessageRole::User,
         incoming.content.clone(),
         incoming.received_at,
     )
-}
-
-struct RequestState {
-    messages: Messages,
-    tools: Vec<ToolDefinition>,
-    budget_report: ContextBudgetReport,
-}
-
-struct ThreadInitStateEx {
-    auto_compact_enabled: bool,
-    tools: Vec<ToolDefinition>,
 }
 
 fn build_thread_tool_event(

@@ -14,7 +14,7 @@ use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
 use crate::session::ThreadLocator;
-use crate::thread::{Thread, ThreadToolEvent};
+use crate::thread::{Thread, ThreadFinalizedTurn};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -29,15 +29,10 @@ pub struct AgentRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct CompletedAgentCommit {
+pub struct FinalizedAgentTurn {
     pub locator: ThreadLocator,
-    pub incoming: IncomingMessage,
-    pub thread_context: Thread,
-    pub commit_messages: Vec<ChatMessage>,
-    pub persist_incoming_user: bool,
-    pub loaded_toolsets: Vec<String>,
-    pub tool_events: Vec<ThreadToolEvent>,
-    pub completed_at: DateTime<Utc>,
+    pub turn: ThreadFinalizedTurn,
+    pub dispatch_batch: Vec<AgentDispatchEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,21 +43,16 @@ pub struct SyncedThreadContext {
 }
 
 #[derive(Debug, Clone)]
-pub struct FailedAgentCommit {
+pub struct CompletedAgentRequest {
     pub locator: ThreadLocator,
-    pub incoming: IncomingMessage,
-    pub error: String,
-    pub thread_context: Thread,
-    pub loaded_toolsets: Vec<String>,
     pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AgentWorkerEvent {
-    Dispatch(AgentDispatchEvent),
     ThreadContextSynced(SyncedThreadContext),
-    CommitCompleted(CompletedAgentCommit),
-    CommitFailed(FailedAgentCommit),
+    TurnFinalized(FinalizedAgentTurn),
+    RequestCompleted(CompletedAgentRequest),
 }
 
 pub struct AgentWorkerHandle {
@@ -415,20 +405,6 @@ impl AgentWorker {
         request: AgentRequest,
         event_tx: mpsc::Sender<AgentWorkerEvent>,
     ) -> Result<AgentLoopOutput> {
-        let (dispatch_tx, mut dispatch_rx) = mpsc::channel(128);
-        let forward_event_tx = event_tx.clone();
-        let forward_dispatch_task = tokio::spawn(async move {
-            while let Some(dispatch_event) = dispatch_rx.recv().await {
-                if forward_event_tx
-                    .send(AgentWorkerEvent::Dispatch(dispatch_event))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
         let mut thread_context = request.thread_context.clone();
         if self.initialize_thread(&mut thread_context).await? {
             event_tx
@@ -447,7 +423,6 @@ impl AgentWorker {
             .agent_loop
             .run_v1(
                 AgentEventSender::from_incoming_and_locator(
-                    dispatch_tx,
                     &request.incoming,
                     &thread_context.locator,
                 ),
@@ -455,45 +430,68 @@ impl AgentWorker {
                 thread_context.clone(),
             )
             .await;
-        forward_dispatch_task
-            .await
-            .map_err(|error| anyhow::anyhow!("agent dispatch forward task failed: {error}"))?;
 
         match loop_output {
             Ok(loop_output) => {
-                let completed_at = Utc::now();
-                event_tx // TODO: 需要重构
-                    .send(AgentWorkerEvent::CommitCompleted(CompletedAgentCommit {
-                        locator: request.locator,
-                        incoming: request.incoming,
-                        thread_context: loop_output.thread_context.clone(),
-                        commit_messages: loop_output.commit_messages.clone(),
-                        persist_incoming_user: loop_output.persist_incoming_user,
-                        loaded_toolsets: loop_output.loaded_toolsets.clone(),
-                        tool_events: loop_output.tool_events.clone(),
-                        completed_at,
+                for completed_turn in &loop_output.turns {
+                    event_tx
+                        .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {
+                            locator: request.locator.clone(),
+                            turn: completed_turn.turn.clone(),
+                            dispatch_batch: completed_turn.dispatch_batch.clone(),
+                        }))
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to report finalized turn: {error}")
+                        })?;
+                }
+                event_tx
+                    .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
+                        locator: request.locator.clone(),
+                        completed_at: Utc::now(),
                     }))
                     .await
                     .map_err(|error| {
-                        anyhow::anyhow!("failed to report completed commit: {error}")
+                        anyhow::anyhow!("failed to report completed request: {error}")
                     })?;
                 Ok(loop_output)
             }
             Err(error) => {
-                let completed_at = Utc::now();
-                let error_message = format!("{error:#}");
+                warn!(
+                    error = %format!("{error:#}"),
+                    thread_id = %request.locator.thread_id,
+                    "agent loop returned one hard failure, attempting turn-aligned fallback"
+                );
+                let mut failed_thread = thread_context;
+                failed_thread.begin_turn(
+                    request.incoming.external_message_id.clone(),
+                    request.incoming.received_at,
+                )?;
+                let finalized_turn =
+                    failed_thread.finalize_turn_failure(format!("{error:#}"), Utc::now())?;
+                let dispatch_batch = AgentEventSender::from_incoming_and_locator(
+                    &request.incoming,
+                    &failed_thread.locator,
+                )
+                .prepare_dispatch_batch(&finalized_turn.events);
                 event_tx
-                    .send(AgentWorkerEvent::CommitFailed(FailedAgentCommit {
-                        locator: request.locator,
-                        incoming: request.incoming,
-                        error: error_message.clone(),
-                        thread_context: thread_context.clone(),
-                        loaded_toolsets: thread_context.load_toolsets(),
-                        completed_at,
+                    .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {
+                        locator: request.locator.clone(),
+                        turn: finalized_turn,
+                        dispatch_batch,
                     }))
                     .await
                     .map_err(|send_error| {
-                        anyhow::anyhow!("failed to report failed commit: {send_error}")
+                        anyhow::anyhow!("failed to report fallback finalized turn: {send_error}")
+                    })?;
+                event_tx
+                    .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
+                        locator: request.locator.clone(),
+                        completed_at: Utc::now(),
+                    }))
+                    .await
+                    .map_err(|send_error| {
+                        anyhow::anyhow!("failed to report completed fallback request: {send_error}")
                     })?;
                 Err(error)
             }

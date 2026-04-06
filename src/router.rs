@@ -2,14 +2,13 @@
 
 use crate::agent::{
     AgentDispatchEvent, AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle,
-    CompletedAgentCommit, FailedAgentCommit,
+    FinalizedAgentTurn,
 };
 use crate::attachment_syntax::AttachmentSyntaxParser;
 use crate::channels::feishu::FeishuChannel;
 use crate::channels::{Channel, ChannelRegistration};
 use crate::command::{CommandRegistry, CommandReply};
 use crate::config::ChannelConfig;
-use crate::context::{ChatMessage, ChatMessageRole};
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
 use crate::thread::Thread;
@@ -462,12 +461,15 @@ impl ChannelRouter {
 
     async fn handle_agent_event(&self, event: AgentWorkerEvent) -> Result<()> {
         match event {
-            AgentWorkerEvent::Dispatch(event) => self.process_agent_dispatch_event(event).await,
             AgentWorkerEvent::ThreadContextSynced(update) => {
                 self.sync_bootstrapped_thread_context(update).await
             }
-            AgentWorkerEvent::CommitCompleted(commit) => self.store_completed_commit(commit).await,
-            AgentWorkerEvent::CommitFailed(commit) => self.store_failed_commit(commit).await,
+            AgentWorkerEvent::TurnFinalized(turn) => {
+                self.store_and_dispatch_finalized_turn(turn).await
+            }
+            AgentWorkerEvent::RequestCompleted(request) => {
+                self.release_or_dispatch_next(&request.locator).await
+            }
         }
     }
 
@@ -550,79 +552,31 @@ impl ChannelRouter {
             .map_err(|error| anyhow::anyhow!("failed to enqueue outgoing message: {error}"))
     }
 
-    async fn store_completed_commit(&self, commit: CompletedAgentCommit) -> Result<()> {
-        let mut messages = Vec::new();
-        if commit.persist_incoming_user {
-            messages.push(ChatMessage::new(
-                ChatMessageRole::User,
-                commit.incoming.content.clone(),
-                commit.incoming.received_at,
-            ));
-        }
-        messages.extend(commit.commit_messages);
+    async fn store_and_dispatch_finalized_turn(&self, turn: FinalizedAgentTurn) -> Result<()> {
+        info!(
+            thread_id = %turn.locator.thread_id,
+            turn_id = %turn.turn.turn_id,
+            event_count = turn.dispatch_batch.len(),
+            "router storing finalized thread-owned turn"
+        );
         let store_result = self
             .sessions
-            .commit_messages_with_thread_context(
-                &commit.locator,
-                Some(commit.thread_context),
-                commit.incoming.external_message_id.clone(),
-                messages,
-                commit.incoming.received_at,
-                commit.completed_at,
-            )
+            .commit_finalized_turn(&turn.locator, &turn.turn)
             .await;
-        let release_result = self.release_or_dispatch_next(&commit.locator).await;
+        let dispatch_result = match &store_result {
+            Ok(_) => {
+                for event in turn.dispatch_batch {
+                    self.process_agent_dispatch_event(event).await?;
+                }
+                Ok(())
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to persist finalized turn before dispatch: {error}"
+            )),
+        };
         store_result?;
-        release_result
-    }
-
-    async fn store_failed_commit(&self, commit: FailedAgentCommit) -> Result<()> {
-        let failure_reply = format!("[openjarvis][agent_error] {}", commit.error);
-        self.dispatch_outgoing(OutgoingMessage {
-            id: Uuid::new_v4(),
-            channel: commit.incoming.channel.clone(),
-            content: failure_reply.clone(),
-            external_thread_id: commit.incoming.external_thread_id.clone(),
-            metadata: serde_json::json!({
-                "event_kind": "AgentError",
-                "session_id": commit.locator.session_id.to_string(),
-                "error": commit.error,
-                "session_channel": commit.locator.channel,
-                "session_user_id": commit.locator.user_id,
-                "session_external_thread_id": commit.locator.external_thread_id,
-                "session_thread_id": commit.locator.thread_id.to_string(),
-            }),
-            reply_to_message_id: commit.incoming.external_message_id.clone(),
-            attachments: Vec::new(),
-            target: commit.incoming.reply_target.clone(),
-        })
-        .await?;
-
-        let store_result = self
-            .sessions
-            .commit_messages_with_thread_context(
-                &commit.locator,
-                Some(commit.thread_context),
-                commit.incoming.external_message_id.clone(),
-                vec![
-                    ChatMessage::new(
-                        ChatMessageRole::User,
-                        commit.incoming.content,
-                        commit.incoming.received_at,
-                    ),
-                    ChatMessage::new(
-                        ChatMessageRole::Assistant,
-                        failure_reply,
-                        commit.completed_at,
-                    ),
-                ],
-                commit.incoming.received_at,
-                commit.completed_at,
-            )
-            .await;
-        let release_result = self.release_or_dispatch_next(&commit.locator).await;
-        store_result?;
-        release_result
+        dispatch_result?;
+        Ok(())
     }
 
     async fn mark_message_seen(&self, external_message_id: Option<&str>) -> bool {

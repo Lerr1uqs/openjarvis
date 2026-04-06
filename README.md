@@ -19,7 +19,7 @@
   - `shell`
 - 已实现本地 memory feature
   - 工作区 `./.openjarvis/memory/{active,passive}` markdown 仓库
-  - thread init 注入 active memory `keyword -> path` catalog
+  - thread init system prompt注入 active memory `keyword -> path` catalog
   - `memory` toolset: `memory_get` / `memory_search` / `memory_write` / `memory_list`
 - 已实现两类 LLM provider
   - `mock`

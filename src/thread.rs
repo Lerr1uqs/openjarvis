@@ -1,11 +1,12 @@
 //! Thread aggregate and persisted thread state model.
 
 use crate::context::{ChatMessage, ChatMessageRole};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ops::{Deref, DerefMut};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 const OPENJARVIS_THREAD_ID_NAMESPACE: Uuid =
@@ -106,6 +107,70 @@ impl ThreadToolEvent {
         self.turn_id = Some(turn_id);
         self
     }
+}
+
+/// User-visible event buffered inside one thread-owned turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ThreadTurnEventKind {
+    TextOutput,
+    ToolCall,
+    ToolResult,
+    Compact,
+}
+
+/// One thread-owned dispatch event that only becomes externally visible after turn finalization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThreadTurnEvent {
+    pub kind: ThreadTurnEventKind,
+    pub content: String,
+    #[serde(default = "default_tool_event_metadata")]
+    pub metadata: Value,
+}
+
+/// Finalized status for one thread-owned turn result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ThreadFinalizedTurnStatus {
+    Succeeded,
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ThreadCurrentTurn {
+    turn_id: Uuid,
+    external_message_id: Option<String>,
+    started_at: DateTime<Utc>,
+    working_messages: Vec<ChatMessage>,
+    history_override: Option<Vec<ChatMessage>>,
+    buffered_events: Vec<ThreadTurnEvent>,
+    tool_events: Vec<ThreadToolEvent>,
+}
+
+impl ThreadCurrentTurn {
+    fn new(external_message_id: Option<String>, started_at: DateTime<Utc>) -> Self {
+        Self {
+            turn_id: Uuid::new_v4(),
+            external_message_id,
+            started_at,
+            working_messages: Vec::new(),
+            history_override: None,
+            buffered_events: Vec::new(),
+            tool_events: Vec::new(),
+        }
+    }
+}
+
+/// One finalized thread-owned turn that binds the event batch and the persisted snapshot edge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThreadFinalizedTurn {
+    pub turn_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_message_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub reply: String,
+    pub status: ThreadFinalizedTurnStatus,
+    pub events: Vec<ThreadTurnEvent>,
+    pub snapshot: Thread,
 }
 
 /// Stable runtime locator shared by session, command, and agent execution on one thread.
@@ -275,7 +340,7 @@ impl ThreadContext {
 }
 
 /// Unified persisted thread aggregate shared by session, command, and agent execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Thread {
     pub locator: ThreadContextLocator,
     pub thread: ThreadContext,
@@ -285,6 +350,8 @@ pub struct Thread {
     revision: u64,
     #[serde(default, skip_serializing, skip_deserializing)]
     pending_tool_events: Vec<ThreadToolEvent>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    current_turn: Option<ThreadCurrentTurn>,
 }
 
 impl Thread {
@@ -314,6 +381,7 @@ impl Thread {
             state: ThreadState::default(),
             revision: 0,
             pending_tool_events: Vec::new(),
+            current_turn: None,
         }
     }
 
@@ -335,9 +403,49 @@ impl Thread {
         self.thread.load_messages()
     }
 
-    /// Export the persisted messages currently owned by the thread.
+    /// Export the current request-visible messages owned by the thread.
+    ///
+    /// 当 turn 已经开始时，返回值会按顺序包含：
+    /// 1. 稳定 system prefix
+    /// 2. 已 finalized 的 non-system history，或 turn 内 compact 生成的 active history override
+    /// 3. 当前 turn 的 working messages
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// let _ = thread.ensure_system_prompt_snapshot("system", now);
+    /// thread
+    ///     .begin_turn(Some("msg_1".to_string()), now)
+    ///     .expect("turn should start");
+    /// thread
+    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should buffer");
+    ///
+    /// assert_eq!(thread.messages()[0].role, ChatMessageRole::System);
+    /// assert_eq!(thread.messages().last().unwrap().content, "hello");
+    /// ```
     pub fn messages(&self) -> Vec<ChatMessage> {
-        self.thread.messages()
+        let mut messages = self.system_prefix_messages().to_vec();
+        messages.extend(
+            self.current_turn
+                .as_ref()
+                .and_then(|turn| turn.history_override.clone())
+                .unwrap_or_else(|| self.thread.load_messages()),
+        );
+        if let Some(current_turn) = &self.current_turn {
+            messages.extend(current_turn.working_messages.clone());
+        }
+        messages
     }
 
     /// Replace all persisted non-system messages while preserving the leading system prefix.
@@ -369,12 +477,250 @@ impl Thread {
 
     /// Return the current pending tool events that still need to be bound to one stored turn.
     pub fn pending_tool_events(&self) -> &[ThreadToolEvent] {
-        &self.pending_tool_events
+        self.current_turn
+            .as_ref()
+            .map(|turn| turn.tool_events.as_slice())
+            .unwrap_or(&self.pending_tool_events)
     }
 
     /// Record one thread-scoped tool event on the current runtime context.
     pub fn record_tool_event(&mut self, event: ThreadToolEvent) {
+        if let Some(current_turn) = self.current_turn.as_mut() {
+            current_turn.tool_events.push(event);
+            return;
+        }
+
         self.pending_tool_events.push(event);
+    }
+
+    /// Return the current turn working messages that can become finalized history.
+    pub fn current_turn_working_messages(&self) -> Vec<ChatMessage> {
+        self.current_turn
+            .as_ref()
+            .map(|turn| turn.working_messages.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the current buffered turn events.
+    pub fn current_turn_events(&self) -> Vec<ThreadTurnEvent> {
+        self.current_turn
+            .as_ref()
+            .map(|turn| turn.buffered_events.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the active non-system message view owned by the thread.
+    ///
+    /// 这个视图会被 compact 使用。它包含已 finalized 的 non-system history 与当前 turn 中
+    /// 已经物化的 working messages。
+    pub fn active_non_system_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = self
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.history_override.clone())
+            .unwrap_or_else(|| self.thread.load_messages());
+        if let Some(current_turn) = &self.current_turn {
+            messages.extend(current_turn.working_messages.clone());
+        }
+        messages
+    }
+
+    /// Start one thread-owned turn from the incoming external message id and user message.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// let _ = thread.ensure_system_prompt_snapshot("system", now);
+    /// let turn_id = thread
+    ///     .begin_turn(Some("msg_1".to_string()), now)
+    ///     .expect("turn should start");
+    /// thread
+    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should be buffered");
+    ///
+    /// assert_eq!(thread.pending_tool_events().len(), 0);
+    /// assert_ne!(turn_id, uuid::Uuid::nil());
+    /// ```
+    pub fn begin_turn(
+        &mut self,
+        external_message_id: Option<String>,
+        started_at: DateTime<Utc>,
+    ) -> Result<Uuid> {
+        Ok(self.open_turn(external_message_id, started_at)?.turn_id)
+    }
+
+    /// Append one request-visible message into the current turn working set.
+    pub fn push_turn_message(&mut self, message: ChatMessage) -> Result<()> {
+        let current_turn = self.current_turn_mut()?;
+        current_turn.working_messages.push(message);
+        Ok(())
+    }
+
+    /// Buffer one user-visible turn event that will only be dispatched after finalization.
+    pub fn buffer_turn_event(&mut self, event: ThreadTurnEvent) -> Result<()> {
+        let current_turn = self.current_turn_mut()?;
+        current_turn.buffered_events.push(event);
+        Ok(())
+    }
+
+    /// Replace the active non-system view with compacted messages for the current turn.
+    ///
+    /// Compact 会直接改写 thread-owned active view；原本已 finalized 的 non-system history
+    /// 与当前 turn working set 会一起收敛到新的 active history override。
+    pub fn apply_turn_compaction(&mut self, compacted_messages: Vec<ChatMessage>) -> Result<()> {
+        let current_turn = self.current_turn_mut()?;
+        current_turn.history_override = Some(compacted_messages);
+        current_turn.working_messages.clear();
+        Ok(())
+    }
+
+    /// Finalize the current turn as one successful thread snapshot and event batch.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator, ThreadFinalizedTurnStatus, ThreadTurnEvent, ThreadTurnEventKind},
+    /// };
+    /// use serde_json::json;
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// let _ = thread.ensure_system_prompt_snapshot("system", now);
+    /// thread
+    ///     .begin_turn(Some("msg_1".to_string()), now)
+    ///     .expect("turn should start");
+    /// thread
+    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should be buffered");
+    /// thread
+    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::Assistant, "world", now))
+    ///     .expect("assistant reply should be buffered");
+    /// thread
+    ///     .buffer_turn_event(ThreadTurnEvent {
+    ///         kind: ThreadTurnEventKind::TextOutput,
+    ///         content: "world".to_string(),
+    ///         metadata: json!({ "is_final": true }),
+    ///     })
+    ///     .expect("event should buffer");
+    ///
+    /// let finalized = thread
+    ///     .finalize_turn_success("world", now)
+    ///     .expect("turn should finalize");
+    ///
+    /// assert!(matches!(finalized.status, ThreadFinalizedTurnStatus::Succeeded));
+    /// assert_eq!(finalized.snapshot.load_messages().len(), 2);
+    /// ```
+    pub fn finalize_turn_success(
+        &mut self,
+        reply: impl Into<String>,
+        completed_at: DateTime<Utc>,
+    ) -> Result<ThreadFinalizedTurn> {
+        self.finalize_turn(
+            ThreadFinalizedTurnStatus::Succeeded,
+            reply.into(),
+            completed_at,
+        )
+    }
+
+    /// Finalize the current turn as one failed thread snapshot and matching event batch.
+    ///
+    /// 异常失败会丢弃当前 turn 内尚未持久化的 working messages、tool events 和 buffered
+    /// events；最终 snapshot 会回退到本轮开始前的线程状态，只保留对外错误事件。
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator, ThreadFinalizedTurnStatus},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// thread.store_turn(
+    ///     Some("msg_0".to_string()),
+    ///     vec![ChatMessage::new(ChatMessageRole::Assistant, "persisted", now)],
+    ///     now,
+    ///     now,
+    /// );
+    /// thread
+    ///     .begin_turn(Some("msg_1".to_string()), now)
+    ///     .expect("turn should start");
+    /// thread
+    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should be buffered");
+    ///
+    /// let finalized = thread
+    ///     .finalize_turn_failure("network error", now)
+    ///     .expect("failed turn should finalize");
+    ///
+    /// assert!(matches!(
+    ///     finalized.status,
+    ///     ThreadFinalizedTurnStatus::Failed { .. }
+    /// ));
+    /// assert_eq!(finalized.snapshot.load_messages().len(), 1);
+    /// assert_eq!(finalized.snapshot.load_messages()[0].content, "persisted");
+    /// ```
+    pub fn finalize_turn_failure(
+        &mut self,
+        error: impl Into<String>,
+        completed_at: DateTime<Utc>,
+    ) -> Result<ThreadFinalizedTurn> {
+        let error = error.into();
+        let Some(current_turn) = self.current_turn.take() else {
+            bail!(
+                "thread `{}` does not own one active turn to finalize",
+                self.locator.thread_id
+            );
+        };
+        let failure_reply = format!("[openjarvis][agent_error] {error}");
+        error!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            turn_id = %current_turn.turn_id,
+            dropped_working_count = current_turn.working_messages.len(),
+            dropped_event_count = current_turn.buffered_events.len(),
+            dropped_tool_event_count = current_turn.tool_events.len(),
+            error = %error,
+            "thread-owned turn failed; dropping in-flight turn contents"
+        );
+
+        Ok(ThreadFinalizedTurn {
+            turn_id: current_turn.turn_id,
+            external_message_id: current_turn.external_message_id,
+            started_at: current_turn.started_at,
+            completed_at,
+            reply: failure_reply.clone(),
+            status: ThreadFinalizedTurnStatus::Failed { error },
+            events: vec![ThreadTurnEvent {
+                kind: ThreadTurnEventKind::TextOutput,
+                content: failure_reply,
+                metadata: json!({
+                    "source": "turn_failure",
+                    "is_final": true,
+                    "is_error": true,
+                }),
+            }],
+            snapshot: self.clone(),
+        })
     }
 
     /// Initialize the thread-scoped system prompt snapshot on first use.
@@ -461,9 +807,7 @@ impl Thread {
         original_len != self.state.tools.loaded_toolsets.len()
     }
 
-    /// Store one completed turn and bind all currently pending tool events to it.
-    ///
-    /// `Turn` 仍然是提交概念，但持久化边界已经收敛为 message append。
+    /// Store one completed turn through the thread-owned turn finalization path.
     ///
     /// # 示例
     /// ```rust
@@ -495,22 +839,22 @@ impl Thread {
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     ) -> Uuid {
-        let turn_id = Uuid::new_v4();
-        let tool_events = std::mem::take(&mut self.pending_tool_events);
-
-        self.thread.messages.extend(messages);
-        self.thread.updated_at = completed_at;
-        if self.thread.created_at > started_at {
-            self.thread.created_at = started_at;
-        }
-
-        let _ = external_message_id;
-        self.state.tools.tool_events.extend(
-            tool_events
-                .into_iter()
-                .map(|event| event.with_turn_id(turn_id)),
-        );
-        turn_id
+        let reply = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ChatMessageRole::Assistant)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        self.open_turn(external_message_id, started_at)
+            .expect("store_turn should open one compatibility turn");
+        let current_turn = self
+            .current_turn
+            .as_mut()
+            .expect("compatibility turn should exist");
+        current_turn.working_messages = messages;
+        self.finalize_turn_success(reply, completed_at)
+            .expect("store_turn should finalize one compatibility turn")
+            .turn_id
     }
 
     /// Store one completed turn together with explicit runtime tool state compatibility payloads.
@@ -528,11 +872,99 @@ impl Thread {
         self.store_turn(external_message_id, messages, started_at, completed_at)
     }
 
+    fn open_turn(
+        &mut self,
+        external_message_id: Option<String>,
+        started_at: DateTime<Utc>,
+    ) -> Result<&mut ThreadCurrentTurn> {
+        if self.current_turn.is_some() {
+            bail!(
+                "thread `{}` already owns one unfinished turn",
+                self.locator.thread_id
+            );
+        }
+
+        let mut current_turn = ThreadCurrentTurn::new(external_message_id, started_at);
+        current_turn
+            .tool_events
+            .append(&mut self.pending_tool_events);
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            turn_id = %current_turn.turn_id,
+            "started thread-owned turn"
+        );
+        self.current_turn = Some(current_turn);
+        Ok(self
+            .current_turn
+            .as_mut()
+            .expect("current turn should exist immediately after open_turn"))
+    }
+
+    fn current_turn_mut(&mut self) -> Result<&mut ThreadCurrentTurn> {
+        self.current_turn.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "thread `{}` does not own one active turn",
+                self.locator.thread_id
+            )
+        })
+    }
+
+    fn finalize_turn(
+        &mut self,
+        status: ThreadFinalizedTurnStatus,
+        reply: String,
+        completed_at: DateTime<Utc>,
+    ) -> Result<ThreadFinalizedTurn> {
+        let Some(current_turn) = self.current_turn.take() else {
+            bail!(
+                "thread `{}` does not own one active turn to finalize",
+                self.locator.thread_id
+            );
+        };
+
+        let mut finalized_non_system_messages = current_turn
+            .history_override
+            .unwrap_or_else(|| self.thread.load_messages());
+        finalized_non_system_messages.extend(current_turn.working_messages);
+        self.replace_non_system_messages(finalized_non_system_messages, completed_at);
+        if self.thread.created_at > current_turn.started_at {
+            self.thread.created_at = current_turn.started_at;
+        }
+
+        self.state.tools.tool_events.extend(
+            current_turn
+                .tool_events
+                .into_iter()
+                .map(|event| event.with_turn_id(current_turn.turn_id)),
+        );
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            turn_id = %current_turn.turn_id,
+            event_count = current_turn.buffered_events.len(),
+            is_error = matches!(status, ThreadFinalizedTurnStatus::Failed { .. }),
+            "finalized thread-owned turn"
+        );
+
+        Ok(ThreadFinalizedTurn {
+            turn_id: current_turn.turn_id,
+            external_message_id: current_turn.external_message_id,
+            started_at: current_turn.started_at,
+            completed_at,
+            reply,
+            status,
+            events: current_turn.buffered_events,
+            snapshot: self.clone(),
+        })
+    }
+
     /// Replace the active thread snapshot while keeping the current locator.
     pub fn overwrite_active_history(&mut self, replacement: &Thread) {
         self.thread = replacement.thread.clone();
         self.state = replacement.state.clone();
         self.pending_tool_events = replacement.pending_tool_events.clone();
+        self.current_turn = replacement.current_turn.clone();
     }
 
     /// Clear the current thread back to one empty initial state.
@@ -545,6 +977,7 @@ impl Thread {
         self.thread = ThreadContext::new(now);
         self.state = ThreadState::default();
         self.pending_tool_events.clear();
+        self.current_turn = None;
     }
 
     /// Return the effective auto-compact state for this thread.

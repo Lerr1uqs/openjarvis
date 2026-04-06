@@ -2,8 +2,8 @@ use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     thread::{
-        Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
-        derive_internal_thread_id,
+        Thread, ThreadContextLocator, ThreadFinalizedTurnStatus, ThreadToolEvent,
+        ThreadToolEventKind, derive_internal_thread_id,
     },
 };
 use serde_json::json;
@@ -113,6 +113,70 @@ fn store_turn_state_binds_pending_tool_events_to_commit_id() {
     assert_eq!(stored_events.len(), 1);
     assert_eq!(stored_events[0].turn_id, Some(turn_id));
     assert_eq!(stored_events[0].tool_call_id.as_deref(), Some("call_1"));
+}
+
+#[test]
+fn finalize_turn_failure_drops_inflight_turn_contents() {
+    // 测试场景: turn 内发生异常失败时，本轮 user input / 中间消息 / tool event 都必须丢弃，
+    // 线程快照只能回退到本轮开始前的 persisted state。
+    let now = Utc::now();
+    let mut thread = build_thread("thread_failed_turn");
+    thread.store_turn(
+        Some("msg_seed".to_string()),
+        vec![ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "persisted history",
+            now,
+        )],
+        now,
+        now,
+    );
+    thread
+        .begin_turn(Some("msg_fail".to_string()), now)
+        .expect("failed turn should start");
+    thread
+        .push_turn_message(ChatMessage::new(
+            ChatMessageRole::User,
+            "current input",
+            now,
+        ))
+        .expect("failed user message should enter current turn");
+    thread
+        .push_turn_message(ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "partial reply",
+            now,
+        ))
+        .expect("partial assistant reply should enter current turn");
+    let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now);
+    event.tool_name = Some("demo__echo".to_string());
+    event.tool_call_id = Some("call_fail_1".to_string());
+    thread.record_tool_event(event);
+
+    let finalized = thread
+        .finalize_turn_failure("network exploded", now)
+        .expect("failed turn should finalize");
+
+    assert!(matches!(
+        finalized.status,
+        ThreadFinalizedTurnStatus::Failed { .. }
+    ));
+    assert_eq!(
+        finalized
+            .snapshot
+            .load_messages()
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec!["persisted history".to_string()]
+    );
+    assert_eq!(finalized.snapshot.load_tool_events().len(), 0);
+    assert_eq!(finalized.events.len(), 1);
+    assert!(
+        finalized.events[0]
+            .content
+            .contains("[openjarvis][agent_error]")
+    );
 }
 
 #[test]

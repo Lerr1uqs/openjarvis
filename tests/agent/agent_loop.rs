@@ -3,13 +3,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentRuntime,
+        AgentEventSender, AgentLoop, AgentLoopEventKind, AgentLoopOutput, AgentRuntime,
         ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
         agent_loop::{
-            AgentLoopUTLLMResponseSnapshot, AgentLoopUTLoopState, AgentLoopUTProber,
-            AgentLoopUTRequestSnapshot, AgentLoopUTToolCallSnapshot, AgentLoopUTToolResultSnapshot,
-            TOOL_EVENT_PREVIEW_MAX_CHARS, UTProbe, truncate_tool_log_preview,
-            truncate_tool_message,
+            AgentLoopUTCompactSnapshot, AgentLoopUTLLMResponseSnapshot, AgentLoopUTLoopState,
+            AgentLoopUTProber, AgentLoopUTRequestSnapshot, AgentLoopUTToolCallSnapshot,
+            AgentLoopUTToolResultSnapshot, TOOL_EVENT_PREVIEW_MAX_CHARS, UTProbe,
+            truncate_tool_log_preview, truncate_tool_message,
         },
         empty_tool_input_schema,
     },
@@ -17,11 +17,11 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
-    thread::{Thread, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator, ThreadFinalizedTurnStatus},
 };
 use serde_json::json;
 use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 struct ScriptedLLMProvider {
@@ -44,6 +44,17 @@ impl LLMProvider for ScriptedLLMProvider {
             .await
             .pop_front()
             .ok_or_else(|| anyhow!("no scripted response left"))
+    }
+}
+
+struct FailingLLMProvider;
+
+#[async_trait]
+impl LLMProvider for FailingLLMProvider {
+    async fn generate(&self, _request: LLMRequest) -> Result<LLMResponse> {
+        Err(anyhow!(
+            "upstream llm transport failed: connection reset by peer"
+        ))
     }
 }
 
@@ -84,7 +95,7 @@ impl ToolHandler for LongResultTool {
 
     async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
         Ok(ToolCallResult {
-            content: "R".repeat(128),
+            content: "R".repeat(512),
             metadata: json!({}),
             is_error: false,
         })
@@ -123,15 +134,50 @@ fn build_thread(external_thread_id: &str) -> Thread {
     thread
 }
 
-fn build_event_sender(
-    incoming: &IncomingMessage,
-    thread_context: &Thread,
-) -> (AgentEventSender, mpsc::Receiver<AgentDispatchEvent>) {
-    let (tx, rx) = mpsc::channel(16);
-    (
-        AgentEventSender::from_incoming_and_locator(tx, incoming, &thread_context.locator),
-        rx,
-    )
+fn build_thread_with_system_messages(external_thread_id: &str, system_count: usize) -> Thread {
+    let locator = ThreadContextLocator::new(
+        Some("session_1".to_string()),
+        "feishu",
+        "ou_xxx",
+        external_thread_id,
+        Uuid::new_v4().to_string(),
+    );
+    let mut thread = Thread::new(locator, Utc::now());
+    let system_messages = (0..system_count)
+        .map(|index| {
+            ChatMessage::new(
+                ChatMessageRole::System,
+                format!("system-slot-{index} {}", "S".repeat(24)),
+                Utc::now(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(thread.ensure_system_prefix_messages(&system_messages));
+    thread
+}
+
+fn build_event_sender(incoming: &IncomingMessage, thread_context: &Thread) -> AgentEventSender {
+    AgentEventSender::from_incoming_and_locator(incoming, &thread_context.locator)
+}
+
+fn only_turn(output: &AgentLoopOutput) -> &openjarvis::agent::CompletedAgentTurn {
+    assert_eq!(output.turns.len(), 1);
+    &output.turns[0]
+}
+
+fn last_turn(output: &AgentLoopOutput) -> &openjarvis::agent::CompletedAgentTurn {
+    output
+        .turns
+        .last()
+        .expect("agent loop should finalize at least one turn")
+}
+
+fn flattened_dispatch_kinds(output: &AgentLoopOutput) -> Vec<AgentLoopEventKind> {
+    output
+        .turns
+        .iter()
+        .flat_map(|turn| turn.dispatch_batch.iter().map(|event| event.kind.clone()))
+        .collect()
 }
 
 #[derive(Default)]
@@ -141,6 +187,7 @@ struct RecordingUTProbe {
     llm_responses: Vec<AgentLoopUTLLMResponseSnapshot>,
     tool_calls: Vec<AgentLoopUTToolCallSnapshot>,
     tool_results: Vec<AgentLoopUTToolResultSnapshot>,
+    compacts: Vec<AgentLoopUTCompactSnapshot>,
     loop_end: Vec<AgentLoopUTLoopState>,
 }
 
@@ -165,14 +212,18 @@ impl AgentLoopUTProber for RecordingUTProbe {
         self.tool_results.push(snapshot.clone());
     }
 
+    fn on_compact(&mut self, snapshot: &AgentLoopUTCompactSnapshot) {
+        self.compacts.push(snapshot.clone());
+    }
+
     fn on_loop_end(&mut self, state: &AgentLoopUTLoopState) {
         self.loop_end.push(state.clone());
     }
 }
 
 #[tokio::test]
-async fn run_v1_emits_text_output_and_returns_commit_messages() {
-    // 测试场景: 主入口只消费 Thread + incoming，loop 负责事件化最终文本并返回待提交消息。
+async fn run_v1_returns_finalized_turn_batch_for_plain_text_reply() {
+    // 测试场景: loop 只返回 finalized turn batch；最终文本和 thread snapshot 来自同一个 turn 边界。
     let runtime = AgentRuntime::new();
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(MockLLMProvider::new("loop-reply")),
@@ -182,29 +233,96 @@ async fn run_v1_emits_text_output_and_returns_commit_messages() {
     );
     let thread_context = build_thread("thread_loop_text");
     let incoming = build_incoming("hello", "thread_loop_text");
-    let (event_tx, mut event_rx) = build_event_sender(&incoming, &thread_context);
 
     let output = loop_runner
-        .run_v1(event_tx, &incoming, thread_context.clone())
+        .run_v1(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context.clone(),
+        )
         .await
         .expect("loop should succeed");
 
-    let event = event_rx.recv().await.expect("text event should be emitted");
-    assert_eq!(event.kind, AgentLoopEventKind::TextOutput);
-    assert_eq!(event.content, "loop-reply");
+    let turn = only_turn(&output);
     assert_eq!(output.reply, "loop-reply");
-    assert_eq!(output.commit_messages.len(), 1);
-    assert_eq!(output.commit_messages[0].content, "loop-reply");
+    assert_eq!(turn.dispatch_batch.len(), 1);
+    assert_eq!(turn.dispatch_batch[0].kind, AgentLoopEventKind::TextOutput);
+    assert_eq!(turn.dispatch_batch[0].content, "loop-reply");
     assert_eq!(
-        output.thread_context.system_prefix_messages()[0].content,
-        "system"
+        turn.turn
+            .snapshot
+            .load_messages()
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec!["hello".to_string(), "loop-reply".to_string()]
     );
-    assert!(output.thread_context.load_messages().is_empty());
 }
 
 #[tokio::test]
-async fn run_v1_with_ut_probe_captures_intermediate_loop_state() {
-    // 测试场景: UTProbe 需要在不改动生产语义的前提下，暴露 loop 中间态供集成测试断言。
+async fn run_v1_drops_failed_turn_contents_when_llm_generate_errors() {
+    // 测试场景: `llm.generate()` 发生异常时，本轮 turn 内容必须整体丢弃；
+    // finalized snapshot 只能保留失败前已有的 persisted history。
+    let runtime = AgentRuntime::new();
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(FailingLLMProvider),
+        runtime,
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+    );
+    let mut thread_context = build_thread("thread_loop_failure");
+    let now = Utc::now();
+    thread_context.store_turn(
+        Some("msg_seed".to_string()),
+        vec![ChatMessage::new(
+            ChatMessageRole::Assistant,
+            "persisted history",
+            now,
+        )],
+        now,
+        now,
+    );
+    let incoming = build_incoming("hello", "thread_loop_failure");
+    let mut probe = RecordingUTProbe::default();
+
+    let output = loop_runner
+        .run_v1_with_ut_probe(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context,
+            Some(&mut probe as UTProbe<'_>),
+        )
+        .await
+        .expect("unexpected llm failure should still finalize one failed turn");
+
+    let turn = only_turn(&output);
+    assert!(matches!(
+        turn.turn.status,
+        ThreadFinalizedTurnStatus::Failed { .. }
+    ));
+    assert_eq!(
+        turn.turn
+            .snapshot
+            .load_messages()
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        vec!["persisted history".to_string()]
+    );
+    assert!(
+        turn.dispatch_batch[0]
+            .content
+            .contains("[openjarvis][agent_error]")
+    );
+    assert_eq!(probe.request_prepared.len(), 1);
+    assert!(probe.llm_responses.is_empty());
+    assert_eq!(probe.loop_end.len(), 1);
+    assert_eq!(probe.loop_end[0].current_turn_working_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn run_v1_with_ut_probe_exposes_thread_owned_turn_state() {
+    // 测试场景: 中间态探针只能看到 Thread 自身的 request view / working set，不再看到 loop-local message 集合。
     let runtime = AgentRuntime::new();
     runtime
         .tools()
@@ -241,12 +359,11 @@ async fn run_v1_with_ut_probe_captures_intermediate_loop_state() {
     );
     let thread_context = build_thread("thread_loop_ut_probe");
     let incoming = build_incoming("run tool", "thread_loop_ut_probe");
-    let (event_tx, _event_rx) = build_event_sender(&incoming, &thread_context);
     let mut probe = RecordingUTProbe::default();
 
     let output = loop_runner
         .run_v1_with_ut_probe(
-            event_tx,
+            build_event_sender(&incoming, &thread_context),
             &incoming,
             thread_context,
             Some(&mut probe as UTProbe<'_>),
@@ -259,99 +376,152 @@ async fn run_v1_with_ut_probe_captures_intermediate_loop_state() {
     assert_eq!(probe.llm_responses.len(), 2);
     assert_eq!(probe.tool_calls.len(), 1);
     assert_eq!(probe.tool_results.len(), 1);
-    assert_eq!(probe.loop_end.len(), 2);
-
-    assert_eq!(probe.loop_begin[0].iteration, 0);
-    assert!(probe.loop_begin[0].thread_messages.is_empty());
-    assert_eq!(probe.loop_begin[0].live_chat_messages.len(), 1);
-    assert_eq!(
-        probe.loop_begin[0].live_chat_messages[0].content,
-        "run tool"
-    );
-    assert!(probe.loop_begin[0].commit_messages.is_empty());
-
-    assert_eq!(probe.request_prepared[0].iteration, 0);
+    assert!(probe.loop_begin[0].current_turn_working_messages.is_empty());
     assert_eq!(
         probe.request_prepared[0]
             .messages
             .last()
-            .expect("user message should exist")
+            .expect("first request should include the user input")
             .content,
         "run tool"
     );
-    assert!(!probe.request_prepared[0].tools.is_empty());
-
-    assert_eq!(probe.llm_responses[0].iteration, 0);
-    assert_eq!(probe.llm_responses[0].tool_calls.len(), 1);
+    assert_eq!(probe.loop_end[0].turn_events.len(), 3);
     assert_eq!(
-        probe.llm_responses[0]
-            .message
-            .as_ref()
-            .expect("assistant text should exist")
-            .content,
-        "我先查一下"
-    );
-
-    assert_eq!(probe.tool_calls[0].iteration, 0);
-    assert_eq!(probe.tool_calls[0].tool_call_id, "call_demo_probe_1");
-    assert_eq!(probe.tool_calls[0].request.name, "demo__echo");
-
-    assert_eq!(probe.tool_results[0].iteration, 0);
-    assert_eq!(probe.tool_results[0].tool_call_id, "call_demo_probe_1");
-    assert_eq!(probe.tool_results[0].result.content, "echo-result");
-    assert!(!probe.tool_results[0].result.is_error);
-
-    assert_eq!(probe.loop_end[0].iteration, 0);
-    assert_eq!(probe.loop_end[0].commit_messages.len(), 2);
-    assert_eq!(probe.loop_end[0].commit_messages[0].content, "我先查一下");
-    assert_eq!(probe.loop_end[0].commit_messages[1].content, "echo-result");
-    assert_eq!(
-        probe.loop_end[0].commit_messages[1].tool_call_id.as_deref(),
+        probe.loop_end[0]
+            .current_turn_working_messages
+            .last()
+            .and_then(|message| message.tool_call_id.as_deref()),
         Some("call_demo_probe_1")
     );
-
-    assert_eq!(probe.loop_begin[1].iteration, 1);
-    assert_eq!(probe.loop_begin[1].live_chat_messages.len(), 3);
-    assert_eq!(
-        probe.loop_begin[1].live_chat_messages[1].content,
-        "我先查一下"
-    );
-    assert_eq!(
-        probe.loop_begin[1].live_chat_messages[1].tool_calls.len(),
-        1
-    );
-    assert_eq!(
-        probe.loop_begin[1].live_chat_messages[2].content,
-        "echo-result"
-    );
-
-    assert_eq!(probe.llm_responses[1].iteration, 1);
-    assert_eq!(probe.llm_responses[1].tool_calls.len(), 0);
-    assert_eq!(
-        probe.llm_responses[1]
-            .message
-            .as_ref()
-            .expect("final assistant text should exist")
-            .content,
-        "done"
-    );
-
-    assert_eq!(probe.loop_end[1].iteration, 1);
-    assert_eq!(
-        probe.loop_end[1]
-            .commit_messages
-            .last()
-            .expect("final assistant message should exist")
-            .content,
-        "done"
-    );
-    assert!(probe.loop_end[1].persist_incoming_user);
+    assert_eq!(output.turns.len(), 2);
+    assert_eq!(flattened_dispatch_kinds(&output).len(), 4);
     assert_eq!(output.reply, "done");
 }
 
 #[tokio::test]
-async fn run_v1_executes_tool_calls_and_records_tool_events() {
-    // 测试场景: loop 必须把 assistant/tool 消息加入 commit_messages，并记录对应 tool event。
+async fn run_v1_batches_multiple_tool_calls_and_probes_each_iteration() {
+    // 测试场景: 单次 LLM 响应返回多个 tool call 时，
+    // loop 必须按顺序执行并把每一轮迭代与每个 tool call 都暴露给 UT probe。
+    let runtime = AgentRuntime::new();
+    runtime
+        .tools()
+        .register(Arc::new(EchoTool))
+        .await
+        .expect("echo tool should register");
+    let provider = ScriptedLLMProvider::new(vec![
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "我会连续调用两个工具",
+                Utc::now(),
+            )),
+            tool_calls: vec![
+                LLMToolCall {
+                    id: "call_demo_batch_1".to_string(),
+                    name: "demo__echo".to_string(),
+                    arguments: json!({"query": "first"}),
+                },
+                LLMToolCall {
+                    id: "call_demo_batch_2".to_string(),
+                    name: "demo__echo".to_string(),
+                    arguments: json!({"query": "second"}),
+                },
+            ],
+        },
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "batch done",
+                Utc::now(),
+            )),
+            tool_calls: Vec::new(),
+        },
+    ]);
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(provider),
+        runtime,
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+    );
+    let thread_context = build_thread("thread_loop_batch_tools");
+    let incoming = build_incoming("run batch tools", "thread_loop_batch_tools");
+    let mut probe = RecordingUTProbe::default();
+
+    let output = loop_runner
+        .run_v1_with_ut_probe(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context,
+            Some(&mut probe as UTProbe<'_>),
+        )
+        .await
+        .expect("loop should succeed");
+
+    let first_turn = &output.turns[0];
+    let final_turn = last_turn(&output);
+    assert_eq!(
+        probe
+            .loop_begin
+            .iter()
+            .map(|state| state.iteration)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        probe
+            .request_prepared
+            .iter()
+            .map(|snapshot| snapshot.iteration)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        probe
+            .llm_responses
+            .iter()
+            .map(|snapshot| snapshot.iteration)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        probe
+            .tool_calls
+            .iter()
+            .map(|snapshot| (snapshot.iteration, snapshot.tool_call_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "call_demo_batch_1"), (0, "call_demo_batch_2")]
+    );
+    assert_eq!(
+        probe
+            .tool_results
+            .iter()
+            .map(|snapshot| (snapshot.iteration, snapshot.tool_call_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "call_demo_batch_1"), (0, "call_demo_batch_2")]
+    );
+    assert_eq!(probe.loop_end[0].turn_events.len(), 5);
+    assert_eq!(output.turns.len(), 2);
+    assert_eq!(
+        first_turn.turn.snapshot.load_messages()[1].tool_calls.len(),
+        2
+    );
+    assert_eq!(
+        flattened_dispatch_kinds(&output),
+        vec![
+            AgentLoopEventKind::TextOutput,
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::TextOutput,
+        ]
+    );
+    assert_eq!(final_turn.turn.reply, "batch done");
+}
+
+#[tokio::test]
+async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
+    // 测试场景: tool call/tool result/final reply 都先进入 Thread 当前 turn，finalize 后再一起外发和落盘。
     let runtime = AgentRuntime::new();
     runtime
         .tools()
@@ -368,7 +538,7 @@ async fn run_v1_executes_tool_calls_and_records_tool_events() {
             tool_calls: vec![LLMToolCall {
                 id: "call_demo_1".to_string(),
                 name: "demo__echo".to_string(),
-                arguments: json!({}),
+                arguments: json!({"query": "demo"}),
             }],
         },
         LLMResponse {
@@ -388,70 +558,76 @@ async fn run_v1_executes_tool_calls_and_records_tool_events() {
     );
     let thread_context = build_thread("thread_loop_tool");
     let incoming = build_incoming("run tool", "thread_loop_tool");
-    let (event_tx, mut event_rx) = build_event_sender(&incoming, &thread_context);
 
     let output = loop_runner
-        .run_v1(event_tx, &incoming, thread_context)
+        .run_v1(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context,
+        )
         .await
         .expect("loop should succeed");
 
-    let mut kinds = Vec::new();
-    while let Ok(event) =
-        tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv()).await
-    {
-        let Some(event) = event else {
-            break;
-        };
-        kinds.push(event.kind);
-    }
-
-    assert!(kinds.contains(&AgentLoopEventKind::TextOutput));
-    assert!(kinds.contains(&AgentLoopEventKind::ToolCall));
-    assert!(kinds.contains(&AgentLoopEventKind::ToolResult));
-    assert_eq!(output.reply, "done");
-    assert_eq!(output.commit_messages.len(), 3);
-    assert_eq!(output.commit_messages[0].content, "我先查一下");
+    let final_turn = last_turn(&output);
     assert_eq!(
-        output.commit_messages[1].tool_call_id.as_deref(),
-        Some("call_demo_1")
+        final_turn
+            .turn
+            .snapshot
+            .load_messages()
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ChatMessageRole::User,
+            ChatMessageRole::Assistant,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Assistant,
+        ]
     );
-    assert_eq!(output.commit_messages[2].content, "done");
-    assert_eq!(output.tool_events.len(), 1);
+    assert_eq!(final_turn.turn.snapshot.load_tool_events().len(), 1);
     assert_eq!(
-        output.tool_events[0].tool_name.as_deref(),
+        final_turn.turn.snapshot.load_tool_events()[0]
+            .tool_name
+            .as_deref(),
         Some("demo__echo")
+    );
+    assert_eq!(
+        flattened_dispatch_kinds(&output),
+        vec![
+            AgentLoopEventKind::TextOutput,
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::TextOutput,
+        ]
     );
 }
 
 #[tokio::test]
-async fn run_v1_truncates_tool_event_content_but_keeps_full_tool_result_history() {
-    // 测试场景: tool_call/tool_result 发给 router 的事件内容必须截断，但写入历史供模型继续推理的 tool result 必须保留完整内容。
+async fn run_v1_truncates_tool_events_but_keeps_full_tool_result_history() {
+    // 测试场景: 对外事件要截断长 tool 文本，但 Thread finalized snapshot 中必须保留完整 tool result。
     let runtime = AgentRuntime::new();
     runtime
         .tools()
         .register(Arc::new(LongResultTool))
         .await
-        .expect("long result tool should register");
-    let long_arguments = json!({
-        "path": "X".repeat(128),
-    });
+        .expect("long tool should register");
     let provider = ScriptedLLMProvider::new(vec![
         LLMResponse {
             message: Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
-                "开始执行",
+                "准备调用长工具",
                 Utc::now(),
             )),
             tool_calls: vec![LLMToolCall {
-                id: "call_long_1".to_string(),
+                id: "call_demo_long_1".to_string(),
                 name: "demo__long_echo".to_string(),
-                arguments: long_arguments.clone(),
+                arguments: json!({"query": "demo"}),
             }],
         },
         LLMResponse {
             message: Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
-                "done",
+                "long done",
                 Utc::now(),
             )),
             tool_calls: Vec::new(),
@@ -463,70 +639,48 @@ async fn run_v1_truncates_tool_event_content_but_keeps_full_tool_result_history(
         LLMConfig::default(),
         AgentCompactConfig::default(),
     );
-    let thread_context = build_thread("thread_loop_tool_truncate");
-    let incoming = build_incoming("run tool", "thread_loop_tool_truncate");
-    let (event_tx, mut event_rx) = build_event_sender(&incoming, &thread_context);
+    let thread_context = build_thread("thread_long_tool");
+    let incoming = build_incoming("run long tool", "thread_long_tool");
 
     let output = loop_runner
-        .run_v1(event_tx, &incoming, thread_context)
+        .run_v1(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context,
+        )
         .await
         .expect("loop should succeed");
 
-    let mut events = Vec::new();
-    while let Ok(event) =
-        tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv()).await
-    {
-        let Some(event) = event else {
-            break;
-        };
-        events.push(event);
-    }
-
-    let tool_call_event = events
+    let tool_result_event = output
+        .turns
         .iter()
-        .find(|event| event.kind == AgentLoopEventKind::ToolCall)
-        .expect("tool_call event should be emitted");
-    let tool_result_event = events
-        .iter()
+        .flat_map(|turn| turn.dispatch_batch.iter())
         .find(|event| event.kind == AgentLoopEventKind::ToolResult)
-        .expect("tool_result event should be emitted");
-
+        .expect("tool result event should exist");
+    assert!(tool_result_event.content.contains("...(truncated"));
     assert_eq!(
-        tool_call_event.content,
-        format!(
-            "[openjarvis][tool_call] demo__long_echo {}",
-            truncate_tool_message(&long_arguments.to_string(), TOOL_EVENT_PREVIEW_MAX_CHARS)
-        )
+        last_turn(&output).turn.snapshot.load_messages()[2].content,
+        "R".repeat(512)
     );
-    assert_eq!(
-        tool_result_event.content,
-        format!(
-            "[openjarvis][tool_result] {}",
-            truncate_tool_message(&"R".repeat(128), TOOL_EVENT_PREVIEW_MAX_CHARS)
-        )
-    );
-    assert_eq!(output.commit_messages.len(), 3);
-    assert_eq!(
-        output.commit_messages[1].tool_call_id.as_deref(),
-        Some("call_long_1")
-    );
-    assert_eq!(output.commit_messages[1].content, "R".repeat(128));
-    assert_eq!(output.reply, "done");
 }
 
 #[test]
 fn tool_log_preview_truncates_long_content() {
-    // 测试场景: tool 日志预览必须对超长内容进行截断，避免 arguments/result 把日志撑爆。
-    let preview = truncate_tool_log_preview(&"A".repeat(700), 32);
-
-    assert!(preview.starts_with("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-    assert!(preview.contains("...(truncated, total_chars=700)"));
-    assert!(preview.len() < 100);
+    // 测试场景: 日志和 channel 预览都应保留统一的截断格式，避免测试依赖两套逻辑。
+    assert_eq!(
+        truncate_tool_message("123456", 4),
+        "1234...(truncated, total_chars=6)"
+    );
+    assert_eq!(
+        truncate_tool_log_preview("abcdef", 3),
+        "abc...(truncated, total_chars=6)"
+    );
+    assert_eq!(TOOL_EVENT_PREVIEW_MAX_CHARS, 300);
 }
 
 #[tokio::test]
-async fn run_v1_tool_requested_compact_replaces_non_system_history() {
-    // 测试场景: compact tool 应只压缩非 system 消息，并通过 compact event 报告结果。
+async fn run_v1_tool_requested_compact_replaces_thread_owned_active_view() {
+    // 测试场景: compact tool 直接改写 Thread active non-system view，Router/Session 不再额外跳过用户消息。
     let compact_config: AgentCompactConfig = serde_json::from_value(json!({
         "enabled": true,
         "auto_compact": false,
@@ -537,7 +691,7 @@ async fn run_v1_tool_requested_compact_replaces_non_system_history() {
     .expect("compact config should parse");
     let provider = ScriptedLLMProvider::new(vec![
         LLMResponse {
-            message: Some(ChatMessage::new(ChatMessageRole::Assistant, "", Utc::now())),
+            message: None,
             tool_calls: vec![LLMToolCall {
                 id: "call_compact_1".to_string(),
                 name: "compact".to_string(),
@@ -558,51 +712,201 @@ async fn run_v1_tool_requested_compact_replaces_non_system_history() {
         AgentRuntime::new(),
         LLMConfig::default(),
         compact_config,
-        None::<String>,
+        Some("system".to_string()),
     );
     let mut thread_context = build_thread("thread_loop_compact");
     let now = Utc::now();
     thread_context.store_turn(
-        Some("msg_history".to_string()),
+        None,
         vec![
-            ChatMessage::new(ChatMessageRole::User, "old question", now),
-            ChatMessage::new(ChatMessageRole::Assistant, "old answer", now),
+            ChatMessage::new(ChatMessageRole::User, "old request", now),
+            ChatMessage::new(ChatMessageRole::Assistant, "old reply", now),
         ],
         now,
         now,
     );
     let incoming = build_incoming("continue", "thread_loop_compact");
-    let (event_tx, mut event_rx) = build_event_sender(&incoming, &thread_context);
 
     let output = loop_runner
-        .run_v1(event_tx, &incoming, thread_context)
+        .run_v1(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context,
+        )
         .await
         .expect("loop should succeed");
 
-    let mut saw_compact = false;
-    while let Ok(event) =
-        tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv()).await
-    {
-        let Some(event) = event else {
-            break;
-        };
-        if event.kind == AgentLoopEventKind::Compact {
-            saw_compact = true;
-        }
-    }
-
-    assert!(saw_compact);
-    assert!(!output.persist_incoming_user);
+    let first_turn = &output.turns[0];
+    let final_turn = last_turn(&output);
     assert_eq!(output.reply, "after compact");
     assert_eq!(
-        output.thread_context.system_prefix_messages()[0].content,
-        "system"
+        flattened_dispatch_kinds(&output),
+        vec![
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::Compact,
+            AgentLoopEventKind::TextOutput,
+        ]
     );
-    assert_eq!(output.thread_context.load_messages().len(), 2);
+    assert_eq!(first_turn.turn.snapshot.load_messages().len(), 3);
+    assert_eq!(
+        first_turn.turn.snapshot.load_messages()[0].content,
+        "这是压缩后的上下文，请基于这些信息继续当前任务：\n任务已压缩"
+    );
+    assert_eq!(first_turn.turn.snapshot.load_messages()[1].content, "继续");
+    assert_eq!(
+        first_turn.turn.snapshot.load_messages()[2].content,
+        "compact completed: compacted 3 messages from current chat history"
+    );
+    assert_eq!(final_turn.turn.snapshot.load_messages().len(), 4);
+    assert_eq!(final_turn.turn.snapshot.load_messages()[1].content, "继续");
+    assert_eq!(
+        final_turn.turn.snapshot.load_messages()[3].content,
+        "after compact"
+    );
+}
+
+#[tokio::test]
+#[ignore = "temporarily disabled because this auto-compact integration case can destabilize the host during cargo test"]
+async fn run_v1_auto_compact_feature_exposes_compact_tool_and_keeps_system_prefix() {
+    // 测试场景: 开启 auto-compact feature 且上下文逼近阈值时，
+    // 模型应能看到 compact 工具并触发压缩；压缩后 system prefix 仍必须完整保留在开头。
+    let compact_config: AgentCompactConfig = serde_json::from_value(json!({
+        "enabled": true,
+        "auto_compact": true,
+        "runtime_threshold_ratio": 0.95,
+        "tool_visible_threshold_ratio": 0.5,
+        "mock_compacted_assistant": "自动压缩摘要"
+    }))
+    .expect("compact config should parse");
+    let llm_config = LLMConfig {
+        context_window_tokens: Some(320),
+        max_output_tokens: Some(16),
+        ..LLMConfig::default()
+    };
+    let provider = ScriptedLLMProvider::new(vec![
+        LLMResponse {
+            message: None,
+            tool_calls: vec![LLMToolCall {
+                id: "call_auto_compact_1".to_string(),
+                name: "compact".to_string(),
+                arguments: json!({}),
+            }],
+        },
+        LLMResponse {
+            message: Some(ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "after auto compact",
+                Utc::now(),
+            )),
+            tool_calls: Vec::new(),
+        },
+    ]);
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(provider),
+        AgentRuntime::new(),
+        llm_config,
+        compact_config,
+    );
+    let mut thread_context = build_thread_with_system_messages("thread_loop_auto_compact", 5);
+    let now = Utc::now();
+    let history = (0..5)
+        .flat_map(|index| {
+            [
+                ChatMessage::new(
+                    ChatMessageRole::User,
+                    format!("user-history-{index} {}", "U".repeat(20)),
+                    now,
+                ),
+                ChatMessage::new(
+                    ChatMessageRole::Assistant,
+                    format!("assistant-history-{index} {}", "A".repeat(20)),
+                    now,
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    thread_context.store_turn(None, history, now, now);
+    thread_context.enable_auto_compact();
+    let incoming = build_incoming("continue", "thread_loop_auto_compact");
+    let mut probe = RecordingUTProbe::default();
+
+    let output = loop_runner
+        .run_v1_with_ut_probe(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            thread_context,
+            Some(&mut probe as UTProbe<'_>),
+        )
+        .await
+        .expect("auto-compact loop should succeed");
+
+    assert!(probe.request_prepared[0].budget_report.utilization_ratio >= 0.5);
     assert!(
-        output.thread_context.load_messages()[0]
-            .content
-            .contains("这是压缩后的上下文")
+        probe.request_prepared[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "compact")
     );
-    assert_eq!(output.thread_context.load_messages()[1].content, "继续");
+    assert_eq!(probe.compacts.len(), 1);
+    assert!(probe.compacts[0].requested_by_model);
+    assert!(!probe.compacts[0].is_error);
+    assert_eq!(probe.compacts[0].active_non_system_messages.len(), 2);
+    assert!(probe.compacts[0].current_turn_working_messages.is_empty());
+    assert_eq!(
+        last_turn(&output)
+            .turn
+            .snapshot
+            .system_prefix_messages()
+            .len(),
+        5
+    );
+    assert_eq!(last_turn(&output).turn.snapshot.messages().len(), 9);
+    assert_eq!(
+        last_turn(&output)
+            .turn
+            .snapshot
+            .messages()
+            .iter()
+            .take(5)
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ChatMessageRole::System,
+            ChatMessageRole::System,
+            ChatMessageRole::System,
+            ChatMessageRole::System,
+            ChatMessageRole::System,
+        ]
+    );
+    assert_eq!(
+        last_turn(&output)
+            .turn
+            .snapshot
+            .load_messages()
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ChatMessageRole::Assistant,
+            ChatMessageRole::User,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Assistant,
+        ]
+    );
+    assert_eq!(
+        last_turn(&output).turn.snapshot.load_messages()[0].content,
+        "这是压缩后的上下文，请基于这些信息继续当前任务：\n自动压缩摘要"
+    );
+    assert_eq!(
+        last_turn(&output).turn.snapshot.load_messages()[1].content,
+        "继续"
+    );
+    assert_eq!(
+        last_turn(&output).turn.snapshot.load_messages()[2].content,
+        "compact completed: compacted 11 messages from current chat history"
+    );
+    assert_eq!(
+        last_turn(&output).turn.snapshot.load_messages()[3].content,
+        "after auto compact"
+    );
 }

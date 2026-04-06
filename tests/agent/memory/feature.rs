@@ -260,10 +260,7 @@ async fn collect_until_commit(
                 .recv()
                 .await
                 .expect("agent worker event channel should stay open");
-            let terminal = matches!(
-                event,
-                AgentWorkerEvent::CommitCompleted(_) | AgentWorkerEvent::CommitFailed(_)
-            );
+            let terminal = matches!(event, AgentWorkerEvent::TurnFinalized(_));
             events.push(event);
             if terminal {
                 break events;
@@ -278,10 +275,10 @@ fn extract_completed_thread(events: &[AgentWorkerEvent]) -> Thread {
     events
         .iter()
         .find_map(|event| match event {
-            AgentWorkerEvent::CommitCompleted(commit) => Some(commit.thread_context.clone()),
+            AgentWorkerEvent::TurnFinalized(turn) => Some(turn.turn.snapshot.clone()),
             _ => None,
         })
-        .expect("commit completed event should exist")
+        .expect("turn finalized event should exist")
 }
 
 fn extract_synced_thread(events: &[AgentWorkerEvent]) -> Thread {

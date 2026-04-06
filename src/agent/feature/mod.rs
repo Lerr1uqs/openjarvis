@@ -192,13 +192,14 @@ impl FeaturePromptProvider for AutoCompactFeaturePromptProvider {
 
         Ok(vec![ChatMessage::new(
             ChatMessageRole::System,
-            "Auto-compact 已开启。`compact` 工具当前可用；当你判断剩余上下文不足以安全继续时，可以主动调用它。`compact` 只会压缩当前线程的非 system 历史。",
+            "Auto-compact 已开启。当当前线程预算达到阈值时，系统会向你暴露 `compact` 工具；当你判断剩余上下文不足以安全继续时，可以主动调用它。`compact` 只会压缩当前线程的非 system 历史。",
             context.created_at,
         )])
     }
 }
 
-/// Runtime auto-compact notifier that injects transient capacity prompts without allocating one fixed slot.
+/// Runtime auto-compact helper that decides compact visibility and runtime thresholds from the
+/// current request budget.
 pub struct AutoCompactor {
     compact_config: AgentCompactConfig,
 }
@@ -208,101 +209,37 @@ impl AutoCompactor {
         Self { compact_config }
     }
 
-    /// Refresh the request-time context-capacity prompt for the current thread.
+    /// Return whether the current request budget should expose the `compact` tool.
     ///
     /// # 示例
     /// ```rust
-    /// use std::collections::HashMap;
-    ///
-    /// use chrono::Utc;
     /// use openjarvis::{
     ///     agent::AutoCompactor,
     ///     compact::ContextBudgetReport,
     ///     config::AgentCompactConfig,
     ///     context::ContextTokenKind,
-    ///     thread::{Thread, ThreadContextLocator},
     /// };
+    /// use std::collections::HashMap;
     ///
-    /// let now = Utc::now();
-    /// let thread_context = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// let mut runtime_system_messages = Vec::new();
     /// let budget_report = ContextBudgetReport::new(
     ///     HashMap::from([
     ///         (ContextTokenKind::System, 32),
-    ///         (ContextTokenKind::Chat, 128),
+    ///         (ContextTokenKind::Chat, 180),
     ///         (ContextTokenKind::VisibleTool, 16),
     ///         (ContextTokenKind::ReservedOutput, 16),
     ///     ]),
     ///     256,
     /// );
     ///
-    /// AutoCompactor::new(AgentCompactConfig::default())
-    ///     .notify_capacity(&mut runtime_system_messages, Some(&budget_report));
-    ///
-    /// assert!(runtime_system_messages
-    ///     .iter()
-    ///     .any(|message| message.content.contains("<context capacity")));
+    /// assert!(AutoCompactor::new(AgentCompactConfig::default())
+    ///     .compact_tool_visible(&budget_report));
     /// ```
-    pub fn notify_capacity(
-        &self,
-        runtime_system_messages: &mut Vec<ChatMessage>,
-        budget_report: Option<&ContextBudgetReport>,
-    ) {
-        let Some(budget_report) = budget_report else {
-            runtime_system_messages.clear();
-            return;
-        };
-
-        runtime_system_messages.clear();
-        runtime_system_messages.push(ChatMessage::new(
-            ChatMessageRole::System,
-            build_auto_compact_dynamic_prompt(
-                budget_report,
-                self.compact_config.tool_visible_threshold_ratio(),
-                self.compact_config.runtime_threshold_ratio(),
-            ),
-            Utc::now(),
-        ));
+    pub fn compact_tool_visible(&self, budget_report: &ContextBudgetReport) -> bool {
+        budget_report.reaches_ratio(self.compact_config.tool_visible_threshold_ratio())
     }
-}
 
-fn build_auto_compact_dynamic_prompt(
-    budget_report: &ContextBudgetReport,
-    tool_visible_threshold_ratio: f64,
-    runtime_threshold_ratio: f64,
-) -> String {
-    let token_breakdown = crate::context::ContextTokenKind::ALL
-        .into_iter()
-        .map(|kind| format!("{}={}", kind.as_str(), budget_report.tokens(kind)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let utilization_percent = budget_report.utilization_ratio * 100.0;
-    let soft_threshold_percent = tool_visible_threshold_ratio * 100.0;
-    let runtime_threshold_percent = runtime_threshold_ratio * 100.0;
-    let guidance = if budget_report.reaches_ratio(runtime_threshold_ratio) {
-        format!(
-            "当前上下文占用已经接近 runtime compact 阈值 ({runtime_threshold_percent:.1}%)，如果你还需要继续消耗上下文，应优先调用 `compact`。"
-        )
-    } else if budget_report.reaches_ratio(tool_visible_threshold_ratio) {
-        format!(
-            "当前上下文占用已经超过 auto_compact 提前提醒阈值 ({soft_threshold_percent:.1}%)，应主动考虑尽快调用 `compact`。"
-        )
-    } else {
-        "如果你判断剩余上下文不足以安全继续，可以主动调用 `compact`。".to_string()
-    };
-
-    format!(
-        "<context capacity {utilization_percent:.1}% used>\ncurrent_context_budget: {token_breakdown}, total_estimated_tokens={total_estimated_tokens}, context_window_tokens={context_window_tokens}, utilization_ratio={utilization_ratio:.3}, soft_threshold={tool_visible_threshold_ratio:.3}, runtime_threshold={runtime_threshold_ratio:.3}.\n{guidance}",
-        utilization_percent = utilization_percent,
-        token_breakdown = token_breakdown,
-        total_estimated_tokens = budget_report.total_estimated_tokens,
-        context_window_tokens = budget_report.context_window_tokens,
-        utilization_ratio = budget_report.utilization_ratio,
-        tool_visible_threshold_ratio = tool_visible_threshold_ratio,
-        runtime_threshold_ratio = runtime_threshold_ratio,
-        guidance = guidance,
-    )
+    /// Return whether runtime compact should run before the next generate.
+    pub fn runtime_compaction_required(&self, budget_report: &ContextBudgetReport) -> bool {
+        budget_report.reaches_ratio(self.compact_config.runtime_threshold_ratio())
+    }
 }

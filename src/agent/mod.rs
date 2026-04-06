@@ -11,7 +11,7 @@ pub mod worker;
 
 pub use agent_loop::{
     AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEvent, AgentLoopEventKind,
-    AgentLoopOutput,
+    AgentLoopOutput, CompletedAgentTurn,
 };
 pub use feature::{
     AutoCompactFeaturePromptProvider, AutoCompactor, FeaturePromptBuildContext,
@@ -37,5 +37,5 @@ pub use tool::{
 };
 pub use worker::{
     AgentRequest, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent, AgentWorkerHandle,
-    CompletedAgentCommit, FailedAgentCommit, SyncedThreadContext,
+    CompletedAgentRequest, FinalizedAgentTurn, SyncedThreadContext,
 };

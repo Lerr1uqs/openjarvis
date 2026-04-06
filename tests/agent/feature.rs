@@ -98,8 +98,18 @@ Read `guide.md` before replying.
         .await
         .expect("feature prompts should build");
     assert!(thread_context.ensure_system_prefix_messages(&built_messages));
-    let mut runtime_system_messages = Vec::new();
-    auto_compactor.notify_capacity(&mut runtime_system_messages, Some(&budget_report));
+    assert!(auto_compactor.compact_tool_visible(&budget_report));
+    assert!(
+        !auto_compactor.runtime_compaction_required(&ContextBudgetReport::new(
+            HashMap::from([
+                (ContextTokenKind::System, 24),
+                (ContextTokenKind::Chat, 80),
+                (ContextTokenKind::VisibleTool, 16),
+                (ContextTokenKind::ReservedOutput, 16),
+            ]),
+            256,
+        ))
+    );
 
     assert!(
         thread_context
@@ -126,18 +136,12 @@ Read `guide.md` before replying.
             .any(|message| message.content.contains("Auto-compact 已开启"))
     );
 
-    let mut exported_messages = thread_context.messages();
-    exported_messages.extend(runtime_system_messages);
-    let auto_compact_index = exported_messages
-        .iter()
-        .position(|message| message.content.contains("Auto-compact 已开启"))
-        .expect("stable auto-compact prompt should exist");
-    let capacity_index = exported_messages
-        .iter()
-        .position(|message| message.content.contains("<context capacity"))
-        .expect("dynamic capacity prompt should exist");
-
-    assert!(auto_compact_index < capacity_index);
+    assert!(
+        !thread_context
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("<context capacity"))
+    );
 }
 
 #[tokio::test]
@@ -251,8 +255,8 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
 }
 
 #[tokio::test]
-async fn auto_compactor_injects_capacity_as_transient_runtime_system_message() {
-    // 测试场景: 动态上下文容量提示不应占用固定 slot，而应由 AutoCompactor 作为 transient system message 注入。
+async fn auto_compactor_only_decides_budget_thresholds_without_injecting_messages() {
+    // 测试场景: AutoCompactor 只负责预算阈值判断，不能再向请求消息里注入 transient system prompt。
     let compact_config = AppConfig::default().agent_config().compact_config().clone();
     let auto_compactor = AutoCompactor::new(compact_config.clone());
     let now = chrono::Utc::now();
@@ -276,12 +280,12 @@ async fn auto_compactor_injects_capacity_as_transient_runtime_system_message() {
         256,
     );
 
-    let mut runtime_system_messages = Vec::new();
-    auto_compactor.notify_capacity(&mut runtime_system_messages, Some(&budget_report));
-
     assert!(thread_context.system_prefix_messages().is_empty());
+    assert!(auto_compactor.compact_tool_visible(&budget_report));
+    assert!(auto_compactor.runtime_compaction_required(&budget_report));
     assert!(
-        runtime_system_messages
+        !thread_context
+            .messages()
             .iter()
             .any(|message| message.content.contains("<context capacity"))
     );
