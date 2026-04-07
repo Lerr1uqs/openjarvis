@@ -297,10 +297,31 @@ fn serialize_openai_messages(
     messages: &[ChatMessage],
 ) -> Result<Vec<ChatCompletionRequestMessage>> {
     // Serialize the unified chat history into OpenAI chat-completion messages.
-    messages
-        .iter()
-        .map(serialize_context_message)
-        .collect::<Result<Vec<_>>>()
+    let mut serialized = Vec::with_capacity(messages.len());
+    let mut cursor = 0usize;
+    while cursor < messages.len() {
+        let message = &messages[cursor];
+        match message.role {
+            ChatMessageRole::Toolcall => {
+                let (tool_call_message, consumed) =
+                    collect_tool_call_messages(messages, cursor, None);
+                serialized.push(serialize_assistant_message(&tool_call_message)?.into());
+                cursor += consumed;
+            }
+            ChatMessageRole::Assistant if message_starts_tool_call_batch(messages, cursor) => {
+                let (assistant_message, consumed) =
+                    collect_tool_call_messages(messages, cursor + 1, Some(message));
+                serialized.push(serialize_assistant_message(&assistant_message)?.into());
+                cursor += consumed + 1;
+            }
+            _ => {
+                serialized.push(serialize_context_message(message)?);
+                cursor += 1;
+            }
+        }
+    }
+
+    Ok(serialized)
 }
 
 fn serialize_context_message(message: &ChatMessage) -> Result<ChatCompletionRequestMessage> {
@@ -328,26 +349,73 @@ fn serialize_context_message(message: &ChatMessage) -> Result<ChatCompletionRequ
             .context("failed to build tool result message from context")?
             .into()),
         ChatMessageRole::Assistant | ChatMessageRole::Toolcall => {
-            let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
-            if !message.content.trim().is_empty() {
-                builder.content(message.content.clone());
-            }
-            if !message.tool_calls.is_empty() {
-                builder.tool_calls(
-                    message
-                        .tool_calls
-                        .iter()
-                        .map(serialize_openai_tool_call)
-                        .collect::<Vec<_>>(),
-                );
-            }
-
-            Ok(builder
-                .build()
-                .context("failed to build assistant message")?
-                .into())
+            Ok(serialize_assistant_message(message)?.into())
         }
     }
+}
+
+fn serialize_assistant_message(
+    message: &ChatMessage,
+) -> Result<async_openai::types::chat::ChatCompletionRequestAssistantMessage> {
+    let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
+    if !message.content.trim().is_empty() {
+        builder.content(message.content.clone());
+    }
+    if !message.tool_calls.is_empty() {
+        builder.tool_calls(
+            message
+                .tool_calls
+                .iter()
+                .map(serialize_openai_tool_call)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    builder.build().context("failed to build assistant message")
+}
+
+fn message_starts_tool_call_batch(messages: &[ChatMessage], cursor: usize) -> bool {
+    let message = &messages[cursor];
+    if !message.tool_calls.is_empty() {
+        return true;
+    }
+
+    messages
+        .get(cursor + 1)
+        .map(|next| next.role == ChatMessageRole::Toolcall)
+        .unwrap_or(false)
+}
+
+fn collect_tool_call_messages(
+    messages: &[ChatMessage],
+    start: usize,
+    assistant_message: Option<&ChatMessage>,
+) -> (ChatMessage, usize) {
+    let mut tool_calls = assistant_message
+        .map(|message| message.tool_calls.clone())
+        .unwrap_or_default();
+    let created_at = assistant_message
+        .map(|message| message.created_at)
+        .or_else(|| messages.get(start).map(|message| message.created_at))
+        .unwrap_or_else(chrono::Utc::now);
+    let content = assistant_message
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    let mut consumed = 0usize;
+
+    while let Some(message) = messages.get(start + consumed) {
+        if message.role != ChatMessageRole::Toolcall {
+            break;
+        }
+        tool_calls.extend(message.tool_calls.clone());
+        consumed += 1;
+    }
+
+    (
+        ChatMessage::new(ChatMessageRole::Assistant, content, created_at)
+            .with_tool_calls(tool_calls),
+        consumed,
+    )
 }
 
 fn serialize_openai_tools(tools: &[ToolDefinition]) -> Result<Vec<ChatCompletionTools>> {
@@ -486,4 +554,55 @@ fn resolve_home_dir() -> Result<PathBuf> {
     }
 
     bail!("failed to resolve user home directory for api_key_path")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize_openai_messages;
+    use crate::context::{ChatMessage, ChatMessageRole, ChatToolCall};
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn serialize_openai_messages_merges_split_toolcall_messages() {
+        // 测试场景: Thread 正式消息按 Toolcall 拆开后，发给 OpenAI 时仍要还原成单个 assistant tool_calls payload。
+        let now = Utc::now();
+        let serialized = serialize_openai_messages(&[
+            ChatMessage::new(ChatMessageRole::System, "system", now),
+            ChatMessage::new(ChatMessageRole::User, "run tools", now),
+            ChatMessage::new(ChatMessageRole::Assistant, "我先执行两个工具", now),
+            ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
+                ChatToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "Cargo.toml" }),
+                },
+            ]),
+            ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
+                ChatToolCall {
+                    id: "call_2".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "src/main.rs" }),
+                },
+            ]),
+            ChatMessage::new(ChatMessageRole::ToolResult, "ok", now).with_tool_call_id("call_1"),
+            ChatMessage::new(ChatMessageRole::ToolResult, "ok", now).with_tool_call_id("call_2"),
+        ])
+        .expect("messages should serialize");
+        let serialized_json = serialized
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("serialized openai messages should convert to json");
+
+        assert_eq!(serialized_json.len(), 5);
+        assert_eq!(serialized_json[2]["role"], "assistant");
+        assert_eq!(serialized_json[2]["content"], "我先执行两个工具");
+        assert_eq!(
+            serialized_json[2]["tool_calls"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(serialized_json[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(serialized_json[2]["tool_calls"][1]["id"], "call_2");
+    }
 }

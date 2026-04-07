@@ -2,7 +2,7 @@
 
 use crate::agent::{
     AgentDispatchEvent, AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle,
-    FinalizedAgentTurn,
+    CommittedAgentMessage,
 };
 use crate::attachment_syntax::AttachmentSyntaxParser;
 use crate::channels::feishu::FeishuChannel;
@@ -423,6 +423,27 @@ impl ChannelRouter {
         }
 
         if self.commands.is_command(&message)? {
+            if self.is_thread_pending(&locator).await {
+                if let Some(reply) = self.commands.running_thread_reply(&message)? {
+                    info!(
+                        thread_id = %locator.thread_id,
+                        external_thread_id = %locator.external_thread_id,
+                        "rejected idle-only command because thread is still running"
+                    );
+                    self.dispatch_command_reply(&message, reply).await?;
+                    if let Some(external_message_id) = message.external_message_id.as_deref() {
+                        self.sessions
+                            .mark_external_message_processed(
+                                &locator,
+                                external_message_id,
+                                None,
+                                message.received_at,
+                            )
+                            .await?;
+                    }
+                    return Ok(());
+                }
+            }
             let mut thread_context = self
                 .sessions
                 .load_thread_context(&locator)
@@ -461,11 +482,16 @@ impl ChannelRouter {
 
     async fn handle_agent_event(&self, event: AgentWorkerEvent) -> Result<()> {
         match event {
-            AgentWorkerEvent::ThreadContextSynced(update) => {
-                self.sync_bootstrapped_thread_context(update).await
+            AgentWorkerEvent::MessageCommitted(message) => {
+                self.dispatch_committed_message(message).await
             }
             AgentWorkerEvent::TurnFinalized(turn) => {
-                self.store_and_dispatch_finalized_turn(turn).await
+                info!(
+                    thread_id = %turn.locator.thread_id,
+                    turn_id = %turn.turn.turn_id,
+                    "router observed finalized thread-owned turn"
+                );
+                Ok(())
             }
             AgentWorkerEvent::RequestCompleted(request) => {
                 self.release_or_dispatch_next(&request.locator).await
@@ -499,16 +525,6 @@ impl ChannelRouter {
             target: event.target,
         };
         self.dispatch_outgoing(outgoing).await
-    }
-
-    async fn sync_bootstrapped_thread_context(
-        &self,
-        update: crate::agent::SyncedThreadContext,
-    ) -> Result<()> {
-        self.sessions
-            .store_thread_context(&update.locator, update.thread_context, update.synced_at)
-            .await?;
-        Ok(())
     }
 
     async fn dispatch_command_reply(
@@ -552,30 +568,18 @@ impl ChannelRouter {
             .map_err(|error| anyhow::anyhow!("failed to enqueue outgoing message: {error}"))
     }
 
-    async fn store_and_dispatch_finalized_turn(&self, turn: FinalizedAgentTurn) -> Result<()> {
+    async fn dispatch_committed_message(&self, committed: CommittedAgentMessage) -> Result<()> {
         info!(
-            thread_id = %turn.locator.thread_id,
-            turn_id = %turn.turn.turn_id,
-            event_count = turn.dispatch_batch.len(),
-            "router storing finalized thread-owned turn"
+            thread_id = %committed.locator.thread_id,
+            turn_id = %committed.turn_id,
+            role = committed.message.role.as_label(),
+            dispatch_event_count = committed.dispatch_events.len(),
+            committed_at = %committed.committed_at,
+            "router dispatching committed thread message"
         );
-        let store_result = self
-            .sessions
-            .commit_finalized_turn(&turn.locator, &turn.turn)
-            .await;
-        let dispatch_result = match &store_result {
-            Ok(_) => {
-                for event in turn.dispatch_batch {
-                    self.process_agent_dispatch_event(event).await?;
-                }
-                Ok(())
-            }
-            Err(error) => Err(anyhow::anyhow!(
-                "failed to persist finalized turn before dispatch: {error}"
-            )),
-        };
-        store_result?;
-        dispatch_result?;
+        for event in committed.dispatch_events {
+            self.process_agent_dispatch_event(event).await?;
+        }
         Ok(())
     }
 
@@ -593,6 +597,11 @@ impl ChannelRouter {
         pending_threads.insert(locator.clone())
     }
 
+    async fn is_thread_pending(&self, locator: &ThreadLocator) -> bool {
+        let pending_threads = self.pending_threads.lock().await;
+        pending_threads.contains(locator)
+    }
+
     async fn enqueue_message(&self, locator: ThreadLocator, message: IncomingMessage) {
         let mut queued_messages = self.queued_messages.lock().await;
         queued_messages
@@ -606,17 +615,12 @@ impl ChannelRouter {
         locator: ThreadLocator,
         message: IncomingMessage,
     ) -> Result<()> {
-        let thread_context = self
-            .sessions
-            .load_thread_context(&locator)
-            .await?
-            .unwrap_or_else(|| Thread::new((&locator).into(), message.received_at));
         if let Err(error) = self
             .agent_tx
             .send(AgentRequest {
                 locator: locator.clone(),
                 incoming: message.clone(),
-                thread_context,
+                sessions: self.sessions.clone(),
             })
             .await
         {

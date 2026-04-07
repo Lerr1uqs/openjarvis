@@ -16,13 +16,15 @@ fn chat_message_role_labels_match_prompt_contract() {
 
 #[test]
 fn chat_message_preserves_tool_call_metadata() {
-    // 测试场景: assistant/tool_result 的 tool-call 关联信息必须原样保留。
-    let message = ChatMessage::new(ChatMessageRole::Assistant, "读取配置", Utc::now())
-        .with_tool_calls(vec![ChatToolCall {
-            id: "call_1".to_string(),
-            name: "read".to_string(),
-            arguments: json!({ "path": "config.yaml" }),
-        }]);
+    // 测试场景: toolcall/tool_result 的 tool-call 关联信息必须原样保留。
+    let message =
+        ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now()).with_tool_calls(vec![
+            ChatToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: json!({ "path": "config.yaml" }),
+            },
+        ]);
     let result =
         ChatMessage::new(ChatMessageRole::ToolResult, "ok", Utc::now()).with_tool_call_id("call_1");
 

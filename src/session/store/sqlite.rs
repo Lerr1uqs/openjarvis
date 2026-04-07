@@ -5,15 +5,13 @@ use super::{
     SessionStoreResult, StoredSessionRecord,
 };
 use crate::{
-    context::ChatMessage,
     session::{SessionKey, ThreadLocator},
-    thread::{Thread, ThreadContextLocator, ThreadToolEvent},
+    thread::Thread,
 };
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -306,9 +304,8 @@ WHERE session_id = ?1 AND thread_id = ?2
                 .optional()
                 .context("failed to load sqlite thread snapshot")?
                 .map(|(snapshot_json, revision)| {
-                    let mut thread_context =
-                        deserialize_thread_snapshot(&snapshot_json, &resolved_locator)
-                            .with_context(|| "failed to deserialize sqlite thread snapshot")?;
+                    let mut thread_context = serde_json::from_str::<Thread>(&snapshot_json)
+                        .with_context(|| "failed to deserialize sqlite thread snapshot")?;
                     thread_context.rebind_locator(resolved_locator);
                     thread_context.set_revision(
                         u64::try_from(revision).context("sqlite revision must not be negative")?,
@@ -534,166 +531,4 @@ DO UPDATE SET turn_id = excluded.turn_id, completed_at = excluded.completed_at
             ))
         })?
     }
-}
-
-// 历史 sqlite 快照曾使用 `conversation + state.request_context.system` 结构。
-// 这里在存储层做兼容迁移，避免旧库在线程模型重构后无法恢复。
-fn deserialize_thread_snapshot(
-    snapshot_json: &str,
-    resolved_locator: &ThreadContextLocator,
-) -> anyhow::Result<Thread> {
-    let current_error = match serde_json::from_str::<Thread>(snapshot_json) {
-        Ok(thread_context) => return Ok(thread_context),
-        Err(error) => error,
-    };
-
-    match serde_json::from_str::<LegacyThreadContextSnapshot>(snapshot_json) {
-        Ok(legacy_snapshot) => {
-            info!(
-                thread_id = %legacy_snapshot.locator.thread_id,
-                external_thread_id = %legacy_snapshot.locator.external_thread_id,
-                "loaded legacy sqlite thread context snapshot"
-            );
-            return Ok(legacy_snapshot.into_thread());
-        }
-        Err(legacy_thread_context_error) => {
-            return serde_json::from_str::<LegacyConversationThreadSnapshot>(snapshot_json)
-                .map(|legacy_snapshot| {
-                    info!(
-                        thread_id = %resolved_locator.thread_id,
-                        external_thread_id = %resolved_locator.external_thread_id,
-                        "loaded detached legacy sqlite conversation snapshot"
-                    );
-                    legacy_snapshot.into_thread(resolved_locator.clone())
-                })
-                .map_err(|legacy_conversation_error| {
-                    anyhow!(
-                        "failed current format decode ({current_error}); failed legacy thread-context decode ({legacy_thread_context_error}); failed detached legacy conversation decode ({legacy_conversation_error})"
-                    )
-                });
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyThreadContextSnapshot {
-    locator: ThreadContextLocator,
-    conversation: LegacyThreadConversationSnapshot,
-    #[serde(default)]
-    state: LegacyThreadStateSnapshot,
-}
-
-impl LegacyThreadContextSnapshot {
-    fn into_thread(self) -> Thread {
-        build_thread_from_legacy_parts(
-            self.locator,
-            self.conversation,
-            self.state.request_context.system,
-            self.state.features.auto_compact_override,
-            self.state.tools.loaded_toolsets,
-        )
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyThreadConversationSnapshot {
-    #[serde(default)]
-    turns: Vec<LegacyConversationTurnSnapshot>,
-    #[serde(default)]
-    tool_events: Vec<ThreadToolEvent>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl LegacyThreadConversationSnapshot {
-    fn flattened_messages(&self) -> Vec<ChatMessage> {
-        self.turns
-            .iter()
-            .flat_map(|turn| turn.messages.iter().cloned())
-            .collect()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyConversationTurnSnapshot {
-    #[serde(default)]
-    messages: Vec<ChatMessage>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LegacyThreadStateSnapshot {
-    #[serde(default)]
-    features: LegacyThreadFeatureStateSnapshot,
-    #[serde(default)]
-    request_context: LegacyThreadRequestContextSnapshot,
-    #[serde(default)]
-    tools: LegacyThreadToolStateSnapshot,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LegacyThreadFeatureStateSnapshot {
-    #[serde(default)]
-    auto_compact_override: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LegacyThreadRequestContextSnapshot {
-    #[serde(default)]
-    system: Vec<ChatMessage>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LegacyThreadToolStateSnapshot {
-    #[serde(default)]
-    loaded_toolsets: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyConversationThreadSnapshot {
-    #[serde(default)]
-    turns: Vec<LegacyConversationTurnSnapshot>,
-    #[serde(default)]
-    loaded_toolsets: Vec<String>,
-    #[serde(default)]
-    tool_events: Vec<ThreadToolEvent>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl LegacyConversationThreadSnapshot {
-    fn into_thread(self, locator: ThreadContextLocator) -> Thread {
-        build_thread_from_legacy_parts(
-            locator,
-            LegacyThreadConversationSnapshot {
-                turns: self.turns,
-                tool_events: self.tool_events,
-                created_at: self.created_at,
-                updated_at: self.updated_at,
-            },
-            Vec::new(),
-            None,
-            self.loaded_toolsets,
-        )
-    }
-}
-
-fn build_thread_from_legacy_parts(
-    locator: ThreadContextLocator,
-    legacy_conversation: LegacyThreadConversationSnapshot,
-    legacy_system_messages: Vec<ChatMessage>,
-    auto_compact_override: Option<bool>,
-    loaded_toolsets: Vec<String>,
-) -> Thread {
-    let mut thread_context = Thread::new(locator, legacy_conversation.created_at);
-    let _ = thread_context.ensure_system_prefix_messages(&legacy_system_messages);
-    thread_context
-        .thread
-        .messages
-        .extend(legacy_conversation.flattened_messages());
-    thread_context.thread.created_at = legacy_conversation.created_at;
-    thread_context.thread.updated_at = legacy_conversation.updated_at;
-    thread_context.state.features.auto_compact_override = auto_compact_override;
-    thread_context.replace_loaded_toolsets(loaded_toolsets);
-    thread_context.state.tools.tool_events = legacy_conversation.tool_events;
-    thread_context
 }

@@ -37,5 +37,5 @@ pub use tool::{
 };
 pub use worker::{
     AgentRequest, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent, AgentWorkerHandle,
-    CompletedAgentRequest, FinalizedAgentTurn, SyncedThreadContext,
+    CommittedAgentMessage, CompletedAgentRequest, FinalizedAgentTurn,
 };

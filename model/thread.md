@@ -40,12 +40,6 @@ pub struct Thread {
 - 这些稳定 `System` messages 必须位于持久化消息序列前缀。
 - `Thread::messages()`
   返回全部持久化消息。
-- `Thread::load_messages()`
-  返回全部持久化的非 `System` 消息。
-- `Thread::system_prefix_messages()`
-  返回持久化的 `System` 前缀。
-- LLM 请求消息
-  由 `AgentLoop` 在运行时临时拼接 `persisted messages + transient system messages + current live chat messages`。
 
 ## 初始化 Ownership
 
@@ -64,8 +58,7 @@ pub struct Thread {
 ## Turn 概念
 
 - `Turn` 仍然表示“一次用户输入驱动的一轮提交”。
-- `Thread::store_turn(...)` 仍是提交接口，但落盘边界已经收敛为 message append。
-- tool event 在提交时再统一绑定到该次 turn。
+- 程序只按message进行落盘和发送 `Turn`只是事件概念 不再有数据结构概念
 
 ## 核心能力
 

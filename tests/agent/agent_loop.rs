@@ -1,3 +1,4 @@
+use super::support::ThreadTestExt;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -130,7 +131,11 @@ fn build_thread(external_thread_id: &str) -> Thread {
         Uuid::new_v4().to_string(),
     );
     let mut thread = Thread::new(locator, Utc::now());
-    let _ = thread.ensure_system_prompt_snapshot("system", Utc::now());
+    thread.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system",
+        Utc::now(),
+    )]);
     thread
 }
 
@@ -152,7 +157,7 @@ fn build_thread_with_system_messages(external_thread_id: &str, system_count: usi
             )
         })
         .collect::<Vec<_>>();
-    assert!(thread.ensure_system_prefix_messages(&system_messages));
+    thread.seed_persisted_messages(system_messages);
     thread
 }
 
@@ -176,7 +181,27 @@ fn flattened_dispatch_kinds(output: &AgentLoopOutput) -> Vec<AgentLoopEventKind>
     output
         .turns
         .iter()
-        .flat_map(|turn| turn.dispatch_batch.iter().map(|event| event.kind.clone()))
+        .flat_map(|turn| {
+            turn.turn
+                .events
+                .iter()
+                .map(|event| event.kind.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn flattened_dispatch_contents(output: &AgentLoopOutput) -> Vec<String> {
+    output
+        .turns
+        .iter()
+        .flat_map(|turn| {
+            turn.turn
+                .events
+                .iter()
+                .map(|event| event.content.clone())
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -245,13 +270,18 @@ async fn run_v1_returns_finalized_turn_batch_for_plain_text_reply() {
 
     let turn = only_turn(&output);
     assert_eq!(output.reply, "loop-reply");
-    assert_eq!(turn.dispatch_batch.len(), 1);
-    assert_eq!(turn.dispatch_batch[0].kind, AgentLoopEventKind::TextOutput);
-    assert_eq!(turn.dispatch_batch[0].content, "loop-reply");
+    assert_eq!(
+        flattened_dispatch_kinds(&output),
+        vec![AgentLoopEventKind::TextOutput]
+    );
+    assert_eq!(
+        flattened_dispatch_contents(&output),
+        vec!["loop-reply".to_string()]
+    );
     assert_eq!(
         turn.turn
             .snapshot
-            .load_messages()
+            .non_system_messages()
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
@@ -261,8 +291,7 @@ async fn run_v1_returns_finalized_turn_batch_for_plain_text_reply() {
 
 #[tokio::test]
 async fn run_v1_drops_failed_turn_contents_when_llm_generate_errors() {
-    // 测试场景: `llm.generate()` 发生异常时，本轮 turn 内容必须整体丢弃；
-    // finalized snapshot 只能保留失败前已有的 persisted history。
+    // 测试场景: `llm.generate()` 发生异常时，已提交消息不能回滚，失败消息必须继续附加到正式历史。
     let runtime = AgentRuntime::new();
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(FailingLLMProvider),
@@ -272,7 +301,7 @@ async fn run_v1_drops_failed_turn_contents_when_llm_generate_errors() {
     );
     let mut thread_context = build_thread("thread_loop_failure");
     let now = Utc::now();
-    thread_context.store_turn(
+    thread_context.commit_test_turn(
         Some("msg_seed".to_string()),
         vec![ChatMessage::new(
             ChatMessageRole::Assistant,
@@ -303,21 +332,21 @@ async fn run_v1_drops_failed_turn_contents_when_llm_generate_errors() {
     assert_eq!(
         turn.turn
             .snapshot
-            .load_messages()
+            .non_system_messages()
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
-        vec!["persisted history".to_string()]
+        vec![
+            "persisted history".to_string(),
+            "hello".to_string(),
+            turn.turn.reply.clone(),
+        ]
     );
-    assert!(
-        turn.dispatch_batch[0]
-            .content
-            .contains("[openjarvis][agent_error]")
-    );
+    assert!(flattened_dispatch_contents(&output)[0].contains("[openjarvis][agent_error]"));
     assert_eq!(probe.request_prepared.len(), 1);
     assert!(probe.llm_responses.is_empty());
     assert_eq!(probe.loop_end.len(), 1);
-    assert_eq!(probe.loop_end[0].current_turn_working_messages.len(), 1);
+    assert_eq!(probe.loop_end[0].request_messages.len(), 3);
 }
 
 #[tokio::test]
@@ -376,7 +405,7 @@ async fn run_v1_with_ut_probe_exposes_thread_owned_turn_state() {
     assert_eq!(probe.llm_responses.len(), 2);
     assert_eq!(probe.tool_calls.len(), 1);
     assert_eq!(probe.tool_results.len(), 1);
-    assert!(probe.loop_begin[0].current_turn_working_messages.is_empty());
+    assert_eq!(probe.loop_begin[0].request_messages.len(), 2);
     assert_eq!(
         probe.request_prepared[0]
             .messages
@@ -388,12 +417,12 @@ async fn run_v1_with_ut_probe_exposes_thread_owned_turn_state() {
     assert_eq!(probe.loop_end[0].turn_events.len(), 3);
     assert_eq!(
         probe.loop_end[0]
-            .current_turn_working_messages
+            .request_messages
             .last()
             .and_then(|message| message.tool_call_id.as_deref()),
         Some("call_demo_probe_1")
     );
-    assert_eq!(output.turns.len(), 2);
+    assert_eq!(output.turns.len(), 1);
     assert_eq!(flattened_dispatch_kinds(&output).len(), 4);
     assert_eq!(output.reply, "done");
 }
@@ -500,18 +529,40 @@ async fn run_v1_batches_multiple_tool_calls_and_probes_each_iteration() {
         vec![(0, "call_demo_batch_1"), (0, "call_demo_batch_2")]
     );
     assert_eq!(probe.loop_end[0].turn_events.len(), 5);
-    assert_eq!(output.turns.len(), 2);
+    assert_eq!(output.turns.len(), 1);
     assert_eq!(
-        first_turn.turn.snapshot.load_messages()[1].tool_calls.len(),
-        2
+        first_turn
+            .turn
+            .snapshot
+            .non_system_messages()
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ChatMessageRole::User,
+            ChatMessageRole::Assistant,
+            ChatMessageRole::Toolcall,
+            ChatMessageRole::Toolcall,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Assistant,
+        ]
+    );
+    assert_eq!(
+        first_turn.turn.snapshot.non_system_messages()[2].tool_calls[0].id,
+        "call_demo_batch_1"
+    );
+    assert_eq!(
+        first_turn.turn.snapshot.non_system_messages()[3].tool_calls[0].id,
+        "call_demo_batch_2"
     );
     assert_eq!(
         flattened_dispatch_kinds(&output),
         vec![
             AgentLoopEventKind::TextOutput,
             AgentLoopEventKind::ToolCall,
-            AgentLoopEventKind::ToolResult,
             AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
             AgentLoopEventKind::ToolResult,
             AgentLoopEventKind::TextOutput,
         ]
@@ -521,7 +572,7 @@ async fn run_v1_batches_multiple_tool_calls_and_probes_each_iteration() {
 
 #[tokio::test]
 async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
-    // 测试场景: tool call/tool result/final reply 都先进入 Thread 当前 turn，finalize 后再一起外发和落盘。
+    // 测试场景: assistant/toolcall/tool_result 都按正式 message 进入 Thread，并在 commit 后立即外发。
     let runtime = AgentRuntime::new();
     runtime
         .tools()
@@ -573,16 +624,21 @@ async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
         final_turn
             .turn
             .snapshot
-            .load_messages()
+            .non_system_messages()
             .iter()
             .map(|message| message.role.clone())
             .collect::<Vec<_>>(),
         vec![
             ChatMessageRole::User,
             ChatMessageRole::Assistant,
+            ChatMessageRole::Toolcall,
             ChatMessageRole::ToolResult,
             ChatMessageRole::Assistant,
         ]
+    );
+    assert_eq!(
+        final_turn.turn.snapshot.non_system_messages()[2].tool_calls[0].id,
+        "call_demo_1"
     );
     assert_eq!(final_turn.turn.snapshot.load_tool_events().len(), 1);
     assert_eq!(
@@ -654,12 +710,12 @@ async fn run_v1_truncates_tool_events_but_keeps_full_tool_result_history() {
     let tool_result_event = output
         .turns
         .iter()
-        .flat_map(|turn| turn.dispatch_batch.iter())
+        .flat_map(|turn| turn.turn.events.iter())
         .find(|event| event.kind == AgentLoopEventKind::ToolResult)
         .expect("tool result event should exist");
     assert!(tool_result_event.content.contains("...(truncated"));
     assert_eq!(
-        last_turn(&output).turn.snapshot.load_messages()[2].content,
+        last_turn(&output).turn.snapshot.non_system_messages()[3].content,
         "R".repeat(512)
     );
 }
@@ -707,16 +763,15 @@ async fn run_v1_tool_requested_compact_replaces_thread_owned_active_view() {
             tool_calls: Vec::new(),
         },
     ]);
-    let loop_runner = AgentLoop::with_compact_config_and_system_prompt(
+    let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),
         AgentRuntime::new(),
         LLMConfig::default(),
         compact_config,
-        Some("system".to_string()),
     );
     let mut thread_context = build_thread("thread_loop_compact");
     let now = Utc::now();
-    thread_context.store_turn(
+    thread_context.commit_test_turn(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::User, "old request", now),
@@ -727,16 +782,26 @@ async fn run_v1_tool_requested_compact_replaces_thread_owned_active_view() {
     );
     let incoming = build_incoming("continue", "thread_loop_compact");
 
+    let mut probe = RecordingUTProbe::default();
     let output = loop_runner
-        .run_v1(
+        .run_v1_with_ut_probe(
             build_event_sender(&incoming, &thread_context),
             &incoming,
             thread_context,
+            Some(&mut probe),
         )
         .await
         .expect("loop should succeed");
 
-    let first_turn = &output.turns[0];
+    let compact_result_snapshot = probe
+        .compacts
+        .last()
+        .expect("compact snapshot should be recorded")
+        .request_messages
+        .iter()
+        .filter(|message| message.role != ChatMessageRole::System)
+        .cloned()
+        .collect::<Vec<_>>();
     let final_turn = last_turn(&output);
     assert_eq!(output.reply, "after compact");
     assert_eq!(
@@ -744,23 +809,23 @@ async fn run_v1_tool_requested_compact_replaces_thread_owned_active_view() {
         vec![
             AgentLoopEventKind::ToolCall,
             AgentLoopEventKind::Compact,
+            AgentLoopEventKind::ToolResult,
             AgentLoopEventKind::TextOutput,
         ]
     );
-    assert_eq!(first_turn.turn.snapshot.load_messages().len(), 3);
+    assert_eq!(compact_result_snapshot.len(), 2);
     assert_eq!(
-        first_turn.turn.snapshot.load_messages()[0].content,
+        compact_result_snapshot[0].content,
         "这是压缩后的上下文，请基于这些信息继续当前任务：\n任务已压缩"
     );
-    assert_eq!(first_turn.turn.snapshot.load_messages()[1].content, "继续");
+    assert_eq!(compact_result_snapshot[1].content, "继续");
+    assert_eq!(final_turn.turn.snapshot.non_system_messages().len(), 4);
     assert_eq!(
-        first_turn.turn.snapshot.load_messages()[2].content,
-        "compact completed: compacted 3 messages from current chat history"
+        final_turn.turn.snapshot.non_system_messages()[1].content,
+        "继续"
     );
-    assert_eq!(final_turn.turn.snapshot.load_messages().len(), 4);
-    assert_eq!(final_turn.turn.snapshot.load_messages()[1].content, "继续");
     assert_eq!(
-        final_turn.turn.snapshot.load_messages()[3].content,
+        final_turn.turn.snapshot.non_system_messages()[3].content,
         "after compact"
     );
 }
@@ -825,7 +890,7 @@ async fn run_v1_auto_compact_feature_exposes_compact_tool_and_keeps_system_prefi
             ]
         })
         .collect::<Vec<_>>();
-    thread_context.store_turn(None, history, now, now);
+    thread_context.commit_test_turn(None, history, now, now);
     thread_context.enable_auto_compact();
     let incoming = build_incoming("continue", "thread_loop_auto_compact");
     let mut probe = RecordingUTProbe::default();
@@ -850,16 +915,8 @@ async fn run_v1_auto_compact_feature_exposes_compact_tool_and_keeps_system_prefi
     assert_eq!(probe.compacts.len(), 1);
     assert!(probe.compacts[0].requested_by_model);
     assert!(!probe.compacts[0].is_error);
-    assert_eq!(probe.compacts[0].active_non_system_messages.len(), 2);
-    assert!(probe.compacts[0].current_turn_working_messages.is_empty());
-    assert_eq!(
-        last_turn(&output)
-            .turn
-            .snapshot
-            .system_prefix_messages()
-            .len(),
-        5
-    );
+    assert_eq!(probe.compacts[0].request_messages.len(), 7);
+    assert_eq!(last_turn(&output).turn.snapshot.system_messages().len(), 5);
     assert_eq!(last_turn(&output).turn.snapshot.messages().len(), 9);
     assert_eq!(
         last_turn(&output)
@@ -882,7 +939,7 @@ async fn run_v1_auto_compact_feature_exposes_compact_tool_and_keeps_system_prefi
         last_turn(&output)
             .turn
             .snapshot
-            .load_messages()
+            .non_system_messages()
             .iter()
             .map(|message| message.role.clone())
             .collect::<Vec<_>>(),
@@ -894,19 +951,19 @@ async fn run_v1_auto_compact_feature_exposes_compact_tool_and_keeps_system_prefi
         ]
     );
     assert_eq!(
-        last_turn(&output).turn.snapshot.load_messages()[0].content,
+        last_turn(&output).turn.snapshot.non_system_messages()[0].content,
         "这是压缩后的上下文，请基于这些信息继续当前任务：\n自动压缩摘要"
     );
     assert_eq!(
-        last_turn(&output).turn.snapshot.load_messages()[1].content,
+        last_turn(&output).turn.snapshot.non_system_messages()[1].content,
         "继续"
     );
     assert_eq!(
-        last_turn(&output).turn.snapshot.load_messages()[2].content,
+        last_turn(&output).turn.snapshot.non_system_messages()[2].content,
         "compact completed: compacted 11 messages from current chat history"
     );
     assert_eq!(
-        last_turn(&output).turn.snapshot.load_messages()[3].content,
+        last_turn(&output).turn.snapshot.non_system_messages()[3].content,
         "after auto compact"
     );
 }

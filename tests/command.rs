@@ -1,3 +1,6 @@
+#[path = "support/mod.rs"]
+mod support;
+
 use chrono::Utc;
 use openjarvis::{
     command::{CommandInvocation, CommandRegistry},
@@ -11,6 +14,7 @@ use openjarvis::{
     },
 };
 use serde_json::json;
+use support::ThreadTestExt;
 use uuid::Uuid;
 
 #[test]
@@ -66,8 +70,12 @@ async fn builtin_context_command_returns_thread_context_summary() {
     let now = Utc::now();
     let incoming = build_incoming("/context");
     let mut thread_context = build_thread_context();
-    assert!(thread_context.ensure_system_prompt_snapshot("system prompt", now));
-    thread_context.store_turn(
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
+    thread_context.commit_test_turn(
         Some("msg_context_summary".to_string()),
         vec![
             ChatMessage::new(ChatMessageRole::User, "hello summary", now),
@@ -99,8 +107,12 @@ async fn builtin_context_role_command_returns_aggregated_role_breakdown() {
     let now = Utc::now();
     let incoming = build_incoming("/context role");
     let mut thread_context = build_thread_context();
-    assert!(thread_context.ensure_system_prompt_snapshot("system prompt", now));
-    thread_context.store_turn(
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
+    thread_context.commit_test_turn(
         Some("msg_context_role".to_string()),
         vec![
             ChatMessage::new(
@@ -136,8 +148,12 @@ async fn builtin_context_detail_command_lists_recent_persisted_messages() {
     let now = Utc::now();
     let incoming = build_incoming("/context detail 2");
     let mut thread_context = build_thread_context();
-    assert!(thread_context.ensure_system_prompt_snapshot("system prompt", now));
-    thread_context.store_turn(
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
+    thread_context.commit_test_turn(
         Some("msg_context_detail".to_string()),
         vec![
             ChatMessage::new(ChatMessageRole::User, "detail user 1", now),
@@ -193,9 +209,13 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
     let mut thread_context = build_thread_context();
     let mut load_event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
     load_event.toolset_name = Some("demo".to_string());
-    assert!(thread_context.ensure_system_prompt_snapshot("system prompt", now));
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
     thread_context.enable_auto_compact();
-    thread_context.store_turn_state(
+    thread_context.commit_test_turn_with_state(
         Some("msg_context_readonly".to_string()),
         vec![ChatMessage::new(
             ChatMessageRole::User,
@@ -296,7 +316,7 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
         event
     };
     thread_context.enable_auto_compact();
-    thread_context.store_turn_state(
+    thread_context.commit_test_turn_with_state(
         Some("msg_history".to_string()),
         vec![openjarvis::context::ChatMessage::new(
             openjarvis::context::ChatMessageRole::User,
@@ -320,7 +340,7 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
         reply.formatted_content(),
         "[Command][clear][SUCCESS]: cleared current thread `thread_command`; all chat messages and thread-scoped runtime state have been reset"
     );
-    assert!(thread_context.load_messages().is_empty());
+    assert!(thread_context.non_system_messages().is_empty());
     assert!(thread_context.load_toolsets().is_empty());
     assert!(thread_context.load_tool_events().is_empty());
     assert!(thread_context.pending_tool_events().is_empty());

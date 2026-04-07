@@ -1,3 +1,4 @@
+use super::super::support::ThreadTestExt;
 use super::MemoryWorkspaceFixture;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -9,8 +10,8 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall},
     model::{IncomingMessage, ReplyTarget},
-    session::{SessionKey, ThreadLocator},
-    thread::{Thread, ThreadContextLocator},
+    session::{SessionKey, SessionManager, ThreadLocator},
+    thread::Thread,
 };
 use serde_json::json;
 use std::{collections::VecDeque, sync::Arc};
@@ -65,6 +66,7 @@ impl LLMProvider for RecordingProvider {
 #[tokio::test]
 async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_reinit() {
     // 测试场景: 用户触发 active memory 写入后，记忆要落盘；当前线程不热更新 catalog，清空重初始化后才把 grouped keywords->path 注入 system prompt。
+    let sessions = SessionManager::new();
     let fixture = MemoryWorkspaceFixture::new("openjarvis-memory-feature-worker");
     let registry = Arc::new(ToolRegistry::with_workspace_root_and_skill_roots(
         fixture.root(),
@@ -125,10 +127,7 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         .send(AgentRequest {
             locator: locator.clone(),
             incoming: remember_incoming.clone(),
-            thread_context: Thread::new(
-                ThreadContextLocator::from(&locator),
-                remember_incoming.received_at,
-            ),
+            sessions: sessions.clone(),
         })
         .await
         .expect("writer request should be accepted");
@@ -139,14 +138,11 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
     let written = std::fs::read_to_string(&memory_file).expect("memory file should exist");
     assert!(written.contains("Notion 上传工作流"));
     assert!(written.contains("上传到 notion 时走用户自定义模板"));
-    assert!(
-        !remembered_thread
-            .system_prefix_messages()
-            .iter()
-            .any(|message| message
-                .content
-                .contains("notion, 上传 -> workflow/notion.md"))
-    );
+    assert!(!remembered_thread.system_messages().iter().any(|message| {
+        message
+            .content
+            .contains("notion, 上传 -> workflow/notion.md")
+    }));
 
     let requests = Arc::new(Mutex::new(Vec::new()));
     let reader_worker = AgentWorker::with_runtime(
@@ -164,7 +160,7 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         .send(AgentRequest {
             locator: locator.clone(),
             incoming: same_thread_incoming.clone(),
-            thread_context: remembered_thread.clone(),
+            sessions: sessions.clone(),
         })
         .await
         .expect("same-thread follow-up should be accepted");
@@ -184,31 +180,41 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
     );
     drop(captured_requests);
 
-    let mut cleared_thread = remembered_thread.clone();
-    cleared_thread.clear_to_initial_state(Utc::now());
     let reinit_incoming = build_incoming("notion 细节是什么");
+    {
+        let mut cleared_thread = sessions
+            .lock_thread_context(&locator, reinit_incoming.received_at)
+            .await
+            .expect("cleared thread should lock");
+        cleared_thread.clear_to_initial_state(Utc::now());
+        sessions
+            .persist_locked_thread_context(
+                &locator,
+                &mut cleared_thread,
+                reinit_incoming.received_at,
+            )
+            .await
+            .expect("cleared thread should store");
+    }
     reader_handle
         .request_tx
         .send(AgentRequest {
             locator,
             incoming: reinit_incoming.clone(),
-            thread_context: cleared_thread,
+            sessions: sessions.clone(),
         })
         .await
         .expect("reinit follow-up should be accepted");
     let reinit_events = collect_until_commit(&mut reader_handle.event_rx).await;
-    let reinit_thread = extract_synced_thread(&reinit_events);
+    let reinit_thread = extract_completed_thread(&reinit_events);
     let captured_requests = requests.lock().await;
     let reinit_messages = &captured_requests[1].messages;
 
-    assert!(
-        reinit_thread
-            .system_prefix_messages()
-            .iter()
-            .any(|message| message
-                .content
-                .contains("notion, 上传 -> workflow/notion.md"))
-    );
+    assert!(reinit_thread.system_messages().iter().any(|message| {
+        message
+            .content
+            .contains("notion, 上传 -> workflow/notion.md")
+    }));
     assert!(reinit_messages.iter().any(|message| {
         message
             .content
@@ -279,14 +285,4 @@ fn extract_completed_thread(events: &[AgentWorkerEvent]) -> Thread {
             _ => None,
         })
         .expect("turn finalized event should exist")
-}
-
-fn extract_synced_thread(events: &[AgentWorkerEvent]) -> Thread {
-    events
-        .iter()
-        .find_map(|event| match event {
-            AgentWorkerEvent::ThreadContextSynced(update) => Some(update.thread_context.clone()),
-            _ => None,
-        })
-        .expect("thread synced event should exist")
 }

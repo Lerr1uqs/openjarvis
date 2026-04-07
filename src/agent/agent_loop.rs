@@ -1,5 +1,5 @@
-//! ReAct-style agent loop that finalizes one thread-owned turn per LLM interaction and only
-//! releases turn event batches after each turn finalization.
+//! ReAct-style agent loop that keeps one thread-owned turn per incoming request and emits
+//! committed messages from the thread-owned message sequence.
 
 use super::{
     feature::AutoCompactor,
@@ -22,6 +22,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -51,7 +52,7 @@ pub struct AgentDispatchEvent {
     pub reply_to_source: bool,
 }
 
-/// Bind agent turn events to one resolved router/session context.
+/// Bind agent dispatch events to one resolved router/session context.
 #[derive(Clone)]
 pub struct AgentEventSender {
     channel: String,
@@ -104,12 +105,12 @@ impl AgentEventSender {
     /// );
     ///
     /// let sender = AgentEventSender::from_incoming_and_locator(&incoming, &locator);
-    /// let batch = sender.prepare_dispatch_batch(&[ThreadTurnEvent {
+    /// let dispatch = sender.prepare_dispatch_event(ThreadTurnEvent {
     ///     kind: ThreadTurnEventKind::TextOutput,
     ///     content: "done".to_string(),
     ///     metadata: json!({}),
-    /// }]);
-    /// assert_eq!(batch[0].session_thread_id, "thread_internal");
+    /// }, true);
+    /// assert_eq!(dispatch.session_thread_id, "thread_internal");
     /// ```
     pub fn from_incoming_and_locator(
         incoming: &IncomingMessage,
@@ -128,32 +129,27 @@ impl AgentEventSender {
         }
     }
 
-    /// Materialize one finalized turn event batch into router-ready dispatch payloads.
-    pub fn prepare_dispatch_batch(&self, events: &[AgentLoopEvent]) -> Vec<AgentDispatchEvent> {
-        let mut reply_to_source = true;
-        events
-            .iter()
-            .cloned()
-            .map(|event| {
-                let dispatch = AgentDispatchEvent {
-                    kind: event.kind,
-                    content: event.content,
-                    metadata: event.metadata,
-                    channel: self.channel.clone(),
-                    external_thread_id: self.external_thread_id.clone(),
-                    source_message_id: self.source_message_id.clone(),
-                    target: self.target.clone(),
-                    session_id: self.session_id.clone(),
-                    session_channel: self.session_channel.clone(),
-                    session_user_id: self.session_user_id.clone(),
-                    session_external_thread_id: self.session_external_thread_id.clone(),
-                    session_thread_id: self.session_thread_id.clone(),
-                    reply_to_source,
-                };
-                reply_to_source = false;
-                dispatch
-            })
-            .collect()
+    /// Materialize one committed message event into a router-ready dispatch payload.
+    pub fn prepare_dispatch_event(
+        &self,
+        event: AgentLoopEvent,
+        reply_to_source: bool,
+    ) -> AgentDispatchEvent {
+        AgentDispatchEvent {
+            kind: event.kind,
+            content: event.content,
+            metadata: event.metadata,
+            channel: self.channel.clone(),
+            external_thread_id: self.external_thread_id.clone(),
+            source_message_id: self.source_message_id.clone(),
+            target: self.target.clone(),
+            session_id: self.session_id.clone(),
+            session_channel: self.session_channel.clone(),
+            session_user_id: self.session_user_id.clone(),
+            session_external_thread_id: self.session_external_thread_id.clone(),
+            session_thread_id: self.session_thread_id.clone(),
+            reply_to_source,
+        }
     }
 }
 
@@ -166,7 +162,32 @@ pub struct AgentLoopOutput {
 #[derive(Debug, Clone)]
 pub struct CompletedAgentTurn {
     pub turn: ThreadFinalizedTurn,
-    pub dispatch_batch: Vec<AgentDispatchEvent>,
+}
+
+#[async_trait]
+pub trait AgentCommittedMessageHandler: Send {
+    async fn on_committed_message(
+        &mut self,
+        turn_id: uuid::Uuid,
+        thread_context: &mut Thread,
+        message: ChatMessage,
+        dispatch_events: Vec<AgentDispatchEvent>,
+    ) -> Result<()>;
+}
+
+struct NoopCommittedMessageHandler;
+
+#[async_trait]
+impl AgentCommittedMessageHandler for NoopCommittedMessageHandler {
+    async fn on_committed_message(
+        &mut self,
+        _turn_id: uuid::Uuid,
+        _thread_context: &mut Thread,
+        _message: ChatMessage,
+        _dispatch_events: Vec<AgentDispatchEvent>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Integration-test probe state captured at one agent-loop iteration boundary.
@@ -175,8 +196,6 @@ pub struct CompletedAgentTurn {
 pub struct AgentLoopUTLoopState {
     pub iteration: usize,
     pub request_messages: Vec<ChatMessage>,
-    pub active_non_system_messages: Vec<ChatMessage>,
-    pub current_turn_working_messages: Vec<ChatMessage>,
     pub turn_events: Vec<AgentLoopEvent>,
 }
 
@@ -230,8 +249,6 @@ pub struct AgentLoopUTCompactSnapshot {
     pub outcome: Option<MessageCompactionOutcome>,
     pub error: Option<String>,
     pub request_messages: Vec<ChatMessage>,
-    pub active_non_system_messages: Vec<ChatMessage>,
-    pub current_turn_working_messages: Vec<ChatMessage>,
     pub turn_events: Vec<AgentLoopEvent>,
 }
 
@@ -270,8 +287,6 @@ impl<'a> AgentLoopUTProberHandle<'a> {
         AgentLoopUTLoopState {
             iteration,
             request_messages: thread_context.messages(),
-            active_non_system_messages: thread_context.active_non_system_messages(),
-            current_turn_working_messages: thread_context.current_turn_working_messages(),
             turn_events: thread_context.current_turn_events(),
         }
     }
@@ -344,12 +359,11 @@ pub struct AgentLoop {
 impl AgentLoop {
     /// Create an agent loop bound to one LLM provider and runtime container.
     pub fn new(llm: Arc<dyn LLMProvider>, runtime: AgentRuntime) -> Self {
-        Self::with_compact_config_and_system_prompt(
+        Self::with_compact_config(
             llm,
             runtime,
             LLMConfig::default(),
             AgentCompactConfig::default(),
-            None::<String>,
         )
     }
 
@@ -360,32 +374,8 @@ impl AgentLoop {
         llm_config: LLMConfig,
         compact_config: AgentCompactConfig,
     ) -> Self {
-        Self::with_compact_config_and_system_prompt(
-            llm,
-            runtime,
-            llm_config,
-            compact_config,
-            None::<String>,
-        )
-    }
-
-    /// Create an agent loop with explicit compact config and one thread-init system prompt.
-    pub fn with_compact_config_and_system_prompt(
-        llm: Arc<dyn LLMProvider>,
-        runtime: AgentRuntime,
-        llm_config: LLMConfig,
-        compact_config: AgentCompactConfig,
-        thread_system_prompt: impl Into<Option<String>>,
-    ) -> Self {
         let compact_provider = build_compact_provider(&llm, &compact_config);
-        Self::with_compact_provider_and_system_prompt(
-            llm,
-            runtime,
-            llm_config,
-            compact_config,
-            compact_provider,
-            thread_system_prompt,
-        )
+        Self::with_compact_provider(llm, runtime, llm_config, compact_config, compact_provider)
     }
 
     /// Create an agent loop with an explicitly injected compact provider.
@@ -395,25 +385,6 @@ impl AgentLoop {
         llm_config: LLMConfig,
         compact_config: AgentCompactConfig,
         compact_provider: Arc<dyn CompactProvider>,
-    ) -> Self {
-        Self::with_compact_provider_and_system_prompt(
-            llm,
-            runtime,
-            llm_config,
-            compact_config,
-            compact_provider,
-            None::<String>,
-        )
-    }
-
-    /// Create an agent loop with an explicitly injected compact provider and thread-init prompt.
-    pub fn with_compact_provider_and_system_prompt(
-        llm: Arc<dyn LLMProvider>,
-        runtime: AgentRuntime,
-        llm_config: LLMConfig,
-        compact_config: AgentCompactConfig,
-        compact_provider: Arc<dyn CompactProvider>,
-        _thread_system_prompt: impl Into<Option<String>>,
     ) -> Self {
         let budget_estimator = ContextBudgetEstimator::from_config(&llm_config, &compact_config);
         let compact_manager = CompactManager::new(compact_provider);
@@ -442,8 +413,18 @@ impl AgentLoop {
         incoming: &IncomingMessage,
         thread_context: Thread,
     ) -> Result<AgentLoopOutput> {
-        self.run_v1_with_ut_probe(event_tx, incoming, thread_context, None)
-            .await
+        let mut thread_context = thread_context;
+        let mut ut_probe = AgentLoopUTProberHandle::new(None);
+        let mut on_committed_message = NoopCommittedMessageHandler;
+        self.run_live_thread(
+            event_tx,
+            &mut thread_context,
+            incoming_message(incoming),
+            incoming.external_message_id.clone(),
+            &mut ut_probe,
+            &mut on_committed_message,
+        )
+        .await
     }
 
     /// Run one agent loop while exposing doc-hidden UT probe hooks for integration tests.
@@ -456,25 +437,55 @@ impl AgentLoop {
         ut_probe: Option<UTProbe<'_>>,
     ) -> Result<AgentLoopOutput> {
         let mut ut_probe = AgentLoopUTProberHandle::new(ut_probe);
+        let mut thread_context = thread_context;
+        let mut on_committed_message = NoopCommittedMessageHandler;
+        self.run_live_thread(
+            event_tx,
+            &mut thread_context,
+            incoming_message(incoming),
+            incoming.external_message_id.clone(),
+            &mut ut_probe,
+            &mut on_committed_message,
+        )
+        .await
+    }
+
+    /// Run one live thread owned by the caller and invoke the commit hook for every committed
+    /// message.
+    pub async fn run_locked_thread<H>(
+        &self,
+        event_tx: AgentEventSender,
+        incoming: &IncomingMessage,
+        thread_context: &mut Thread,
+        on_committed_message: &mut H,
+    ) -> Result<AgentLoopOutput>
+    where
+        H: AgentCommittedMessageHandler,
+    {
+        let mut ut_probe = AgentLoopUTProberHandle::new(None);
         self.run_live_thread(
             event_tx,
             thread_context,
             incoming_message(incoming),
             incoming.external_message_id.clone(),
             &mut ut_probe,
+            on_committed_message,
         )
         .await
     }
 
-    async fn run_live_thread(
+    async fn run_live_thread<H>(
         &self,
         event_tx: AgentEventSender,
-        thread_context: Thread,
+        mut thread_context: &mut Thread,
         initial_message: ChatMessage,
         external_message_id: Option<String>,
         ut_probe: &mut AgentLoopUTProberHandle<'_>,
-    ) -> Result<AgentLoopOutput> {
-        let mut thread_context = thread_context;
+        on_committed_message: &mut H,
+    ) -> Result<AgentLoopOutput>
+    where
+        H: AgentCommittedMessageHandler,
+    {
         self.prepare_thread_runtime(&mut thread_context).await?;
 
         let hooks = self.runtime.hooks();
@@ -494,11 +505,20 @@ impl AgentLoop {
         let mut used_tool_names = Vec::new();
         let mut last_visible_tools = Vec::new();
         let mut last_budget_report = None;
-        let mut completed_turns = Vec::new();
-        let mut pending_turn_input_messages = vec![initial_message];
         let mut loop_iteration = 0usize;
+        let mut reply_to_source = true;
+        thread_context.begin_turn(external_message_id, initial_message.created_at)?;
+        commit_message(
+            &event_tx,
+            &mut thread_context,
+            &mut reply_to_source,
+            initial_message,
+            Vec::new(),
+            on_committed_message,
+        )
+        .await?;
 
-        let reply = loop {
+        let turn_completion = loop {
             ut_probe.on_loop_begin(loop_iteration, &thread_context);
             let pre_turn_request_state = self.prepare_request_state(&thread_context).await?;
             if self.should_runtime_compact(&thread_context, &pre_turn_request_state.budget_report) {
@@ -523,21 +543,9 @@ impl AgentLoop {
                         outcome: Some(outcome),
                         error: None,
                         request_messages: thread_context.messages(),
-                        active_non_system_messages: thread_context.active_non_system_messages(),
-                        current_turn_working_messages: thread_context
-                            .current_turn_working_messages(),
                         turn_events: thread_context.current_turn_events(),
                     });
                 }
-            }
-
-            let started_at = pending_turn_input_messages
-                .first()
-                .map(|message| message.created_at)
-                .unwrap_or_else(Utc::now);
-            thread_context.begin_turn(external_message_id.clone(), started_at)?;
-            for message in pending_turn_input_messages.drain(..) {
-                thread_context.push_turn_message(message)?;
             }
 
             let turn_result = async {
@@ -581,25 +589,28 @@ impl AgentLoop {
                         bail!("llm final response did not contain assistant text");
                     }
 
-                    thread_context.push_turn_message(assistant_message.clone())?;
-                    thread_context.buffer_turn_event(AgentLoopEvent {
-                        kind: AgentLoopEventKind::TextOutput,
-                        content: assistant_message.content.clone(),
-                        metadata: json!({
-                            "source": "llm_response",
-                            "is_final": true,
-                        }),
-                    })?;
+                    commit_message(
+                        &event_tx,
+                        &mut thread_context,
+                        &mut reply_to_source,
+                        assistant_message.clone(),
+                        vec![AgentLoopEvent {
+                            kind: AgentLoopEventKind::TextOutput,
+                            content: assistant_message.content.clone(),
+                            metadata: json!({
+                                "source": "llm_response",
+                                "is_final": true,
+                            }),
+                        }],
+                        on_committed_message,
+                    )
+                    .await?;
                     return Ok::<TurnLoopSuccess, anyhow::Error>(TurnLoopSuccess {
                         reply: assistant_message.content,
-                        has_more_turns: false,
+                        completed: true,
                     });
                 }
 
-                let assistant_tool_message = build_assistant_tool_call_message(
-                    response.message.as_ref(),
-                    &response.tool_calls,
-                );
                 let turn_reply = response
                     .message
                     .as_ref()
@@ -608,16 +619,43 @@ impl AgentLoop {
                 if let Some(message) = response.message.as_ref()
                     && !message.content.trim().is_empty()
                 {
-                    thread_context.buffer_turn_event(AgentLoopEvent {
-                        kind: AgentLoopEventKind::TextOutput,
-                        content: message.content.clone(),
-                        metadata: json!({
-                            "source": "llm_response",
-                            "is_final": false,
-                        }),
-                    })?;
+                    commit_message(
+                        &event_tx,
+                        &mut thread_context,
+                        &mut reply_to_source,
+                        message.clone(),
+                        vec![AgentLoopEvent {
+                            kind: AgentLoopEventKind::TextOutput,
+                            content: message.content.clone(),
+                            metadata: json!({
+                                "source": "llm_response",
+                                "is_final": false,
+                            }),
+                        }],
+                        on_committed_message,
+                    )
+                    .await?;
                 }
-                thread_context.push_turn_message(assistant_tool_message)?;
+                let tool_call_message_created_at = response
+                    .message
+                    .as_ref()
+                    .map(|message| message.created_at)
+                    .unwrap_or_else(Utc::now);
+                for provider_tool_call in &response.tool_calls {
+                    let tool_call = ToolCallRequest {
+                        name: provider_tool_call.name.clone(),
+                        arguments: provider_tool_call.arguments.clone(),
+                    };
+                    commit_message(
+                        &event_tx,
+                        &mut thread_context,
+                        &mut reply_to_source,
+                        build_tool_call_message(provider_tool_call, tool_call_message_created_at),
+                        vec![build_tool_call_event(&tool_call, &provider_tool_call.id)],
+                        on_committed_message,
+                    )
+                    .await?;
+                }
 
                 for provider_tool_call in response.tool_calls {
                     let tool_call = ToolCallRequest {
@@ -625,10 +663,6 @@ impl AgentLoop {
                         arguments: provider_tool_call.arguments.clone(),
                     };
                     used_tool_names.push(tool_call.name.clone());
-                    thread_context.buffer_turn_event(build_tool_call_event(
-                        &tool_call,
-                        &provider_tool_call.id,
-                    ))?;
                     hooks
                         .emit(HookEvent {
                             kind: HookEventKind::PreToolUse,
@@ -718,22 +752,28 @@ impl AgentLoop {
                             "agent loop completed tool call"
                         );
 
-                        thread_context.buffer_turn_event(build_tool_result_event(
-                            &tool_call,
-                            &provider_tool_call.id,
-                            &tool_result,
-                        ))?;
                         tool_result
                     };
 
-                    thread_context.push_turn_message(
-                        ChatMessage::new(
-                            ChatMessageRole::ToolResult,
-                            format_tool_result_content(&tool_result.content, tool_result.is_error),
-                            Utc::now(),
-                        )
-                        .with_tool_call_id(provider_tool_call.id.clone()),
-                    )?;
+                    let tool_result_message = ChatMessage::new(
+                        ChatMessageRole::ToolResult,
+                        format_tool_result_content(&tool_result.content, tool_result.is_error),
+                        Utc::now(),
+                    )
+                    .with_tool_call_id(provider_tool_call.id.clone());
+                    commit_message(
+                        &event_tx,
+                        &mut thread_context,
+                        &mut reply_to_source,
+                        tool_result_message,
+                        vec![build_tool_result_event(
+                            &tool_call,
+                            &provider_tool_call.id,
+                            &tool_result,
+                        )],
+                        on_committed_message,
+                    )
+                    .await?;
                     ut_probe.on_tool_result(AgentLoopUTToolResultSnapshot {
                         iteration: loop_iteration,
                         tool_call_id: provider_tool_call.id,
@@ -744,7 +784,7 @@ impl AgentLoop {
 
                 Ok::<TurnLoopSuccess, anyhow::Error>(TurnLoopSuccess {
                     reply: turn_reply,
-                    has_more_turns: true,
+                    completed: false,
                 })
             }
             .await;
@@ -753,11 +793,11 @@ impl AgentLoop {
             match turn_result {
                 Ok(turn_result) => {
                     ut_probe.on_loop_end(loop_iteration, &thread_context);
-                    let turn = thread_context
-                        .finalize_turn_success(turn_result.reply.clone(), completed_at)?;
-                    completed_turns.push(finalize_completed_turn(&event_tx, turn));
-                    if !turn_result.has_more_turns {
-                        break turn_result.reply;
+                    if turn_result.completed {
+                        break TurnCompletion {
+                            reply: turn_result.reply,
+                            failure_error: None,
+                        };
                     }
                 }
                 Err(error) => {
@@ -769,16 +809,46 @@ impl AgentLoop {
                         "agent loop encountered one unexpected turn failure"
                     );
                     ut_probe.on_loop_end(loop_iteration, &thread_context);
-                    let turn = thread_context.finalize_turn_failure(error_message, completed_at)?;
-                    let failure_reply = turn.reply.clone();
-                    completed_turns.push(finalize_completed_turn(&event_tx, turn));
-                    break failure_reply;
+                    let failure_reply = format!("[openjarvis][agent_error] {error_message}");
+                    let failure_message = ChatMessage::new(
+                        ChatMessageRole::Assistant,
+                        failure_reply.clone(),
+                        completed_at,
+                    );
+                    commit_message(
+                        &event_tx,
+                        &mut thread_context,
+                        &mut reply_to_source,
+                        failure_message,
+                        vec![AgentLoopEvent {
+                            kind: AgentLoopEventKind::TextOutput,
+                            content: failure_reply.clone(),
+                            metadata: json!({
+                                "source": "turn_failure",
+                                "is_final": true,
+                                "is_error": true,
+                            }),
+                        }],
+                        on_committed_message,
+                    )
+                    .await?;
+                    break TurnCompletion {
+                        reply: failure_reply,
+                        failure_error: Some(error_message),
+                    };
                 }
             }
 
             loop_iteration += 1;
         };
 
+        let completed_at = Utc::now();
+        let turn = if let Some(error_message) = turn_completion.failure_error.clone() {
+            thread_context.finalize_turn_failure(error_message, completed_at)?
+        } else {
+            thread_context.finalize_turn_success(turn_completion.reply.clone(), completed_at)?
+        };
+        let completed_turns = vec![finalize_completed_turn(turn)];
         let last_turn = completed_turns
             .last()
             .context("agent loop did not finalize any turn")?;
@@ -794,14 +864,14 @@ impl AgentLoop {
             .emit(HookEvent {
                 kind: HookEventKind::Notification,
                 payload: json!({
-                    "reply_preview": reply.clone(),
+                    "reply_preview": turn_completion.reply.clone(),
                     "runtime": metadata,
                 }),
             })
             .await?;
 
         Ok(AgentLoopOutput {
-            reply,
+            reply: turn_completion.reply,
             metadata,
             turns: completed_turns,
         })
@@ -860,7 +930,10 @@ impl AgentLoop {
         budget_report: &ContextBudgetReport,
     ) -> bool {
         self.compact_config.enabled()
-            && !thread_context.active_non_system_messages().is_empty()
+            && thread_context
+                .messages()
+                .iter()
+                .any(|message| message.role != ChatMessageRole::System)
             && self
                 .auto_compactor
                 .runtime_compaction_required(budget_report)
@@ -886,7 +959,7 @@ impl AgentLoop {
         tool_call_id: Option<&str>,
         budget_report: &ContextBudgetReport,
     ) -> Result<Option<MessageCompactionOutcome>> {
-        let compactable_messages = thread_context.active_non_system_messages();
+        let compactable_messages = thread_context.messages();
         if compactable_messages.is_empty() {
             let compact_event = build_compact_event(
                 reason,
@@ -928,7 +1001,7 @@ impl AgentLoop {
         else {
             return Ok(None);
         };
-        thread_context.apply_turn_compaction(outcome.compacted_messages.clone())?;
+        thread_context.replace_messages_after_compaction(outcome.compacted_messages.clone())?;
         thread_context.buffer_turn_event(build_compact_event(
             reason,
             requested_by_model,
@@ -941,7 +1014,7 @@ impl AgentLoop {
         info!(
             thread_id,
             reason,
-            compacted_message_count = thread_context.active_non_system_messages().len(),
+            compacted_message_count = thread_context.messages().len(),
             "thread compact completed"
         );
         Ok(Some(outcome))
@@ -1011,8 +1084,6 @@ impl AgentLoop {
                 outcome: None,
                 error: Some(error_message),
                 request_messages: thread_context.messages(),
-                active_non_system_messages: thread_context.active_non_system_messages(),
-                current_turn_working_messages: thread_context.current_turn_working_messages(),
                 turn_events: thread_context.current_turn_events(),
             });
             return Ok(result);
@@ -1059,8 +1130,6 @@ impl AgentLoop {
                     outcome: outcome.clone(),
                     error: None,
                     request_messages: thread_context.messages(),
-                    active_non_system_messages: thread_context.active_non_system_messages(),
-                    current_turn_working_messages: thread_context.current_turn_working_messages(),
                     turn_events: thread_context.current_turn_events(),
                 });
                 let content = outcome
@@ -1126,10 +1195,8 @@ impl AgentLoop {
                     is_error: true,
                     budget_report: budget_report.clone(),
                     outcome: None,
-                    error: Some(error_message),
+                    error: Some(error_message.clone()),
                     request_messages: thread_context.messages(),
-                    active_non_system_messages: thread_context.active_non_system_messages(),
-                    current_turn_working_messages: thread_context.current_turn_working_messages(),
                     turn_events: thread_context.current_turn_events(),
                 });
                 Ok(super::ToolCallResult {
@@ -1153,7 +1220,12 @@ struct RequestState {
 
 struct TurnLoopSuccess {
     reply: String,
-    has_more_turns: bool,
+    completed: bool,
+}
+
+struct TurnCompletion {
+    reply: String,
+    failure_error: Option<String>,
 }
 
 fn build_tool_call_event(tool_call: &ToolCallRequest, tool_call_id: &str) -> AgentLoopEvent {
@@ -1198,15 +1270,40 @@ fn build_tool_result_event(
     }
 }
 
-fn finalize_completed_turn(
+fn finalize_completed_turn(turn: ThreadFinalizedTurn) -> CompletedAgentTurn {
+    CompletedAgentTurn { turn }
+}
+
+async fn commit_message<H>(
     event_tx: &AgentEventSender,
-    turn: ThreadFinalizedTurn,
-) -> CompletedAgentTurn {
-    let dispatch_batch = event_tx.prepare_dispatch_batch(&turn.events);
-    CompletedAgentTurn {
-        turn,
-        dispatch_batch,
+    thread_context: &mut Thread,
+    reply_to_source: &mut bool,
+    message: ChatMessage,
+    turn_events: Vec<AgentLoopEvent>,
+    on_committed_message: &mut H,
+) -> Result<()>
+where
+    H: AgentCommittedMessageHandler,
+{
+    thread_context.append_message(message.clone())?;
+    for event in &turn_events {
+        thread_context.buffer_turn_event(event.clone())?;
     }
+    let dispatch_events = turn_events
+        .into_iter()
+        .map(|event| {
+            let dispatch = event_tx.prepare_dispatch_event(event, *reply_to_source);
+            *reply_to_source = false;
+            dispatch
+        })
+        .collect::<Vec<_>>();
+    let turn_id = thread_context
+        .current_turn_id()
+        .context("thread did not expose one active turn id for committed message")?;
+    on_committed_message
+        .on_committed_message(turn_id, thread_context, message, dispatch_events)
+        .await?;
+    Ok(())
 }
 
 async fn build_loop_output_metadata(
@@ -1232,19 +1329,12 @@ async fn build_loop_output_metadata(
     })
 }
 
-fn build_assistant_tool_call_message(
-    assistant_message: Option<&ChatMessage>,
-    tool_calls: &[crate::llm::LLMToolCall],
+fn build_tool_call_message(
+    tool_call: &crate::llm::LLMToolCall,
+    created_at: chrono::DateTime<Utc>,
 ) -> ChatMessage {
-    let created_at = assistant_message
-        .map(|message| message.created_at)
-        .unwrap_or_else(Utc::now);
-    let content = assistant_message
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
-
-    ChatMessage::new(ChatMessageRole::Assistant, content, created_at)
-        .with_tool_calls(tool_calls.to_vec())
+    ChatMessage::new(ChatMessageRole::Toolcall, "", created_at)
+        .with_tool_calls(vec![tool_call.clone()])
 }
 
 fn format_tool_result_content(content: &str, is_error: bool) -> String {

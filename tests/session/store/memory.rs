@@ -1,3 +1,4 @@
+use super::support::ThreadTestExt;
 use super::{build_compacted_thread_context, build_incoming, build_locator};
 use chrono::Utc;
 use openjarvis::session::{
@@ -46,9 +47,12 @@ async fn memory_store_roundtrips_thread_snapshot_and_dedup_record() {
         .expect("dedup record should load")
         .expect("dedup record should exist");
 
-    assert_eq!(loaded.load_messages().len(), 2);
-    assert_eq!(loaded.load_messages()[0].content, "这是压缩后的上下文");
-    assert_eq!(loaded.load_messages()[1].content, "继续");
+    assert_eq!(loaded.non_system_messages().len(), 2);
+    assert_eq!(
+        loaded.non_system_messages()[0].content,
+        "这是压缩后的上下文"
+    );
+    assert_eq!(loaded.non_system_messages()[1].content, "继续");
     assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
     assert!(loaded.auto_compact_enabled(false));
     assert_eq!(loaded_dedup.turn_id, Some(turn_id));

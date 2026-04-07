@@ -1,3 +1,4 @@
+use super::support::ThreadTestExt;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -20,6 +21,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn worker_spawn_emits_thread_sync_then_finalized_turn() {
+    let sessions = SessionManager::new();
     let worker = AgentWorker::builder()
         .llm(Arc::new(MockLLMProvider::new("mock-reply")))
         .system_prompt("system prompt")
@@ -27,7 +29,7 @@ async fn worker_spawn_emits_thread_sync_then_finalized_turn() {
         .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
-    let locator = SessionManager::new()
+    let locator = sessions
         .load_or_create_thread(&incoming)
         .await
         .expect("thread should resolve");
@@ -37,47 +39,51 @@ async fn worker_spawn_emits_thread_sync_then_finalized_turn() {
         .send(AgentRequest {
             locator: locator.clone(),
             incoming: incoming.clone(),
-            thread_context: Thread::new(ThreadContextLocator::from(&locator), incoming.received_at),
+            sessions: sessions.clone(),
         })
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 3).await;
+    let events = collect_events(handle.event_rx, 4).await;
 
     match &events[0] {
-        AgentWorkerEvent::ThreadContextSynced(update) => {
-            assert_eq!(update.locator.thread_id, locator.thread_id);
-            assert_eq!(
-                update.thread_context.system_prefix_messages()[0].content,
-                "system prompt"
-            );
+        AgentWorkerEvent::MessageCommitted(message) => {
+            assert_eq!(message.message.content, "hello");
+            assert!(message.dispatch_events.is_empty());
         }
         other => panic!("unexpected first event: {other:?}"),
     }
 
     match &events[1] {
+        AgentWorkerEvent::MessageCommitted(message) => {
+            assert_eq!(message.message.content, "mock-reply");
+            assert_eq!(message.dispatch_events.len(), 1);
+            assert_eq!(message.dispatch_events[0].content, "mock-reply");
+        }
+        other => panic!("unexpected second event: {other:?}"),
+    }
+
+    match &events[2] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert_eq!(turn.locator.thread_id, locator.thread_id);
-            assert_eq!(turn.dispatch_batch.len(), 1);
-            assert_eq!(turn.dispatch_batch[0].content, "mock-reply");
             assert_eq!(
                 turn.turn
                     .snapshot
-                    .load_messages()
+                    .non_system_messages()
                     .iter()
                     .map(|message| message.content.clone())
                     .collect::<Vec<_>>(),
                 vec!["hello".to_string(), "mock-reply".to_string()]
             );
         }
-        other => panic!("unexpected second event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
 
-    match &events[2] {
+    match &events[3] {
         AgentWorkerEvent::RequestCompleted(completed) => {
             assert_eq!(completed.locator.thread_id, locator.thread_id);
         }
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected fourth event: {other:?}"),
     }
 }
 
@@ -137,6 +143,7 @@ impl LLMProvider for FailingProvider {
 
 #[tokio::test]
 async fn worker_builds_request_from_thread_messages_plus_current_user_turn() {
+    let sessions = SessionManager::new();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let worker = AgentWorker::builder()
         .llm(Arc::new(RecordingProvider {
@@ -147,44 +154,59 @@ async fn worker_builds_request_from_thread_messages_plus_current_user_turn() {
         .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("what happened");
-    let locator = SessionManager::new()
+    let locator = sessions
         .load_or_create_thread(&incoming)
         .await
         .expect("thread should resolve");
-    let mut thread_context = thread_with_history(
-        locator.thread_id,
-        &[ChatMessage::new(
+    let now = Utc::now();
+    let mut thread_context = Thread::new(ThreadContextLocator::from(&locator), now);
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
+    thread_context.commit_test_turn(
+        None,
+        vec![ChatMessage::new(
             ChatMessageRole::Assistant,
             "previous reply",
-            Utc::now(),
+            now,
         )],
+        now,
+        now,
     );
-    thread_context.rebind_locator(ThreadContextLocator::from(&locator));
-    let _ = thread_context.ensure_system_prompt_snapshot("system prompt", Utc::now());
+    sessions
+        .store_thread_context(&locator, thread_context, incoming.received_at)
+        .await
+        .expect("seed thread context should store");
 
     handle
         .request_tx
         .send(AgentRequest {
-            thread_context,
             locator,
             incoming,
+            sessions: sessions.clone(),
         })
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 2).await;
-    match &events[0] {
+    let events = collect_events(handle.event_rx, 4).await;
+    match &events[2] {
         AgentWorkerEvent::TurnFinalized(_) => {}
-        other => panic!("unexpected first event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
-    match &events[1] {
+    match &events[3] {
         AgentWorkerEvent::RequestCompleted(_) => {}
-        other => panic!("unexpected second event: {other:?}"),
+        other => panic!("unexpected fourth event: {other:?}"),
     }
     let captured_requests = requests.lock().await;
     let messages = &captured_requests[0].messages;
 
-    assert_eq!(messages[0].content, "system prompt");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content == "system prompt")
+    );
     assert!(
         messages
             .iter()
@@ -256,6 +278,7 @@ llm:
 
 #[tokio::test]
 async fn worker_failed_turn_is_finalized_inside_thread_boundary() {
+    let sessions = SessionManager::new();
     let worker = AgentWorker::builder()
         .llm(Arc::new(FailingProvider))
         .system_prompt("system prompt")
@@ -263,7 +286,7 @@ async fn worker_failed_turn_is_finalized_inside_thread_boundary() {
         .expect("worker should build");
     let handle = worker.spawn();
     let incoming = build_incoming("hello");
-    let locator = SessionManager::new()
+    let locator = sessions
         .load_or_create_thread(&incoming)
         .await
         .expect("thread should resolve");
@@ -273,40 +296,41 @@ async fn worker_failed_turn_is_finalized_inside_thread_boundary() {
         .send(AgentRequest {
             locator: locator.clone(),
             incoming,
-            thread_context: Thread::new(ThreadContextLocator::from(&locator), Utc::now()),
+            sessions: sessions.clone(),
         })
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 3).await;
+    let events = collect_events(handle.event_rx, 4).await;
 
-    match &events[1] {
+    match &events[2] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert!(matches!(
                 turn.turn.status,
                 ThreadFinalizedTurnStatus::Failed { .. }
             ));
-            assert!(turn.turn.snapshot.load_messages().is_empty());
-            assert_eq!(turn.dispatch_batch.len(), 1);
+            assert_eq!(turn.turn.snapshot.non_system_messages().len(), 2);
+            assert_eq!(turn.turn.snapshot.non_system_messages()[0].content, "hello");
             assert!(
-                turn.dispatch_batch[0]
+                turn.turn.snapshot.non_system_messages()[1]
                     .content
                     .contains("provider said 429: rate limit exceeded")
             );
         }
-        other => panic!("unexpected second event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
 
-    match &events[2] {
+    match &events[3] {
         AgentWorkerEvent::RequestCompleted(completed) => {
             assert_eq!(completed.locator.thread_id, locator.thread_id);
         }
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected fourth event: {other:?}"),
     }
 }
 
 #[tokio::test]
 async fn worker_preserves_existing_thread_system_prompt_snapshot() {
+    let sessions = SessionManager::new();
     // 测试场景: 旧线程首次补齐 system prompt snapshot 后，后续轮次即使 worker 配置变化，也必须继续使用原快照。
     let first_requests = Arc::new(Mutex::new(Vec::new()));
     let first_worker = AgentWorker::builder()
@@ -318,7 +342,7 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
         .expect("first worker should build");
     let first_handle = first_worker.spawn();
     let first_incoming = build_incoming("hello");
-    let locator = SessionManager::new()
+    let locator = sessions
         .load_or_create_thread(&first_incoming)
         .await
         .expect("thread should resolve");
@@ -328,28 +352,24 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
         .send(AgentRequest {
             locator: locator.clone(),
             incoming: first_incoming.clone(),
-            thread_context: Thread::new(
-                ThreadContextLocator::from(&locator),
-                first_incoming.received_at,
-            ),
+            sessions: sessions.clone(),
         })
         .await
         .expect("first request should be accepted");
 
-    let first_events = collect_events(first_handle.event_rx, 3).await;
-    let preserved_thread_context = match &first_events[1] {
+    let first_events = collect_events(first_handle.event_rx, 4).await;
+    match &first_events[2] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert_eq!(
-                turn.turn.snapshot.system_prefix_messages()[0].content,
+                turn.turn.snapshot.system_messages()[0].content,
                 "system prompt A"
             );
-            turn.turn.snapshot.clone()
         }
         other => panic!("unexpected first worker completion event: {other:?}"),
     };
-    match &first_events[2] {
+    match &first_events[3] {
         AgentWorkerEvent::RequestCompleted(_) => {}
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected fourth event: {other:?}"),
     }
     let first_captured_requests = first_requests.lock().await;
     assert_eq!(
@@ -374,24 +394,24 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
         .send(AgentRequest {
             locator,
             incoming: second_incoming.clone(),
-            thread_context: preserved_thread_context.clone(),
+            sessions: sessions.clone(),
         })
         .await
         .expect("second request should be accepted");
 
-    let second_events = collect_events(second_handle.event_rx, 2).await;
-    match &second_events[0] {
+    let second_events = collect_events(second_handle.event_rx, 4).await;
+    match &second_events[2] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert_eq!(
-                turn.turn.snapshot.system_prefix_messages()[0].content,
+                turn.turn.snapshot.system_messages()[0].content,
                 "system prompt A"
             );
         }
-        other => panic!("unexpected second worker completion event: {other:?}"),
+        other => panic!("unexpected third worker completion event: {other:?}"),
     }
-    match &second_events[1] {
+    match &second_events[3] {
         AgentWorkerEvent::RequestCompleted(_) => {}
-        other => panic!("unexpected second event: {other:?}"),
+        other => panic!("unexpected fourth event: {other:?}"),
     }
 
     let second_captured_requests = second_requests.lock().await;
@@ -444,16 +464,4 @@ fn build_incoming(content: &str) -> IncomingMessage {
             receive_id_type: "chat_id".to_string(),
         },
     }
-}
-
-fn thread_with_history(thread_id: uuid::Uuid, history: &[ChatMessage]) -> Thread {
-    let now = Utc::now();
-    let mut thread = Thread::new(
-        ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
-        now,
-    );
-    if !history.is_empty() {
-        thread.store_turn(None, history.to_vec(), now, now);
-    }
-    thread
 }

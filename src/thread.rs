@@ -139,8 +139,6 @@ struct ThreadCurrentTurn {
     turn_id: Uuid,
     external_message_id: Option<String>,
     started_at: DateTime<Utc>,
-    working_messages: Vec<ChatMessage>,
-    history_override: Option<Vec<ChatMessage>>,
     buffered_events: Vec<ThreadTurnEvent>,
     tool_events: Vec<ThreadToolEvent>,
 }
@@ -151,8 +149,6 @@ impl ThreadCurrentTurn {
             turn_id: Uuid::new_v4(),
             external_message_id,
             started_at,
-            working_messages: Vec::new(),
-            history_override: None,
             buffered_events: Vec::new(),
             tool_events: Vec::new(),
         }
@@ -320,23 +316,6 @@ impl ThreadContext {
     pub fn messages(&self) -> Vec<ChatMessage> {
         self.messages.clone()
     }
-
-    /// Export only the persisted non-system chat history currently owned by the thread.
-    pub fn load_messages(&self) -> Vec<ChatMessage> {
-        self.messages[self.system_prefix_len()..].to_vec()
-    }
-
-    /// Return the persisted leading system messages for the thread.
-    pub fn system_prefix_messages(&self) -> &[ChatMessage] {
-        &self.messages[..self.system_prefix_len()]
-    }
-
-    fn system_prefix_len(&self) -> usize {
-        self.messages
-            .iter()
-            .take_while(|message| message.role == ChatMessageRole::System)
-            .count()
-    }
 }
 
 /// Unified persisted thread aggregate shared by session, command, and agent execution.
@@ -398,17 +377,7 @@ impl Thread {
         self.revision = revision;
     }
 
-    /// Load the flattened persisted non-system chat history for the thread.
-    pub fn load_messages(&self) -> Vec<ChatMessage> {
-        self.thread.load_messages()
-    }
-
-    /// Export the current request-visible messages owned by the thread.
-    ///
-    /// 当 turn 已经开始时，返回值会按顺序包含：
-    /// 1. 稳定 system prefix
-    /// 2. 已 finalized 的 non-system history，或 turn 内 compact 生成的 active history override
-    /// 3. 当前 turn 的 working messages
+    /// Export the thread-owned formal message sequence.
     ///
     /// # 示例
     /// ```rust
@@ -423,51 +392,33 @@ impl Thread {
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     now,
     /// );
-    /// let _ = thread.ensure_system_prompt_snapshot("system", now);
     /// thread
     ///     .begin_turn(Some("msg_1".to_string()), now)
     ///     .expect("turn should start");
     /// thread
-    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .expect("user message should buffer");
+    ///     .append_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should append");
     ///
-    /// assert_eq!(thread.messages()[0].role, ChatMessageRole::System);
-    /// assert_eq!(thread.messages().last().unwrap().content, "hello");
+    /// assert_eq!(thread.messages()[0].role, ChatMessageRole::User);
+    /// assert_eq!(thread.messages()[0].content, "hello");
     /// ```
     pub fn messages(&self) -> Vec<ChatMessage> {
-        let mut messages = self.system_prefix_messages().to_vec();
-        messages.extend(
-            self.current_turn
-                .as_ref()
-                .and_then(|turn| turn.history_override.clone())
-                .unwrap_or_else(|| self.thread.load_messages()),
-        );
-        if let Some(current_turn) = &self.current_turn {
-            messages.extend(current_turn.working_messages.clone());
-        }
-        messages
+        self.thread.messages()
     }
 
-    /// Replace all persisted non-system messages while preserving the leading system prefix.
-    pub(crate) fn replace_non_system_messages(
+    /// Replace the current persisted message sequence.
+    pub(crate) fn replace_messages(
         &mut self,
         replacement: Vec<ChatMessage>,
         updated_at: DateTime<Utc>,
     ) {
-        let mut messages = self.system_prefix_messages().to_vec();
-        messages.extend(replacement);
-        self.thread.messages = messages;
+        self.thread.messages = replacement;
         self.thread.updated_at = updated_at;
     }
 
     /// Return the persisted loaded toolsets for the thread.
     pub fn load_toolsets(&self) -> Vec<String> {
         self.state.tools.loaded_toolsets.clone()
-    }
-
-    /// Return the persisted thread-scoped system prompt snapshot.
-    pub fn system_prefix_messages(&self) -> &[ChatMessage] {
-        self.thread.system_prefix_messages()
     }
 
     /// Return the persisted structured tool event history.
@@ -493,36 +444,12 @@ impl Thread {
         self.pending_tool_events.push(event);
     }
 
-    /// Return the current turn working messages that can become finalized history.
-    pub fn current_turn_working_messages(&self) -> Vec<ChatMessage> {
-        self.current_turn
-            .as_ref()
-            .map(|turn| turn.working_messages.clone())
-            .unwrap_or_default()
-    }
-
     /// Return the current buffered turn events.
     pub fn current_turn_events(&self) -> Vec<ThreadTurnEvent> {
         self.current_turn
             .as_ref()
             .map(|turn| turn.buffered_events.clone())
             .unwrap_or_default()
-    }
-
-    /// Return the active non-system message view owned by the thread.
-    ///
-    /// 这个视图会被 compact 使用。它包含已 finalized 的 non-system history 与当前 turn 中
-    /// 已经物化的 working messages。
-    pub fn active_non_system_messages(&self) -> Vec<ChatMessage> {
-        let mut messages = self
-            .current_turn
-            .as_ref()
-            .and_then(|turn| turn.history_override.clone())
-            .unwrap_or_else(|| self.thread.load_messages());
-        if let Some(current_turn) = &self.current_turn {
-            messages.extend(current_turn.working_messages.clone());
-        }
-        messages
     }
 
     /// Start one thread-owned turn from the incoming external message id and user message.
@@ -540,13 +467,12 @@ impl Thread {
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     now,
     /// );
-    /// let _ = thread.ensure_system_prompt_snapshot("system", now);
     /// let turn_id = thread
     ///     .begin_turn(Some("msg_1".to_string()), now)
     ///     .expect("turn should start");
     /// thread
-    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .expect("user message should be buffered");
+    ///     .append_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should append");
     ///
     /// assert_eq!(thread.pending_tool_events().len(), 0);
     /// assert_ne!(turn_id, uuid::Uuid::nil());
@@ -559,10 +485,51 @@ impl Thread {
         Ok(self.open_turn(external_message_id, started_at)?.turn_id)
     }
 
-    /// Append one request-visible message into the current turn working set.
-    pub fn push_turn_message(&mut self, message: ChatMessage) -> Result<()> {
-        let current_turn = self.current_turn_mut()?;
-        current_turn.working_messages.push(message);
+    /// Return the active thread-owned turn id.
+    pub fn current_turn_id(&self) -> Option<Uuid> {
+        self.current_turn.as_ref().map(|turn| turn.turn_id)
+    }
+
+    /// Append one formal message directly into the thread-owned message sequence.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// thread
+    ///     .begin_turn(Some("msg_1".to_string()), now)
+    ///     .expect("turn should start");
+    /// thread
+    ///     .append_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should append");
+    ///
+    /// assert_eq!(thread.messages()[0].content, "hello");
+    /// ```
+    pub fn append_message(&mut self, message: ChatMessage) -> Result<()> {
+        let turn_id = self.current_turn_mut()?.turn_id;
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            turn_id = %turn_id,
+            role = message.role.as_label(),
+            tool_call_count = message.tool_calls.len(),
+            has_tool_call_id = message.tool_call_id.is_some(),
+            "appended formal thread message"
+        );
+        if self.thread.created_at > message.created_at {
+            self.thread.created_at = message.created_at;
+        }
+        self.thread.updated_at = message.created_at;
+        self.thread.messages.push(message);
         Ok(())
     }
 
@@ -573,14 +540,64 @@ impl Thread {
         Ok(())
     }
 
-    /// Replace the active non-system view with compacted messages for the current turn.
+    /// Replace the persisted non-system history after one compact rewrite.
     ///
-    /// Compact 会直接改写 thread-owned active view；原本已 finalized 的 non-system history
-    /// 与当前 turn working set 会一起收敛到新的 active history override。
-    pub fn apply_turn_compaction(&mut self, compacted_messages: Vec<ChatMessage>) -> Result<()> {
-        let current_turn = self.current_turn_mut()?;
-        current_turn.history_override = Some(compacted_messages);
-        current_turn.working_messages.clear();
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// thread.begin_turn(Some("msg_1".to_string()), now).expect("turn should start");
+    /// thread
+    ///     .append_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("message should append");
+    /// thread
+    ///     .replace_messages_after_compaction(vec![
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
+    ///         ChatMessage::new(ChatMessageRole::User, "继续", now),
+    ///     ])
+    ///     .expect("compaction should rewrite history");
+    ///
+    /// assert_eq!(thread.messages()[0].content, "这是压缩后的上下文");
+    /// ```
+    pub fn replace_messages_after_compaction(
+        &mut self,
+        compacted_messages: Vec<ChatMessage>,
+    ) -> Result<()> {
+        let turn_id = self.current_turn_mut()?.turn_id;
+        let mut persisted_messages = self
+            .thread
+            .messages
+            .iter()
+            .filter(|message| message.role == ChatMessageRole::System)
+            .cloned()
+            .collect::<Vec<_>>();
+        let updated_at = compacted_messages
+            .last()
+            .map(|message| message.created_at)
+            .unwrap_or_else(Utc::now);
+        persisted_messages.extend(compacted_messages);
+        self.replace_messages(persisted_messages, updated_at);
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            turn_id = %turn_id,
+            compacted_message_count = self
+                .thread
+                .messages
+                .iter()
+                .filter(|message| message.role != ChatMessageRole::System)
+                .count(),
+            "rewrote thread non-system history after compaction"
+        );
         Ok(())
     }
 
@@ -600,16 +617,15 @@ impl Thread {
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     now,
     /// );
-    /// let _ = thread.ensure_system_prompt_snapshot("system", now);
     /// thread
     ///     .begin_turn(Some("msg_1".to_string()), now)
     ///     .expect("turn should start");
     /// thread
-    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .expect("user message should be buffered");
+    ///     .append_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("user message should append");
     /// thread
-    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::Assistant, "world", now))
-    ///     .expect("assistant reply should be buffered");
+    ///     .append_message(ChatMessage::new(ChatMessageRole::Assistant, "world", now))
+    ///     .expect("assistant reply should append");
     /// thread
     ///     .buffer_turn_event(ThreadTurnEvent {
     ///         kind: ThreadTurnEventKind::TextOutput,
@@ -623,7 +639,7 @@ impl Thread {
     ///     .expect("turn should finalize");
     ///
     /// assert!(matches!(finalized.status, ThreadFinalizedTurnStatus::Succeeded));
-    /// assert_eq!(finalized.snapshot.load_messages().len(), 2);
+    /// assert_eq!(finalized.snapshot.messages().len(), 2);
     /// ```
     pub fn finalize_turn_success(
         &mut self,
@@ -639,8 +655,8 @@ impl Thread {
 
     /// Finalize the current turn as one failed thread snapshot and matching event batch.
     ///
-    /// 异常失败会丢弃当前 turn 内尚未持久化的 working messages、tool events 和 buffered
-    /// events；最终 snapshot 会回退到本轮开始前的线程状态，只保留对外错误事件。
+    /// 异常失败不会回滚已经 append 的正式消息；若当前 turn 还没有任何 turn 事件，
+    /// 会补一条 failure event 作为审计输出。
     ///
     /// # 示例
     /// ```rust
@@ -655,18 +671,19 @@ impl Thread {
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
     ///     now,
     /// );
-    /// thread.store_turn(
-    ///     Some("msg_0".to_string()),
-    ///     vec![ChatMessage::new(ChatMessageRole::Assistant, "persisted", now)],
-    ///     now,
-    ///     now,
-    /// );
+    /// thread.begin_turn(Some("msg_0".to_string()), now).expect("turn should start");
+    /// thread
+    ///     .append_message(ChatMessage::new(ChatMessageRole::Assistant, "persisted", now))
+    ///     .expect("persisted message should append");
+    /// thread
+    ///     .finalize_turn_success("persisted", now)
+    ///     .expect("seed turn should finalize");
     /// thread
     ///     .begin_turn(Some("msg_1".to_string()), now)
     ///     .expect("turn should start");
     /// thread
-    ///     .push_turn_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .expect("user message should be buffered");
+    ///     .append_message(ChatMessage::new(ChatMessageRole::Assistant, "partial reply", now))
+    ///     .expect("partial reply should append");
     ///
     /// let finalized = thread
     ///     .finalize_turn_failure("network error", now)
@@ -676,8 +693,8 @@ impl Thread {
     ///     finalized.status,
     ///     ThreadFinalizedTurnStatus::Failed { .. }
     /// ));
-    /// assert_eq!(finalized.snapshot.load_messages().len(), 1);
-    /// assert_eq!(finalized.snapshot.load_messages()[0].content, "persisted");
+    /// assert_eq!(finalized.snapshot.messages().len(), 2);
+    /// assert_eq!(finalized.snapshot.messages()[1].content, "partial reply");
     /// ```
     pub fn finalize_turn_failure(
         &mut self,
@@ -696,13 +713,35 @@ impl Thread {
             thread_id = %self.locator.thread_id,
             external_thread_id = %self.locator.external_thread_id,
             turn_id = %current_turn.turn_id,
-            dropped_working_count = current_turn.working_messages.len(),
             dropped_event_count = current_turn.buffered_events.len(),
             dropped_tool_event_count = current_turn.tool_events.len(),
             error = %error,
-            "thread-owned turn failed; dropping in-flight turn contents"
+            message_count = self.messages().len(),
+            "thread-owned turn failed without rolling back committed messages"
         );
 
+        self.thread.updated_at = completed_at;
+        if self.thread.created_at > current_turn.started_at {
+            self.thread.created_at = current_turn.started_at;
+        }
+        self.state.tools.tool_events.extend(
+            current_turn
+                .tool_events
+                .into_iter()
+                .map(|event| event.with_turn_id(current_turn.turn_id)),
+        );
+        let mut events = current_turn.buffered_events;
+        if events.is_empty() {
+            events.push(ThreadTurnEvent {
+                kind: ThreadTurnEventKind::TextOutput,
+                content: failure_reply.clone(),
+                metadata: json!({
+                    "source": "turn_failure",
+                    "is_final": true,
+                    "is_error": true,
+                }),
+            });
+        }
         Ok(ThreadFinalizedTurn {
             turn_id: current_turn.turn_id,
             external_message_id: current_turn.external_message_id,
@@ -710,62 +749,9 @@ impl Thread {
             completed_at,
             reply: failure_reply.clone(),
             status: ThreadFinalizedTurnStatus::Failed { error },
-            events: vec![ThreadTurnEvent {
-                kind: ThreadTurnEventKind::TextOutput,
-                content: failure_reply,
-                metadata: json!({
-                    "source": "turn_failure",
-                    "is_final": true,
-                    "is_error": true,
-                }),
-            }],
+            events,
             snapshot: self.clone(),
         })
-    }
-
-    /// Initialize the thread-scoped system prompt snapshot on first use.
-    pub fn ensure_system_prompt_snapshot(
-        &mut self,
-        system_prompt: impl AsRef<str>,
-        created_at: DateTime<Utc>,
-    ) -> bool {
-        let system_prompt = system_prompt.as_ref().trim();
-        if system_prompt.is_empty() || !self.thread.system_prefix_messages().is_empty() {
-            return false;
-        }
-
-        self.initialize_system_messages(
-            vec![ChatMessage::new(
-                ChatMessageRole::System,
-                system_prompt,
-                created_at,
-            )],
-            "system_prompt",
-        )
-    }
-
-    /// Initialize persisted system messages from one prebuilt snapshot when missing.
-    pub fn ensure_system_prefix_messages(&mut self, system_messages: &[ChatMessage]) -> bool {
-        if !self.thread.system_prefix_messages().is_empty() {
-            return false;
-        }
-
-        let normalized_messages = system_messages
-            .iter()
-            .filter(|message| !message.content.trim().is_empty())
-            .map(|message| {
-                ChatMessage::new(
-                    ChatMessageRole::System,
-                    message.content.clone(),
-                    message.created_at,
-                )
-            })
-            .collect::<Vec<_>>();
-        if normalized_messages.is_empty() {
-            return false;
-        }
-
-        self.initialize_system_messages(normalized_messages, "thread_init")
     }
 
     /// Replace the thread's loaded toolset state with a normalized snapshot.
@@ -805,71 +791,6 @@ impl Thread {
             .loaded_toolsets
             .retain(|candidate| candidate != toolset_name);
         original_len != self.state.tools.loaded_toolsets.len()
-    }
-
-    /// Store one completed turn through the thread-owned turn finalization path.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// let turn_id = thread.store_turn(
-    ///     Some("msg_1".to_string()),
-    ///     vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
-    ///     now,
-    ///     now,
-    /// );
-    ///
-    /// assert_eq!(thread.load_messages().len(), 1);
-    /// assert_ne!(turn_id, uuid::Uuid::nil());
-    /// ```
-    pub fn store_turn(
-        &mut self,
-        external_message_id: Option<String>,
-        messages: Vec<ChatMessage>,
-        started_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-    ) -> Uuid {
-        let reply = messages
-            .iter()
-            .rev()
-            .find(|message| message.role == ChatMessageRole::Assistant)
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
-        self.open_turn(external_message_id, started_at)
-            .expect("store_turn should open one compatibility turn");
-        let current_turn = self
-            .current_turn
-            .as_mut()
-            .expect("compatibility turn should exist");
-        current_turn.working_messages = messages;
-        self.finalize_turn_success(reply, completed_at)
-            .expect("store_turn should finalize one compatibility turn")
-            .turn_id
-    }
-
-    /// Store one completed turn together with explicit runtime tool state compatibility payloads.
-    pub fn store_turn_state(
-        &mut self,
-        external_message_id: Option<String>,
-        messages: Vec<ChatMessage>,
-        started_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-        loaded_toolsets: Vec<String>,
-        tool_events: Vec<ThreadToolEvent>,
-    ) -> Uuid {
-        self.replace_loaded_toolsets(loaded_toolsets);
-        self.pending_tool_events.extend(tool_events);
-        self.store_turn(external_message_id, messages, started_at, completed_at)
     }
 
     fn open_turn(
@@ -923,11 +844,7 @@ impl Thread {
             );
         };
 
-        let mut finalized_non_system_messages = current_turn
-            .history_override
-            .unwrap_or_else(|| self.thread.load_messages());
-        finalized_non_system_messages.extend(current_turn.working_messages);
-        self.replace_non_system_messages(finalized_non_system_messages, completed_at);
+        self.thread.updated_at = completed_at;
         if self.thread.created_at > current_turn.started_at {
             self.thread.created_at = current_turn.started_at;
         }
@@ -1001,26 +918,6 @@ impl Thread {
     /// Disable thread-scoped auto-compact and fall back to the static auto-compact default.
     pub fn disable_auto_compact(&mut self) {
         self.set_auto_compact_override(Some(false));
-    }
-
-    fn initialize_system_messages(
-        &mut self,
-        system_messages: Vec<ChatMessage>,
-        source: &str,
-    ) -> bool {
-        if system_messages.is_empty() || !self.thread.system_prefix_messages().is_empty() {
-            return false;
-        }
-
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            source,
-            system_message_count = system_messages.len(),
-            "initialized persisted thread system messages"
-        );
-        self.thread.messages.splice(0..0, system_messages);
-        true
     }
 }
 

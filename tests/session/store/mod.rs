@@ -1,3 +1,6 @@
+#[path = "../../support/mod.rs"]
+pub mod support;
+
 use chrono::{DateTime, Utc};
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
@@ -11,6 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use support::ThreadTestExt;
 use uuid::Uuid;
 
 mod memory;
@@ -45,7 +49,7 @@ fn build_locator(session_id: Uuid, incoming: &IncomingMessage) -> ThreadLocator 
 fn build_compacted_thread_context(locator: &ThreadLocator, now: DateTime<Utc>) -> (Thread, Uuid) {
     let mut thread_context = Thread::new(ThreadContextLocator::from(locator), now);
     thread_context.enable_auto_compact();
-    let turn_id = thread_context.store_turn_state(
+    let turn_id = thread_context.commit_test_turn_with_state(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),

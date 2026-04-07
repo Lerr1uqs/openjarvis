@@ -39,9 +39,15 @@ pub struct FeaturePromptRebuilder {
 
 impl FeaturePromptRebuilder {
     /// Create the fixed provider set used by the agent loop.
-    pub fn new(tool_registry: Arc<ToolRegistry>, compact_config: AgentCompactConfig) -> Self {
+    pub fn new(
+        tool_registry: Arc<ToolRegistry>,
+        compact_config: AgentCompactConfig,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        let system_prompt = system_prompt.into();
         Self {
             providers: vec![
+                Box::new(StaticSystemPromptFeaturePromptProvider::new(system_prompt)),
                 Box::new(ToolsetCatalogFeaturePromptProvider::new(Arc::clone(
                     &tool_registry,
                 ))),
@@ -82,17 +88,38 @@ impl FeaturePromptRebuilder {
         );
         Ok(messages)
     }
+}
 
-    /// Initialize the thread's stable feature messages when the thread has not been initialized yet.
-    pub async fn initialize_thread(
-        &self,
-        thread_context: &mut Thread,
-        auto_compact_enabled: bool,
-    ) -> Result<bool> {
-        let messages = self
-            .build_messages(thread_context, auto_compact_enabled)
-            .await?;
-        Ok(thread_context.ensure_system_prefix_messages(&messages))
+/// Static system prompt provider that emits the configured worker prompt during thread init.
+pub struct StaticSystemPromptFeaturePromptProvider {
+    system_prompt: String,
+}
+
+impl StaticSystemPromptFeaturePromptProvider {
+    pub fn new(system_prompt: impl Into<String>) -> Self {
+        Self {
+            system_prompt: system_prompt.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl FeaturePromptProvider for StaticSystemPromptFeaturePromptProvider {
+    fn name(&self) -> &'static str {
+        "worker_system_prompt"
+    }
+
+    async fn build(&self, context: &FeaturePromptBuildContext<'_>) -> Result<Vec<ChatMessage>> {
+        let system_prompt = self.system_prompt.trim();
+        if system_prompt.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![ChatMessage::new(
+            ChatMessageRole::System,
+            system_prompt,
+            context.created_at,
+        )])
     }
 }
 

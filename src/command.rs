@@ -220,6 +220,11 @@ impl CommandInvocation {
 /// Async command handler abstraction used by the router-facing command registry.
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
+    /// Return whether this command may only run after the active agent turn finishes.
+    fn requires_idle_thread(&self) -> bool {
+        false
+    }
+
     /// Execute one parsed command invocation and return a formatted reply payload.
     async fn execute(
         &self,
@@ -335,6 +340,28 @@ impl CommandRegistry {
     pub fn is_command(&self, incoming: &IncomingMessage) -> Result<bool> {
         let normalized_content = remove_prefix_at_if_exist(incoming);
         Ok(CommandInvocation::parse(&normalized_content)?.is_some())
+    }
+
+    /// Return the command reply that should be sent when the target thread is still running.
+    pub fn running_thread_reply(&self, incoming: &IncomingMessage) -> Result<Option<CommandReply>> {
+        let normalized_content = remove_prefix_at_if_exist(incoming);
+        let Some(invocation) = CommandInvocation::parse(&normalized_content)? else {
+            return Ok(None);
+        };
+        let Some(handler) = self.handlers.get(invocation.name()) else {
+            return Ok(None);
+        };
+        if !handler.requires_idle_thread() {
+            return Ok(None);
+        }
+
+        Ok(Some(CommandReply::failed(
+            invocation.name(),
+            format!(
+                "current thread is running; /{} is unavailable until the active agent turn completes",
+                invocation.name()
+            ),
+        )))
     }
 
     /// Try to execute one incoming message as a slash command with the resolved target thread context.
@@ -542,6 +569,10 @@ impl ClearCommand {
 
 #[async_trait]
 impl CommandHandler for ClearCommand {
+    fn requires_idle_thread(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         invocation: &CommandInvocation,

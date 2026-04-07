@@ -1,3 +1,4 @@
+use super::support::ThreadTestExt;
 use anyhow::Result;
 use async_trait::async_trait;
 use openjarvis::{
@@ -75,7 +76,11 @@ Read `guide.md` before replying.
         .expect("builtin tools and skills should register");
 
     let compact_config = AppConfig::default().agent_config().compact_config().clone();
-    let rebuilder = FeaturePromptRebuilder::new(Arc::clone(&registry), compact_config.clone());
+    let rebuilder = FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        compact_config.clone(),
+        "worker system prompt",
+    );
     let auto_compactor = AutoCompactor::new(compact_config);
     let now = chrono::Utc::now();
     let mut thread_context = Thread::new(
@@ -97,7 +102,7 @@ Read `guide.md` before replying.
         .build_messages(&thread_context, true)
         .await
         .expect("feature prompts should build");
-    assert!(thread_context.ensure_system_prefix_messages(&built_messages));
+    thread_context.seed_persisted_messages(built_messages);
     assert!(auto_compactor.compact_tool_visible(&budget_report));
     assert!(
         !auto_compactor.runtime_compaction_required(&ContextBudgetReport::new(
@@ -113,25 +118,31 @@ Read `guide.md` before replying.
 
     assert!(
         thread_context
-            .system_prefix_messages()
+            .system_messages()
+            .iter()
+            .any(|message| message.content.contains("worker system prompt"))
+    );
+    assert!(
+        thread_context
+            .system_messages()
             .iter()
             .any(|message| message.content.contains("OpenJarvis tool-use mode"))
     );
     assert!(
         thread_context
-            .system_prefix_messages()
+            .system_messages()
             .iter()
             .any(|message| message.content.contains("Available toolsets"))
     );
     assert!(
         thread_context
-            .system_prefix_messages()
+            .system_messages()
             .iter()
             .any(|message| message.content.contains("Available local skills"))
     );
     assert!(
         thread_context
-            .system_prefix_messages()
+            .system_messages()
             .iter()
             .any(|message| message.content.contains("Auto-compact 已开启"))
     );
@@ -166,6 +177,7 @@ async fn feature_prompt_rebuilder_includes_enabled_acpx_skill_in_thread_system_m
     let rebuilder = FeaturePromptRebuilder::new(
         Arc::clone(&registry),
         AppConfig::default().agent_config().compact_config().clone(),
+        "",
     );
     let now = chrono::Utc::now();
     let mut thread_context = Thread::new(
@@ -173,14 +185,14 @@ async fn feature_prompt_rebuilder_includes_enabled_acpx_skill_in_thread_system_m
         now,
     );
 
-    let inserted = rebuilder
-        .initialize_thread(&mut thread_context, false)
+    let built_messages = rebuilder
+        .build_messages(&thread_context, false)
         .await
-        .expect("feature prompts should initialize");
+        .expect("feature prompts should build");
 
-    assert!(inserted);
-    let skill_message = thread_context
-        .system_prefix_messages()
+    thread_context.seed_persisted_messages(built_messages);
+    let system_messages = thread_context.system_messages();
+    let skill_message = system_messages
         .iter()
         .find(|message| message.content.contains("Available local skills"))
         .expect("skill catalog system message should exist");
@@ -203,6 +215,7 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
     let rebuilder = FeaturePromptRebuilder::new(
         Arc::clone(&registry),
         AppConfig::default().agent_config().compact_config().clone(),
+        "",
     );
     let now = chrono::Utc::now();
     let mut thread_context = Thread::new(
@@ -215,7 +228,7 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
         ),
         now,
     );
-    thread_context.store_turn(
+    thread_context.commit_test_turn(
         None,
         vec![ChatMessage::new(
             ChatMessageRole::User,
@@ -231,9 +244,9 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
         .await
         .expect("feature prompts should build");
 
-    assert_eq!(thread_context.load_messages().len(), 1);
+    assert_eq!(thread_context.non_system_messages().len(), 1);
     assert_eq!(
-        thread_context.load_messages()[0].content,
+        thread_context.non_system_messages()[0].content,
         "persisted history"
     );
     assert!(
@@ -280,7 +293,7 @@ async fn auto_compactor_only_decides_budget_thresholds_without_injecting_message
         256,
     );
 
-    assert!(thread_context.system_prefix_messages().is_empty());
+    assert!(thread_context.system_messages().is_empty());
     assert!(auto_compactor.compact_tool_visible(&budget_report));
     assert!(auto_compactor.runtime_compaction_required(&budget_report));
     assert!(

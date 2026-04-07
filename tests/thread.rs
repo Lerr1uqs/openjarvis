@@ -1,3 +1,6 @@
+#[path = "support/mod.rs"]
+mod support;
+
 use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
@@ -7,6 +10,7 @@ use openjarvis::{
     },
 };
 use serde_json::json;
+use support::ThreadTestExt;
 
 fn build_thread(external_thread_id: &str) -> Thread {
     let thread_id = derive_internal_thread_id(&format!("ou_xxx:feishu:{external_thread_id}"));
@@ -28,17 +32,18 @@ fn store_turn_preserves_tool_call_metadata_in_message_history() {
     let now = Utc::now();
     let mut thread = build_thread("thread_messages");
 
-    thread.store_turn(
+    thread.commit_test_turn(
         Some("msg_1".to_string()),
         vec![
             ChatMessage::new(ChatMessageRole::User, "hello", now),
-            ChatMessage::new(ChatMessageRole::Assistant, "我先读取文件", now).with_tool_calls(
-                vec![ChatToolCall {
+            ChatMessage::new(ChatMessageRole::Assistant, "我先读取文件", now),
+            ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
+                ChatToolCall {
                     id: "call_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "Cargo.toml" }),
-                }],
-            ),
+                },
+            ]),
             ChatMessage::new(ChatMessageRole::ToolResult, "file-content", now)
                 .with_tool_call_id("call_1"),
             ChatMessage::new(ChatMessageRole::Assistant, "读取完成", now),
@@ -47,11 +52,12 @@ fn store_turn_preserves_tool_call_metadata_in_message_history() {
         now,
     );
 
-    let messages = thread.load_messages();
+    let messages = thread.non_system_messages();
 
-    assert_eq!(messages.len(), 4);
-    assert_eq!(messages[1].tool_calls[0].id, "call_1");
-    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[2].role, ChatMessageRole::Toolcall);
+    assert_eq!(messages[2].tool_calls[0].id, "call_1");
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
 }
 
 #[test]
@@ -66,9 +72,13 @@ fn clear_to_initial_state_resets_persisted_and_runtime_state() {
         event
     };
 
-    assert!(thread.ensure_system_prompt_snapshot("system prompt snapshot", now));
+    thread.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt snapshot",
+        now,
+    )]);
     thread.enable_auto_compact();
-    thread.store_turn_state(
+    thread.commit_test_turn_with_state(
         Some("msg_clear".to_string()),
         vec![ChatMessage::new(ChatMessageRole::User, "历史消息", now)],
         now,
@@ -80,11 +90,11 @@ fn clear_to_initial_state_resets_persisted_and_runtime_state() {
 
     thread.clear_to_initial_state(now);
 
-    assert!(thread.load_messages().is_empty());
+    assert!(thread.non_system_messages().is_empty());
     assert!(thread.load_toolsets().is_empty());
     assert!(thread.load_tool_events().is_empty());
     assert!(thread.pending_tool_events().is_empty());
-    assert!(thread.system_prefix_messages().is_empty());
+    assert!(thread.system_messages().is_empty());
     assert!(!thread.auto_compact_enabled(false));
 }
 
@@ -101,7 +111,7 @@ fn store_turn_state_binds_pending_tool_events_to_commit_id() {
     };
     thread.record_tool_event(event);
 
-    let turn_id = thread.store_turn(
+    let turn_id = thread.commit_test_turn(
         Some("msg_runtime".to_string()),
         vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
         now,
@@ -117,11 +127,10 @@ fn store_turn_state_binds_pending_tool_events_to_commit_id() {
 
 #[test]
 fn finalize_turn_failure_drops_inflight_turn_contents() {
-    // 测试场景: turn 内发生异常失败时，本轮 user input / 中间消息 / tool event 都必须丢弃，
-    // 线程快照只能回退到本轮开始前的 persisted state。
+    // 测试场景: turn 内发生异常失败时，已 append 的正式消息不能回滚，tool event 仍需绑定到失败 turn。
     let now = Utc::now();
     let mut thread = build_thread("thread_failed_turn");
-    thread.store_turn(
+    thread.commit_test_turn(
         Some("msg_seed".to_string()),
         vec![ChatMessage::new(
             ChatMessageRole::Assistant,
@@ -135,14 +144,14 @@ fn finalize_turn_failure_drops_inflight_turn_contents() {
         .begin_turn(Some("msg_fail".to_string()), now)
         .expect("failed turn should start");
     thread
-        .push_turn_message(ChatMessage::new(
+        .append_open_turn_message(ChatMessage::new(
             ChatMessageRole::User,
             "current input",
             now,
         ))
         .expect("failed user message should enter current turn");
     thread
-        .push_turn_message(ChatMessage::new(
+        .append_open_turn_message(ChatMessage::new(
             ChatMessageRole::Assistant,
             "partial reply",
             now,
@@ -164,13 +173,17 @@ fn finalize_turn_failure_drops_inflight_turn_contents() {
     assert_eq!(
         finalized
             .snapshot
-            .load_messages()
+            .non_system_messages()
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
-        vec!["persisted history".to_string()]
+        vec![
+            "persisted history".to_string(),
+            "current input".to_string(),
+            "partial reply".to_string(),
+        ]
     );
-    assert_eq!(finalized.snapshot.load_tool_events().len(), 0);
+    assert_eq!(finalized.snapshot.load_tool_events().len(), 1);
     assert_eq!(finalized.events.len(), 1);
     assert!(
         finalized.events[0]
@@ -184,7 +197,7 @@ fn overwrite_active_history_replaces_message_snapshot() {
     // 测试场景: session/router 需要覆盖线程快照时，应直接替换 message 域和状态，而不是依赖 legacy turn 结构。
     let now = Utc::now();
     let mut thread = build_thread("thread_replace");
-    thread.store_turn(
+    thread.commit_test_turn(
         Some("msg_1".to_string()),
         vec![ChatMessage::new(ChatMessageRole::User, "old history", now)],
         now,
@@ -192,7 +205,7 @@ fn overwrite_active_history_replaces_message_snapshot() {
     );
 
     let mut compacted = build_thread("thread_replace");
-    compacted.store_turn(
+    compacted.commit_test_turn(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
@@ -203,30 +216,40 @@ fn overwrite_active_history_replaces_message_snapshot() {
     );
     thread.overwrite_active_history(&compacted);
 
-    assert_eq!(thread.load_messages().len(), 2);
-    assert_eq!(thread.load_messages()[0].content, "这是压缩后的上下文");
-    assert_eq!(thread.load_messages()[1].content, "继续");
+    assert_eq!(thread.non_system_messages().len(), 2);
+    assert_eq!(
+        thread.non_system_messages()[0].content,
+        "这是压缩后的上下文"
+    );
+    assert_eq!(thread.non_system_messages()[1].content, "继续");
 }
 
 #[test]
-fn ensure_system_prefix_messages_only_initializes_once() {
-    // 测试场景: 稳定 system messages 只能初始化一次，不能在后续请求中被覆盖。
+fn compaction_preserves_seeded_system_messages_at_front() {
+    // 测试场景: compact 改写非 system 历史时，测试预置的 system message 仍应保留在前缀。
     let now = Utc::now();
     let mut thread = build_thread("thread_system_prefix");
-
-    assert!(thread.ensure_system_prefix_messages(&[ChatMessage::new(
+    thread.seed_persisted_messages(vec![ChatMessage::new(
         ChatMessageRole::System,
         "stable system prompt",
         now,
-    )]));
-    assert!(!thread.ensure_system_prefix_messages(&[ChatMessage::new(
-        ChatMessageRole::System,
-        "new system prompt",
-        now,
-    )]));
-    assert_eq!(thread.system_prefix_messages().len(), 1);
+    )]);
+    thread
+        .begin_turn(Some("msg_compact".to_string()), now)
+        .expect("turn should start");
+    thread
+        .replace_non_system_messages_after_compaction(vec![
+            ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
+            ChatMessage::new(ChatMessageRole::User, "继续", now),
+        ])
+        .expect("compaction rewrite should succeed");
+
+    assert_eq!(thread.system_messages().len(), 1);
+    assert_eq!(thread.system_messages()[0].content, "stable system prompt");
+    assert_eq!(thread.non_system_messages().len(), 2);
     assert_eq!(
-        thread.system_prefix_messages()[0].content,
-        "stable system prompt"
+        thread.non_system_messages()[0].content,
+        "这是压缩后的上下文"
     );
+    assert_eq!(thread.non_system_messages()[1].content, "继续");
 }

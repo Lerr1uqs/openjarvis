@@ -1,3 +1,6 @@
+#[path = "support/mod.rs"]
+mod support;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -8,7 +11,10 @@ use openjarvis::{
     },
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     model::{IncomingMessage, ReplyTarget},
-    session::{MemorySessionStore, SessionKey, SessionManager, SessionStore, SqliteSessionStore},
+    session::{
+        MemorySessionStore, SessionKey, SessionManager, SessionStore, SessionStoreError,
+        SqliteSessionStore,
+    },
     thread::{
         Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
@@ -21,6 +27,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use support::{SessionManagerTestExt, ThreadTestExt};
 use uuid::Uuid;
 
 struct DemoSessionTool;
@@ -79,7 +86,7 @@ async fn commit_messages_and_load_messages_creates_session_state() {
         .expect("thread should resolve");
 
     manager
-        .commit_messages(
+        .commit_test_turn_messages(
             &locator,
             incoming.external_message_id.clone(),
             vec![
@@ -93,7 +100,7 @@ async fn commit_messages_and_load_messages_creates_session_state() {
         .expect("message commit should store");
 
     let history = manager
-        .load_messages(&locator)
+        .load_non_system_messages(&locator)
         .await
         .expect("history should load");
     let session = manager
@@ -105,12 +112,12 @@ async fn commit_messages_and_load_messages_creates_session_state() {
         .get(&locator.thread_id)
         .expect("default thread should exist");
 
-    assert_eq!(thread.load_messages().len(), 2);
+    assert_eq!(thread.non_system_messages().len(), 2);
     assert_eq!(thread.locator.external_thread_id, "default");
     assert_eq!(history.len(), 2);
     assert_eq!(
         thread
-            .load_messages()
+            .non_system_messages()
             .last()
             .map(|message| message.content.as_str()),
         Some("world")
@@ -127,12 +134,12 @@ async fn load_turn_keeps_tool_call_id_history() {
         .expect("thread should resolve");
 
     manager
-        .commit_messages(
+        .commit_test_turn_messages(
             &locator,
             incoming.external_message_id.clone(),
             vec![
                 ChatMessage::new(ChatMessageRole::User, "read config", incoming.received_at),
-                ChatMessage::new(ChatMessageRole::Assistant, "", Utc::now()).with_tool_calls(vec![
+                ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now()).with_tool_calls(vec![
                     ChatToolCall {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
@@ -150,7 +157,7 @@ async fn load_turn_keeps_tool_call_id_history() {
         .expect("message commit should store");
 
     let history = manager
-        .load_messages(&locator)
+        .load_non_system_messages(&locator)
         .await
         .expect("history should load");
 
@@ -158,6 +165,11 @@ async fn load_turn_keeps_tool_call_id_history() {
         history
             .iter()
             .any(|message| message.tool_calls.iter().any(|call| call.id == "call_1"))
+    );
+    assert!(
+        history
+            .iter()
+            .any(|message| message.role == ChatMessageRole::Toolcall)
     );
     assert!(
         history
@@ -179,7 +191,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
 
     let now = Utc::now();
     manager
-        .commit_messages(
+        .commit_test_turn_messages(
             &locator,
             incoming.external_message_id.clone(),
             vec![
@@ -188,22 +200,28 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                     "keep large tool history",
                     incoming.received_at,
                 ),
-                ChatMessage::new(ChatMessageRole::Assistant, "", now).with_tool_calls(vec![
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:4".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "agent-doc/agent.md" }),
                     },
+                ]),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:5".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "arch/system.md" }),
                     },
+                ]),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:6".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "src/mod.md" }),
                     },
+                ]),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:7".to_string(),
                         name: "read".to_string(),
@@ -218,17 +236,21 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                     .with_tool_call_id("read:6"),
                 ChatMessage::new(ChatMessageRole::ToolResult, "agent", now)
                     .with_tool_call_id("read:7"),
-                ChatMessage::new(ChatMessageRole::Assistant, "", now).with_tool_calls(vec![
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:8".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "model/session.md" }),
                     },
+                ]),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:9".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "model/thread.md" }),
                     },
+                ]),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
                     ChatToolCall {
                         id: "read:10".to_string(),
                         name: "read".to_string(),
@@ -250,7 +272,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
         .expect("large tool turn should store");
 
     let history = manager
-        .load_messages(&locator)
+        .load_non_system_messages(&locator)
         .await
         .expect("history should load");
     let session = manager
@@ -262,14 +284,16 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
         .get(&locator.thread_id)
         .expect("default thread should exist");
 
-    assert_eq!(history.len(), 11);
+    assert_eq!(history.len(), 16);
     assert_eq!(
-        history[1]
-            .tool_calls
+        history
             .iter()
-            .map(|call| call.id.as_str())
+            .filter(|message| message.role == ChatMessageRole::Toolcall)
+            .map(|message| message.tool_calls[0].id.as_str())
             .collect::<Vec<_>>(),
-        vec!["read:4", "read:5", "read:6", "read:7"]
+        vec![
+            "read:4", "read:5", "read:6", "read:7", "read:8", "read:9", "read:10",
+        ]
     );
     assert!(
         history
@@ -281,8 +305,8 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
             .iter()
             .any(|message| message.tool_call_id.as_deref() == Some("read:10"))
     );
-    assert_eq!(thread.load_messages().len(), 11);
-    assert_eq!(thread.load_messages()[10].content, "final answer");
+    assert_eq!(thread.non_system_messages().len(), 16);
+    assert_eq!(thread.non_system_messages()[15].content, "final answer");
 }
 
 #[tokio::test]
@@ -326,7 +350,7 @@ async fn commit_messages_with_state_persists_loaded_toolsets_and_tool_events() {
     };
 
     manager
-        .commit_messages_with_state(
+        .commit_test_turn_messages_with_state(
             &locator,
             incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -373,9 +397,13 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
         event
     };
     let mut thread_context = Thread::new(ThreadContextLocator::from(&locator), now);
-    assert!(thread_context.ensure_system_prompt_snapshot("session system snapshot", now));
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "session system snapshot",
+        now,
+    )]);
     thread_context.enable_auto_compact();
-    thread_context.store_turn_state(
+    thread_context.commit_test_turn_with_state(
         incoming.external_message_id.clone(),
         vec![ChatMessage::new(
             ChatMessageRole::User,
@@ -405,7 +433,7 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
 
     assert_eq!(loaded.locator, ThreadContextLocator::from(&locator));
     assert_eq!(
-        loaded.system_prefix_messages()[0].content,
+        loaded.system_messages()[0].content,
         "session system snapshot"
     );
     assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
@@ -432,7 +460,11 @@ async fn lock_thread_context_allows_live_mutation_and_explicit_persist() {
             .lock_thread_context(&locator, now)
             .await
             .expect("thread context should lock");
-        assert!(thread_context.ensure_system_prompt_snapshot("locked system snapshot", now));
+        thread_context.seed_persisted_messages(vec![ChatMessage::new(
+            ChatMessageRole::System,
+            "locked system snapshot",
+            now,
+        )]);
         thread_context.enable_auto_compact();
     }
 
@@ -448,7 +480,7 @@ async fn lock_thread_context_allows_live_mutation_and_explicit_persist() {
         .expect("thread context should exist");
 
     assert_eq!(
-        loaded.system_prefix_messages()[0].content,
+        loaded.system_messages()[0].content,
         "locked system snapshot"
     );
     assert!(loaded.auto_compact_enabled(false));
@@ -474,7 +506,11 @@ async fn mutate_thread_context_persists_changes_without_manual_snapshot_roundtri
 
     manager_a
         .mutate_thread_context(&locator, now, |thread_context| {
-            assert!(thread_context.ensure_system_prompt_snapshot("mutated snapshot", now));
+            thread_context.seed_persisted_messages(vec![ChatMessage::new(
+                ChatMessageRole::System,
+                "mutated snapshot",
+                now,
+            )]);
             thread_context.enable_auto_compact();
             Ok(())
         })
@@ -491,10 +527,7 @@ async fn mutate_thread_context_persists_changes_without_manual_snapshot_roundtri
         .expect("thread context should load")
         .expect("thread context should exist");
 
-    assert_eq!(
-        loaded.system_prefix_messages()[0].content,
-        "mutated snapshot"
-    );
+    assert_eq!(loaded.system_messages()[0].content, "mutated snapshot");
     assert!(loaded.auto_compact_enabled(false));
 }
 
@@ -508,7 +541,7 @@ async fn load_thread_state_can_rehydrate_runtime_by_internal_thread_id() {
         .expect("thread should resolve");
 
     manager
-        .commit_messages_with_state(
+        .commit_test_turn_messages_with_state(
             &locator,
             incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -562,7 +595,7 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
         .expect("second thread should resolve");
 
     manager
-        .commit_messages_with_state(
+        .commit_test_turn_messages_with_state(
             &first_locator,
             first_incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -578,7 +611,7 @@ async fn loaded_toolsets_remain_isolated_between_internal_threads_for_same_user(
         .await
         .expect("first thread state should store");
     manager
-        .commit_messages_with_state(
+        .commit_test_turn_messages_with_state(
             &second_locator,
             second_incoming.external_message_id.clone(),
             vec![ChatMessage::new(
@@ -617,7 +650,7 @@ async fn commit_messages_with_thread_context_replaces_old_history_before_appendi
         .await
         .expect("thread should resolve");
     manager
-        .commit_messages(
+        .commit_test_turn_messages(
             &locator,
             first_incoming.external_message_id.clone(),
             vec![
@@ -641,7 +674,7 @@ async fn commit_messages_with_thread_context_replaces_old_history_before_appendi
         .thread_context
         .expect("thread should exist before compact");
     let mut replacement = Thread::new(ThreadContextLocator::from(&locator), Utc::now());
-    replacement.store_turn(
+    replacement.commit_test_turn(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", Utc::now()),
@@ -653,7 +686,7 @@ async fn commit_messages_with_thread_context_replaces_old_history_before_appendi
     compacted_thread.overwrite_active_history(&replacement);
 
     manager
-        .commit_messages_with_thread_context(
+        .commit_test_turn_messages_with_thread_context(
             &locator,
             Some(compacted_thread),
             Some("msg_compact_2".to_string()),
@@ -676,16 +709,20 @@ async fn commit_messages_with_thread_context_replaces_old_history_before_appendi
         .get(&locator.thread_id)
         .expect("thread should exist");
 
-    assert_eq!(thread.load_messages().len(), 4);
-    assert_eq!(thread.load_messages()[0].content, "这是压缩后的上下文");
-    assert_eq!(thread.load_messages()[1].content, "继续");
-    assert_eq!(thread.load_messages()[2].content, "new question");
-    assert_eq!(thread.load_messages()[3].content, "new reply");
+    assert_eq!(thread.non_system_messages().len(), 4);
+    assert_eq!(
+        thread.non_system_messages()[0].content,
+        "这是压缩后的上下文"
+    );
+    assert_eq!(thread.non_system_messages()[1].content, "继续");
+    assert_eq!(thread.non_system_messages()[2].content, "new question");
+    assert_eq!(thread.non_system_messages()[3].content, "new reply");
 }
 
 #[tokio::test]
-async fn shared_store_merges_stale_state_updates_and_restores_external_message_dedup() {
-    // 测试场景: 多个 SessionManager 共享同一个 store 时，旧线程状态写入要和最新快照合并，而不是覆盖 turn；dedup 记录也要能被新 manager 恢复。
+async fn shared_store_rejects_stale_state_updates_and_restores_external_message_dedup() {
+    // 测试场景: 多个 SessionManager 共享同一个 store 时，旧线程状态写入必须显式报 revision conflict，
+    // 不能再静默 merge 覆盖；dedup 记录仍要能被新 manager 恢复。
     let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let manager_a = SessionManager::with_store(Arc::clone(&store))
         .await
@@ -719,19 +756,23 @@ async fn shared_store_merges_stale_state_updates_and_restores_external_message_d
         .await
         .expect("fresh context should store");
 
-    manager_b
+    let stale_update = manager_b
         .store_thread_context(&locator_b, stale, Utc::now())
         .await
-        .expect("stale state update should merge with latest snapshot");
-    let merged = manager_b
-        .load_thread_context(&locator_b)
+        .expect_err("stale state update should be rejected");
+    assert!(matches!(
+        stale_update,
+        SessionStoreError::RevisionConflict(_)
+    ));
+    let merged = manager_a
+        .load_thread_context(&locator_a)
         .await
-        .expect("merged context should load")
-        .expect("merged context should exist");
+        .expect("latest context should load")
+        .expect("latest context should exist");
     assert!(merged.auto_compact_enabled(false));
 
     manager_a
-        .commit_messages(
+        .commit_test_turn_messages(
             &locator_a,
             Some("msg_conflict_2".to_string()),
             vec![
@@ -780,9 +821,13 @@ async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_foll
         .expect("manager A should resolve thread");
     let now = Utc::now();
     let mut thread_context = Thread::new(ThreadContextLocator::from(&locator_a), now);
-    assert!(thread_context.ensure_system_prompt_snapshot("sqlite system snapshot", now));
+    thread_context.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "sqlite system snapshot",
+        now,
+    )]);
     thread_context.enable_auto_compact();
-    thread_context.store_turn_state(
+    thread_context.commit_test_turn_with_state(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
@@ -816,18 +861,21 @@ async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_foll
         .expect("restored thread context should load")
         .expect("restored thread context should exist");
 
-    assert_eq!(restored.load_messages().len(), 2);
+    assert_eq!(restored.non_system_messages().len(), 2);
     assert_eq!(
-        restored.system_prefix_messages()[0].content,
+        restored.system_messages()[0].content,
         "sqlite system snapshot"
     );
-    assert_eq!(restored.load_messages()[0].content, "这是压缩后的上下文");
-    assert_eq!(restored.load_messages()[1].content, "继续");
+    assert_eq!(
+        restored.non_system_messages()[0].content,
+        "这是压缩后的上下文"
+    );
+    assert_eq!(restored.non_system_messages()[1].content, "继续");
     assert_eq!(restored.load_toolsets(), vec!["demo".to_string()]);
     assert!(restored.auto_compact_enabled(false));
 
     manager_b
-        .commit_messages(
+        .commit_test_turn_messages(
             &locator_b,
             Some("msg_restart_2".to_string()),
             vec![
@@ -844,7 +892,7 @@ async fn sqlite_backed_session_manager_restores_compact_commit_toolsets_and_foll
         .await
         .expect("follow-up commit should store after restart");
     let history = manager_b
-        .load_messages(&locator_b)
+        .load_non_system_messages(&locator_b)
         .await
         .expect("history should load after restart");
 

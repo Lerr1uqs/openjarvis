@@ -83,7 +83,16 @@ impl CompactManager {
             return Ok(None);
         }
 
-        let request = CompactRequest::new(messages.to_vec())?;
+        let compactable_messages = messages
+            .iter()
+            .filter(|message| message.role != ChatMessageRole::System)
+            .cloned()
+            .collect::<Vec<_>>();
+        if compactable_messages.is_empty() {
+            return Ok(None);
+        }
+
+        let request = CompactRequest::new(compactable_messages.clone())?;
         info!(
             source_message_count = request.messages.len(),
             "starting compact manager run from messages"
@@ -93,7 +102,7 @@ impl CompactManager {
         let compacted_messages = build_compacted_messages(&summary, compacted_at);
 
         Ok(Some(MessageCompactionOutcome {
-            source_message_count: messages.len(),
+            source_message_count: compactable_messages.len(),
             summary,
             compacted_messages,
         }))

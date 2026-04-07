@@ -1,3 +1,6 @@
+#[path = "../support/mod.rs"]
+pub mod support;
+
 mod agent_loop;
 mod feature;
 mod hook;

@@ -15,13 +15,12 @@ fn render_chat_history_keeps_tool_annotations() {
     // 测试场景: compact prompt 需要保留 tool_call 标识，避免摘要时丢失关键上下文。
     let now = Utc::now();
     let rendered = render_chat_history(&[
-        ChatMessage::new(ChatMessageRole::Assistant, "read config", now).with_tool_calls(vec![
-            ChatToolCall {
-                id: "call_1".to_string(),
-                name: "read".to_string(),
-                arguments: json!({ "path": "config.yaml" }),
-            },
-        ]),
+        ChatMessage::new(ChatMessageRole::Assistant, "read config", now),
+        ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![ChatToolCall {
+            id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: json!({ "path": "config.yaml" }),
+        }]),
         ChatMessage::new(ChatMessageRole::ToolResult, "ok", now).with_tool_call_id("call_1"),
         ChatMessage::new(ChatMessageRole::User, "task", now),
     ]);
