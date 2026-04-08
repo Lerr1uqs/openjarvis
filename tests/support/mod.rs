@@ -61,7 +61,12 @@ impl ThreadTestExt for Thread {
             .last()
             .map(|message| message.created_at)
             .unwrap_or(created_at);
+        let initialized_at = messages
+            .iter()
+            .find(|message| message.role == ChatMessageRole::System)
+            .map(|message| message.created_at);
         self.thread.messages = messages;
+        self.thread.request_context_initialized_at = initialized_at;
         self.thread.created_at = created_at;
         self.thread.updated_at = updated_at;
     }
@@ -83,7 +88,7 @@ impl ThreadTestExt for Thread {
             .begin_turn(external_message_id, started_at)
             .expect("test turn should start");
         for message in messages {
-            self.append_message(message)
+            self.push_message(message)
                 .expect("test message should append");
         }
         self.finalize_turn_success(reply, completed_at)
@@ -108,7 +113,7 @@ impl ThreadTestExt for Thread {
     }
 
     fn append_open_turn_message(&mut self, message: ChatMessage) -> Result<()> {
-        self.append_message(message)
+        self.push_message(message)
     }
 
     fn replace_non_system_messages_after_compaction(

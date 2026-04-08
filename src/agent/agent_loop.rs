@@ -883,6 +883,9 @@ impl AgentLoop {
     }
 
     async fn prepare_thread_runtime(&self, thread_context: &mut Thread) -> Result<()> {
+        if thread_context.has_runtime() {
+            return Ok(());
+        }
         info!(
             thread_id = %thread_context.locator.thread_id,
             "preparing thread runtime"
@@ -892,7 +895,11 @@ impl AgentLoop {
     }
 
     async fn prepare_request_state(&self, thread_context: &Thread) -> Result<RequestState> {
-        let base_tools = self.runtime.list_tools(thread_context, false).await?;
+        let base_tools = if thread_context.has_runtime() {
+            thread_context.visible_tools(false).await?
+        } else {
+            self.runtime.list_tools(thread_context, false).await?
+        };
         let messages = thread_context.messages();
         let base_budget_report = self.budget_estimator.estimate(&messages, &base_tools);
         let compact_visible = self.auto_compact_enabled_for_thread(thread_context)
@@ -900,7 +907,11 @@ impl AgentLoop {
                 .auto_compactor
                 .compact_tool_visible(&base_budget_report);
         let tools = if compact_visible {
-            self.runtime.list_tools(thread_context, true).await?
+            if thread_context.has_runtime() {
+                thread_context.visible_tools(true).await?
+            } else {
+                self.runtime.list_tools(thread_context, true).await?
+            }
         } else {
             base_tools
         };
@@ -944,9 +955,13 @@ impl AgentLoop {
         thread_context: &mut Thread,
         tool_call: &ToolCallRequest,
     ) -> Result<super::ToolCallResult> {
-        self.runtime
-            .call_tool(thread_context, tool_call.clone())
-            .await
+        if thread_context.has_runtime() {
+            thread_context.call_tool(tool_call.clone()).await
+        } else {
+            self.runtime
+                .call_tool(thread_context, tool_call.clone())
+                .await
+        }
     }
 
     async fn execute_turn_compaction(
@@ -1285,7 +1300,7 @@ async fn commit_message<H>(
 where
     H: AgentCommittedMessageHandler,
 {
-    thread_context.append_message(message.clone())?;
+    thread_context.push_message(message.clone())?;
     for event in &turn_events {
         thread_context.buffer_turn_event(event.clone())?;
     }

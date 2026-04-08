@@ -1,11 +1,17 @@
 //! Thread aggregate and persisted thread state model.
 
+use crate::agent::{
+    FeaturePromptRebuilder, MemoryRepository, ToolCallRequest, ToolCallResult, ToolDefinition,
+    ToolRegistry,
+};
 use crate::context::{ChatMessage, ChatMessageRole};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -298,6 +304,8 @@ pub struct ThreadState {
 pub struct ThreadContext {
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_context_initialized_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -307,6 +315,7 @@ impl ThreadContext {
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
             messages: Vec::new(),
+            request_context_initialized_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -318,8 +327,82 @@ impl ThreadContext {
     }
 }
 
+/// Runtime attachment bundle injected into one live thread before request handling starts.
+#[derive(Clone)]
+pub struct ThreadRuntimeAttachment {
+    tool_registry: Arc<ToolRegistry>,
+    memory_repository: Arc<MemoryRepository>,
+    feature_prompt_rebuilder: Arc<FeaturePromptRebuilder>,
+    default_auto_compact_enabled: bool,
+}
+
+impl ThreadRuntimeAttachment {
+    /// Build one thread runtime attachment from shared runtime services.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use openjarvis::{
+    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     thread::ThreadRuntimeAttachment,
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let tool_registry = Arc::new(ToolRegistry::new());
+    /// let memory_repository = Arc::new(MemoryRepository::new("."));
+    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
+    ///     Arc::clone(&tool_registry),
+    ///     Default::default(),
+    ///     "",
+    /// ));
+    ///
+    /// let attachment = ThreadRuntimeAttachment::new(
+    ///     tool_registry,
+    ///     memory_repository,
+    ///     feature_prompt_rebuilder,
+    ///     false,
+    /// );
+    /// assert!(!attachment.default_auto_compact_enabled());
+    /// ```
+    pub fn new(
+        tool_registry: Arc<ToolRegistry>,
+        memory_repository: Arc<MemoryRepository>,
+        feature_prompt_rebuilder: Arc<FeaturePromptRebuilder>,
+        default_auto_compact_enabled: bool,
+    ) -> Self {
+        Self {
+            tool_registry,
+            memory_repository,
+            feature_prompt_rebuilder,
+            default_auto_compact_enabled,
+        }
+    }
+
+    /// Return whether auto-compact should be enabled by default for attached threads.
+    pub fn default_auto_compact_enabled(&self) -> bool {
+        self.default_auto_compact_enabled
+    }
+
+    async fn ensure_tool_registry_ready(&self) -> Result<()> {
+        self.tool_registry.register_builtin_tools().await
+    }
+}
+
+impl fmt::Debug for ThreadRuntimeAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadRuntimeAttachment")
+            .field(
+                "default_auto_compact_enabled",
+                &self.default_auto_compact_enabled,
+            )
+            .field("tool_registry", &"Arc<ToolRegistry>")
+            .field("memory_repository", &"Arc<MemoryRepository>")
+            .field("feature_prompt_rebuilder", &"Arc<FeaturePromptRebuilder>")
+            .finish()
+    }
+}
+
 /// Unified persisted thread aggregate shared by session, command, and agent execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
     pub locator: ThreadContextLocator,
     pub thread: ThreadContext,
@@ -331,6 +414,8 @@ pub struct Thread {
     pending_tool_events: Vec<ThreadToolEvent>,
     #[serde(default, skip_serializing, skip_deserializing)]
     current_turn: Option<ThreadCurrentTurn>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    runtime_attachment: Option<ThreadRuntimeAttachment>,
 }
 
 impl Thread {
@@ -361,12 +446,83 @@ impl Thread {
             revision: 0,
             pending_tool_events: Vec::new(),
             current_turn: None,
+            runtime_attachment: None,
         }
     }
 
     /// Rebind the runtime locator while keeping persisted thread state intact.
     pub fn rebind_locator(&mut self, locator: ThreadContextLocator) {
         self.locator = locator;
+    }
+
+    /// Attach the shared runtime services required by this thread during live request handling.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let tool_registry = Arc::new(ToolRegistry::new());
+    /// let memory_repository = Arc::new(MemoryRepository::new("."));
+    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
+    ///     Arc::clone(&tool_registry),
+    ///     Default::default(),
+    ///     "",
+    /// ));
+    /// let attachment = ThreadRuntimeAttachment::new(
+    ///     tool_registry,
+    ///     memory_repository,
+    ///     feature_prompt_rebuilder,
+    ///     false,
+    /// );
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// thread.attach_runtime(attachment);
+    /// assert!(thread.has_runtime());
+    /// ```
+    pub fn attach_runtime(&mut self, attachment: ThreadRuntimeAttachment) {
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            "attached runtime services to thread"
+        );
+        self.runtime_attachment = Some(attachment);
+    }
+
+    /// Return whether the current thread already has a live runtime attachment.
+    pub fn has_runtime(&self) -> bool {
+        self.runtime_attachment.is_some()
+    }
+
+    pub(crate) fn detach_runtime(&mut self) {
+        self.runtime_attachment = None;
+    }
+
+    fn runtime_attachment(&self) -> Result<&ThreadRuntimeAttachment> {
+        self.runtime_attachment.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "thread `{}` does not have attached runtime services",
+                self.locator.thread_id
+            )
+        })
+    }
+
+    fn backfill_initialized_at_from_system_prefix(&mut self) -> Option<DateTime<Utc>> {
+        let initialized_at = self
+            .thread
+            .messages
+            .iter()
+            .find(|message| message.role == ChatMessageRole::System)
+            .map(|message| message.created_at)?;
+        self.thread.request_context_initialized_at = Some(initialized_at);
+        Some(initialized_at)
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -404,6 +560,97 @@ impl Thread {
     /// ```
     pub fn messages(&self) -> Vec<ChatMessage> {
         self.thread.messages()
+    }
+
+    /// Return whether this thread already owns a stable initialized request-context snapshot.
+    pub fn is_initialized(&self) -> bool {
+        self.thread.request_context_initialized_at.is_some()
+    }
+
+    /// Ensure the current thread has finished stable request-context initialization.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let tool_registry = Arc::new(ToolRegistry::new());
+    /// let memory_repository = Arc::new(MemoryRepository::new("."));
+    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
+    ///     Arc::clone(&tool_registry),
+    ///     Default::default(),
+    ///     "system",
+    /// ));
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// thread.attach_runtime(ThreadRuntimeAttachment::new(
+    ///     tool_registry,
+    ///     memory_repository,
+    ///     feature_prompt_rebuilder,
+    ///     false,
+    /// ));
+    ///
+    /// let _ = thread.ensure_initialized().await?;
+    /// assert!(thread.is_initialized());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn ensure_initialized(&mut self) -> Result<bool> {
+        let runtime_attachment = self.runtime_attachment()?.clone();
+        runtime_attachment.ensure_tool_registry_ready().await?;
+
+        if self.is_initialized() {
+            return Ok(false);
+        }
+
+        if let Some(initialized_at) = self.backfill_initialized_at_from_system_prefix() {
+            info!(
+                thread_id = %self.locator.thread_id,
+                external_thread_id = %self.locator.external_thread_id,
+                initialized_at = %initialized_at,
+                "backfilled thread initialization marker from existing system prefix"
+            );
+            return Ok(true);
+        }
+
+        let auto_compact_enabled =
+            self.auto_compact_enabled(runtime_attachment.default_auto_compact_enabled());
+        let initialized_messages = runtime_attachment
+            .feature_prompt_rebuilder
+            .build_messages(self, auto_compact_enabled)
+            .await?;
+        let initialized_at = initialized_messages
+            .first()
+            .map(|message| message.created_at)
+            .unwrap_or_else(Utc::now);
+        if !initialized_messages.is_empty() {
+            self.replace_messages(initialized_messages, initialized_at);
+        }
+        self.thread.request_context_initialized_at = Some(initialized_at);
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            initialized_message_count = self
+                .thread
+                .messages
+                .iter()
+                .filter(|message| message.role == ChatMessageRole::System)
+                .count(),
+            "thread ensured initialized request-context snapshot"
+        );
+        Ok(true)
+    }
+
+    /// Return the memory repository attached to the current live thread runtime.
+    pub fn memory_repository(&self) -> Result<Arc<MemoryRepository>> {
+        Ok(Arc::clone(&self.runtime_attachment()?.memory_repository))
     }
 
     /// Replace the current persisted message sequence.
@@ -490,7 +737,27 @@ impl Thread {
         self.current_turn.as_ref().map(|turn| turn.turn_id)
     }
 
-    /// Append one formal message directly into the thread-owned message sequence.
+    /// Return the current thread-scoped visible tools by delegating to the attached runtime.
+    pub async fn visible_tools(&self, compact_visible: bool) -> Result<Vec<ToolDefinition>> {
+        let runtime_attachment = self.runtime_attachment()?.clone();
+        runtime_attachment.ensure_tool_registry_ready().await?;
+        runtime_attachment
+            .tool_registry
+            .list_for_context_with_compact(self, compact_visible)
+            .await
+    }
+
+    /// Execute one thread-scoped tool call through the attached global tool registry.
+    pub async fn call_tool(&mut self, request: ToolCallRequest) -> Result<ToolCallResult> {
+        let runtime_attachment = self.runtime_attachment()?.clone();
+        runtime_attachment.ensure_tool_registry_ready().await?;
+        runtime_attachment
+            .tool_registry
+            .call_for_context(self, request)
+            .await
+    }
+
+    /// Push one formal message into the thread-owned message sequence.
     ///
     /// # 示例
     /// ```rust
@@ -509,12 +776,12 @@ impl Thread {
     ///     .begin_turn(Some("msg_1".to_string()), now)
     ///     .expect("turn should start");
     /// thread
-    ///     .append_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
     ///     .expect("user message should append");
     ///
     /// assert_eq!(thread.messages()[0].content, "hello");
     /// ```
-    pub fn append_message(&mut self, message: ChatMessage) -> Result<()> {
+    pub fn push_message(&mut self, message: ChatMessage) -> Result<()> {
         let turn_id = self.current_turn_mut()?.turn_id;
         info!(
             thread_id = %self.locator.thread_id,
@@ -531,6 +798,11 @@ impl Thread {
         self.thread.updated_at = message.created_at;
         self.thread.messages.push(message);
         Ok(())
+    }
+
+    /// Compatibility wrapper for older call sites still using the previous message API name.
+    pub fn append_message(&mut self, message: ChatMessage) -> Result<()> {
+        self.push_message(message)
     }
 
     /// Buffer one user-visible turn event that will only be dispatched after finalization.
@@ -932,5 +1204,16 @@ impl Deref for Thread {
 impl DerefMut for Thread {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.thread
+    }
+}
+
+impl PartialEq for Thread {
+    fn eq(&self, other: &Self) -> bool {
+        self.locator == other.locator
+            && self.thread == other.thread
+            && self.state == other.state
+            && self.revision == other.revision
+            && self.pending_tool_events == other.pending_tool_events
+            && self.current_turn == other.current_turn
     }
 }

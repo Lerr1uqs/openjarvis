@@ -17,7 +17,9 @@ use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
 use crate::session::{SessionManager, ThreadLocator};
-use crate::thread::{Thread, ThreadFinalizedTurn, ThreadTurnEvent, ThreadTurnEventKind};
+use crate::thread::{
+    Thread, ThreadFinalizedTurn, ThreadRuntimeAttachment, ThreadTurnEvent, ThreadTurnEventKind,
+};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -68,7 +70,7 @@ pub struct AgentWorkerHandle {
 
 pub struct AgentWorker {
     agent_loop: AgentLoop,
-    thread_initializer: FeaturePromptRebuilder,
+    thread_initializer: Arc<FeaturePromptRebuilder>,
     compact_config: AgentCompactConfig,
     sandbox: DummySandboxContainer,
 }
@@ -197,11 +199,11 @@ impl AgentWorkerBuilder {
         let Some(llm) = llm else {
             bail!("agent worker builder requires an llm provider");
         };
-        let thread_initializer = FeaturePromptRebuilder::new(
+        let thread_initializer = Arc::new(FeaturePromptRebuilder::new(
             runtime.tools(),
             compact_config.clone(),
             system_prompt.clone(),
-        );
+        ));
         let agent_loop = match compact_provider {
             Some(compact_provider) => AgentLoop::with_compact_provider(
                 llm,
@@ -225,41 +227,20 @@ impl AgentWorkerBuilder {
 }
 
 impl AgentWorker {
+    fn build_thread_runtime_attachment(&self) -> ThreadRuntimeAttachment {
+        let tool_registry = self.agent_loop.runtime().tools();
+        let memory_repository = tool_registry.memory_repository();
+        ThreadRuntimeAttachment::new(
+            tool_registry,
+            memory_repository,
+            Arc::clone(&self.thread_initializer),
+            self.compact_config.enabled() && self.compact_config.auto_compact(),
+        )
+    }
+
     async fn initialize_thread(&self, thread_context: &mut Thread) -> Result<bool> {
-        if !thread_context.messages().is_empty() {
-            return Ok(false);
-        }
-
-        self.agent_loop
-            .runtime()
-            .tools()
-            .register_builtin_tools()
-            .await?;
-
-        let initialized_messages = self
-            .thread_initializer
-            .build_messages(
-                thread_context,
-                self.compact_config.enabled()
-                    && thread_context.auto_compact_enabled(self.compact_config.auto_compact()),
-            )
-            .await?;
-        if initialized_messages.is_empty() {
-            return Ok(false);
-        }
-
-        let initialized_at = initialized_messages
-            .first()
-            .map(|message| message.created_at)
-            .unwrap_or_else(Utc::now);
-        tracing::info!(
-            thread_id = %thread_context.locator.thread_id,
-            external_thread_id = %thread_context.locator.external_thread_id,
-            message_count = initialized_messages.len(),
-            "initialized thread messages through worker feature traversal"
-        );
-        thread_context.replace_messages(initialized_messages, initialized_at);
-        Ok(true)
+        thread_context.attach_runtime(self.build_thread_runtime_attachment());
+        thread_context.ensure_initialized().await
     }
 
     /// Create one worker builder.
@@ -528,7 +509,7 @@ impl AgentWorker {
                     failure_reply.clone(),
                     committed_at,
                 );
-                thread_context.append_message(failure_message.clone())?;
+                thread_context.push_message(failure_message.clone())?;
                 let failure_event = ThreadTurnEvent {
                     kind: ThreadTurnEventKind::TextOutput,
                     content: failure_reply.clone(),

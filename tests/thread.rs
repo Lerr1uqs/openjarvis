@@ -3,13 +3,17 @@ mod support;
 
 use chrono::Utc;
 use openjarvis::{
+    agent::{FeaturePromptRebuilder, ToolRegistry},
+    config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     thread::{
-        Thread, ThreadContextLocator, ThreadFinalizedTurnStatus, ThreadToolEvent,
+        Thread, ThreadContextLocator, ThreadFinalizedTurnStatus, ThreadRuntimeAttachment,
+        ThreadToolEvent,
         ThreadToolEventKind, derive_internal_thread_id,
     },
 };
 use serde_json::json;
+use std::sync::Arc;
 use support::ThreadTestExt;
 
 fn build_thread(external_thread_id: &str) -> Thread {
@@ -24,6 +28,17 @@ fn build_thread(external_thread_id: &str) -> Thread {
         ),
         Utc::now(),
     )
+}
+
+fn build_runtime_attachment(system_prompt: &str) -> ThreadRuntimeAttachment {
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        AppConfig::default().agent_config().compact_config().clone(),
+        system_prompt,
+    ));
+    let memory_repository = registry.memory_repository();
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
 }
 
 #[test]
@@ -252,4 +267,65 @@ fn compaction_preserves_seeded_system_messages_at_front() {
         "这是压缩后的上下文"
     );
     assert_eq!(thread.non_system_messages()[1].content, "继续");
+}
+
+#[tokio::test]
+async fn thread_runtime_attachment_supports_idempotent_initialization() {
+    // 测试场景: runtime service attach 到 Thread 后，应由 Thread 自己完成初始化且保持幂等。
+    let mut thread = build_thread("thread_runtime_attach");
+    thread.attach_runtime(build_runtime_attachment("stable system prompt"));
+
+    let first = thread
+        .ensure_initialized()
+        .await
+        .expect("first initialization should succeed");
+    let second = thread
+        .ensure_initialized()
+        .await
+        .expect("second initialization should stay idempotent");
+
+    assert!(thread.has_runtime());
+    assert!(thread.is_initialized());
+    assert!(first);
+    assert!(!second);
+    assert!(
+        thread
+            .system_messages()
+            .iter()
+            .any(|message| message.content == "stable system prompt")
+    );
+    assert!(
+        thread.system_messages().len() >= 2,
+        "expected stable system prompt plus feature prompts"
+    );
+    assert!(
+        thread
+            .memory_repository()
+            .expect("runtime attachment should expose memory repository")
+            .memory_root()
+            .ends_with(".openjarvis/memory")
+    );
+}
+
+#[tokio::test]
+async fn thread_ensure_initialized_backfills_existing_system_prefix_without_overwrite() {
+    // 测试场景: 已存在旧 system prefix 的线程在 attach runtime 后，应只回填初始化标记而不覆盖原快照。
+    let now = Utc::now();
+    let mut thread = build_thread("thread_init_backfill");
+    thread.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "legacy system snapshot",
+        now,
+    )]);
+    thread.attach_runtime(build_runtime_attachment("new system prompt"));
+
+    let changed = thread
+        .ensure_initialized()
+        .await
+        .expect("legacy initialization backfill should succeed");
+
+    assert!(!changed);
+    assert!(thread.is_initialized());
+    assert_eq!(thread.system_messages().len(), 1);
+    assert_eq!(thread.system_messages()[0].content, "legacy system snapshot");
 }
