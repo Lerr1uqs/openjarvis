@@ -5,13 +5,14 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        AgentRequest, AgentRuntime, AgentWorker, AgentWorkerEvent, HookRegistry, ToolRegistry,
+        AgentRequest, AgentRuntime, AgentWorker, AgentWorkerEvent, FeaturePromptRebuilder,
+        HookRegistry, MemoryType, MemoryWriteRequest, ToolRegistry,
     },
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall},
     model::{IncomingMessage, ReplyTarget},
     session::{SessionKey, SessionManager, ThreadLocator},
-    thread::Thread,
+    thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
 };
 use serde_json::json;
 use std::{collections::VecDeque, sync::Arc};
@@ -61,6 +62,19 @@ impl LLMProvider for RecordingProvider {
             tool_calls: Vec::new(),
         })
     }
+}
+
+fn build_runtime_attachment(registry: Arc<ToolRegistry>) -> ThreadRuntimeAttachment {
+    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        openjarvis::config::AppConfig::default()
+            .agent_config()
+            .compact_config()
+            .clone(),
+        "system prompt",
+    ));
+    let memory_repository = registry.memory_repository();
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
 }
 
 #[tokio::test]
@@ -224,6 +238,67 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         !reinit_messages
             .iter()
             .any(|message| message.content.contains("上传到 notion 时走用户自定义模板"))
+    );
+}
+
+#[tokio::test]
+async fn thread_owned_request_time_memory_refresh_keeps_memory_as_non_persisted_noop() {
+    // 测试场景: request-time memory 刷新必须由 Thread 调 repository 决策；当前策略应保持空注入，且 turn 结束后不留下额外历史。
+    let fixture = MemoryWorkspaceFixture::new("openjarvis-thread-owned-request-time-memory");
+    let registry = Arc::new(ToolRegistry::with_workspace_root_and_skill_roots(
+        fixture.root(),
+        Vec::new(),
+    ));
+    registry
+        .memory_repository()
+        .write(MemoryWriteRequest {
+            memory_type: MemoryType::Active,
+            path: "workflow/notion.md".to_string(),
+            title: "Notion 上传工作流".to_string(),
+            content: "上传到 notion 时走用户自定义模板".to_string(),
+            keywords: Some(vec!["notion".to_string(), "上传".to_string()]),
+        })
+        .expect("active memory fixture should write");
+
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_memory_refresh",
+            "thread_memory_refresh",
+        ),
+        Utc::now(),
+    );
+    thread.attach_runtime(build_runtime_attachment(Arc::clone(&registry)));
+    thread
+        .begin_turn(Some("msg_memory_refresh".to_string()), Utc::now())
+        .expect("turn should start");
+    thread
+        .push_message(ChatMessage::new(
+            ChatMessageRole::User,
+            "notion 上传细节是什么",
+            Utc::now(),
+        ))
+        .expect("user message should append");
+
+    let injected = thread
+        .refresh_request_time_memory()
+        .await
+        .expect("thread-owned refresh should succeed");
+
+    assert_eq!(injected, 0);
+    assert_eq!(thread.messages().len(), 1);
+    assert_eq!(thread.compact_source_messages().len(), 1);
+
+    let finalized = thread
+        .finalize_turn_success("ok", Utc::now())
+        .expect("turn should finalize");
+    assert_eq!(finalized.snapshot.messages().len(), 1);
+    assert!(
+        !finalized.snapshot.messages()[0]
+            .content
+            .contains("上传到 notion 时走用户自定义模板")
     );
 }
 

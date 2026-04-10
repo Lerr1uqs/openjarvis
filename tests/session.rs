@@ -7,8 +7,7 @@ use chrono::Utc;
 use openjarvis::{
     agent::{
         FeaturePromptRebuilder, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
-        ToolRegistry,
-        ToolsetCatalogEntry, empty_tool_input_schema,
+        ToolRegistry, ToolsetCatalogEntry, empty_tool_input_schema,
     },
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
@@ -19,8 +18,7 @@ use openjarvis::{
     },
     thread::{
         Thread, ThreadContextLocator, ThreadRuntimeAttachment, ThreadToolEvent,
-        ThreadToolEventKind,
-        derive_internal_thread_id,
+        ThreadToolEventKind, derive_internal_thread_id,
     },
 };
 use serde_json::json;

@@ -1,5 +1,6 @@
 //! Markdown-backed local memory repository used by thread init and the `memory` toolset.
 
+use crate::{context::ChatMessage, thread::Thread};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -470,6 +471,20 @@ impl MemoryRepository {
             "completed active memory prompt build"
         );
         Ok(Some(prompt))
+    }
+
+    /// Build request-time memory messages for one live thread request.
+    ///
+    /// 当前 memory 仍然遵循“渐进式披露”原则，因此 repository 不会因为命中关键词而
+    /// 自动把正文注入到请求里。这个入口只负责把 request-time memory 的决策边界
+    /// 固定在 `Thread -> MemoryRepository`，避免 AgentLoop/Worker 重新接管该职责。
+    pub fn build_request_time_messages(&self, thread: &Thread) -> Result<Vec<ChatMessage>> {
+        info!(
+            thread_id = %thread.locator.thread_id,
+            root = %self.memory_root().display(),
+            "evaluated request-time memory injection policy for thread"
+        );
+        Ok(Vec::new())
     }
 
     fn load_documents(&self, memory_type: Option<MemoryType>) -> Result<Vec<MemoryDocument>> {

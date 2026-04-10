@@ -54,6 +54,55 @@ where
     names
 }
 
+/// Message visibility scope owned by the current thread turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadMessageScope {
+    PersistedHistory,
+    RequestOnly,
+}
+
+/// One unified thread message write request routed through `Thread::push_message(...)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadMessageInput {
+    pub message: ChatMessage,
+    pub scope: ThreadMessageScope,
+}
+
+impl ThreadMessageInput {
+    /// Wrap one message as a request-only input that only lives in the current request view.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{ThreadMessageInput, ThreadMessageScope},
+    /// };
+    ///
+    /// let input = ThreadMessageInput::request_only(ChatMessage::new(
+    ///     ChatMessageRole::System,
+    ///     "runtime memory",
+    ///     Utc::now(),
+    /// ));
+    /// assert_eq!(input.scope, ThreadMessageScope::RequestOnly);
+    /// ```
+    pub fn request_only(message: ChatMessage) -> Self {
+        Self {
+            message,
+            scope: ThreadMessageScope::RequestOnly,
+        }
+    }
+}
+
+impl From<ChatMessage> for ThreadMessageInput {
+    fn from(message: ChatMessage) -> Self {
+        Self {
+            message,
+            scope: ThreadMessageScope::PersistedHistory,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ThreadToolEventKind {
     LoadToolset,
@@ -147,6 +196,7 @@ struct ThreadCurrentTurn {
     started_at: DateTime<Utc>,
     buffered_events: Vec<ThreadTurnEvent>,
     tool_events: Vec<ThreadToolEvent>,
+    request_only_messages: Vec<ChatMessage>,
 }
 
 impl ThreadCurrentTurn {
@@ -157,6 +207,7 @@ impl ThreadCurrentTurn {
             started_at,
             buffered_events: Vec::new(),
             tool_events: Vec::new(),
+            request_only_messages: Vec::new(),
         }
     }
 }
@@ -559,6 +610,44 @@ impl Thread {
     /// assert_eq!(thread.messages()[0].content, "hello");
     /// ```
     pub fn messages(&self) -> Vec<ChatMessage> {
+        let mut messages = self.thread.messages();
+        if let Some(current_turn) = &self.current_turn {
+            messages.extend(current_turn.request_only_messages.clone());
+        }
+        messages
+    }
+
+    /// Export the compact source message sequence without request-only runtime messages.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator, ThreadMessageInput},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// thread.begin_turn(Some("msg_1".to_string()), now).expect("turn should start");
+    /// thread
+    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .expect("persisted message should append");
+    /// thread
+    ///     .push_message(ThreadMessageInput::request_only(ChatMessage::new(
+    ///         ChatMessageRole::System,
+    ///         "runtime memory",
+    ///         now,
+    ///     )))
+    ///     .expect("request-only message should append");
+    ///
+    /// assert_eq!(thread.messages().len(), 2);
+    /// assert_eq!(thread.compact_source_messages().len(), 1);
+    /// ```
+    pub fn compact_source_messages(&self) -> Vec<ChatMessage> {
         self.thread.messages()
     }
 
@@ -653,6 +742,70 @@ impl Thread {
         Ok(Arc::clone(&self.runtime_attachment()?.memory_repository))
     }
 
+    /// Refresh request-time memory messages for the current turn.
+    ///
+    /// 当前 memory 语义仍然遵循“渐进式披露”原则:
+    /// repository 不会根据关键词自动把正文塞进请求；因此这个入口目前只负责把
+    /// request-time memory 的 ownership 固定在 `Thread`，并在未来真正需要注入时通过
+    /// `push_message(...)` 写入 request-only working set。
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let tool_registry = Arc::new(ToolRegistry::new());
+    /// let memory_repository = Arc::new(MemoryRepository::new("."));
+    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
+    ///     Arc::clone(&tool_registry),
+    ///     Default::default(),
+    ///     "",
+    /// ));
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// thread.attach_runtime(ThreadRuntimeAttachment::new(
+    ///     tool_registry,
+    ///     memory_repository,
+    ///     feature_prompt_rebuilder,
+    ///     false,
+    /// ));
+    /// thread.begin_turn(Some("msg_1".to_string()), Utc::now())?;
+    ///
+    /// let injected = thread.refresh_request_time_memory().await?;
+    /// assert_eq!(injected, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn refresh_request_time_memory(&mut self) -> Result<usize> {
+        let memory_repository = self.memory_repository()?;
+        let memory_messages = memory_repository.build_request_time_messages(self)?;
+        let current_turn = self.current_turn_mut()?;
+        current_turn.request_only_messages.clear();
+        let turn_id = current_turn.turn_id;
+        let memory_root = memory_repository.memory_root();
+        let mut injected_count = 0usize;
+        for memory_message in memory_messages {
+            self.push_message(ThreadMessageInput::request_only(memory_message))?;
+            injected_count += 1;
+        }
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            turn_id = %turn_id,
+            request_time_memory_count = injected_count,
+            memory_root = %memory_root.display(),
+            "refreshed thread-owned request-time memory messages"
+        );
+        Ok(injected_count)
+    }
+
     /// Replace the current persisted message sequence.
     pub(crate) fn replace_messages(
         &mut self,
@@ -737,23 +890,232 @@ impl Thread {
         self.current_turn.as_ref().map(|turn| turn.turn_id)
     }
 
+    pub(crate) async fn toolset_catalog_prompt_with_registry(
+        &self,
+        tool_registry: &ToolRegistry,
+    ) -> Option<String> {
+        tool_registry
+            .render_toolset_catalog_prompt(&self.load_toolsets())
+            .await
+    }
+
+    pub(crate) async fn visible_tools_with_registry(
+        &self,
+        tool_registry: &ToolRegistry,
+        compact_visible: bool,
+    ) -> Result<Vec<ToolDefinition>> {
+        let mut definitions = tool_registry.always_visible_definitions().await;
+        definitions.push(crate::agent::tool::load_toolset_definition());
+        definitions.push(crate::agent::tool::unload_toolset_definition());
+
+        for toolset_name in self.load_toolsets() {
+            definitions.extend(tool_registry.toolset_definitions(&toolset_name).await?);
+        }
+
+        if compact_visible {
+            definitions.push(crate::agent::tool::compact_tool_definition());
+        }
+
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(definitions)
+    }
+
     /// Return the current thread-scoped visible tools by delegating to the attached runtime.
     pub async fn visible_tools(&self, compact_visible: bool) -> Result<Vec<ToolDefinition>> {
         let runtime_attachment = self.runtime_attachment()?.clone();
         runtime_attachment.ensure_tool_registry_ready().await?;
-        runtime_attachment
-            .tool_registry
-            .list_for_context_with_compact(self, compact_visible)
+        self.visible_tools_with_registry(&runtime_attachment.tool_registry, compact_visible)
             .await
+    }
+
+    async fn load_toolset_via_registry(
+        &mut self,
+        tool_registry: &ToolRegistry,
+        toolset_name: &str,
+    ) -> Result<bool> {
+        let toolset_name = toolset_name.trim();
+        if toolset_name.is_empty() {
+            bail!("load_toolset requires a non-empty tool name");
+        }
+
+        tool_registry.toolset_definitions(toolset_name).await?;
+        Ok(self.load_toolset(toolset_name))
+    }
+
+    async fn unload_toolset_via_registry(
+        &mut self,
+        tool_registry: &ToolRegistry,
+        toolset_name: &str,
+    ) -> Result<bool> {
+        let toolset_name = toolset_name.trim();
+        if toolset_name.is_empty() {
+            bail!("unload_toolset requires a non-empty tool name");
+        }
+
+        let thread_id = self.locator.thread_id.clone();
+        let is_loaded = self
+            .load_toolsets()
+            .into_iter()
+            .any(|loaded_name| loaded_name == toolset_name);
+        if is_loaded && let Some(runtime) = tool_registry.toolset_runtime(toolset_name).await? {
+            runtime.on_unload(&thread_id).await?;
+        }
+
+        Ok(self.unload_toolset(toolset_name))
+    }
+
+    pub(crate) async fn call_tool_with_registry(
+        &mut self,
+        tool_registry: &ToolRegistry,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        let thread_id = self.locator.thread_id.clone();
+        let tool_name = request.name.clone();
+        let loaded_toolset_count = self.load_toolsets().len();
+        let argument_field_count = request
+            .arguments
+            .as_object()
+            .map(|arguments| arguments.len())
+            .unwrap_or_default();
+        let started_at = std::time::Instant::now();
+        tracing::debug!(
+            thread_id = %thread_id,
+            tool_name = %tool_name,
+            loaded_toolset_count,
+            argument_field_count,
+            "starting thread-owned tool call"
+        );
+
+        let result = match request.name.as_str() {
+            "compact" => bail!("tool `compact` must be handled by the agent loop compact runtime"),
+            "load_toolset" => {
+                let toolset_name = request
+                    .arguments
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("load_toolset requires a non-empty tool name")
+                    })?;
+                let inserted = self
+                    .load_toolset_via_registry(tool_registry, toolset_name)
+                    .await?;
+                let loaded_toolsets = self.load_toolsets();
+                Ok(ToolCallResult {
+                    content: if inserted {
+                        format!("Toolset `{toolset_name}` loaded for the current thread.")
+                    } else {
+                        format!(
+                            "Toolset `{toolset_name}` was already loaded for the current thread."
+                        )
+                    },
+                    metadata: json!({
+                        "event_kind": "load_toolset",
+                        "toolset": toolset_name,
+                        "loaded_toolsets": loaded_toolsets,
+                        "already_loaded": !inserted,
+                        "approval_required": false,
+                        "policy_extension_point": true,
+                    }),
+                    is_error: false,
+                })
+            }
+            "unload_toolset" => {
+                let toolset_name = request
+                    .arguments
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unload_toolset requires a non-empty tool name")
+                    })?;
+                let removed = self
+                    .unload_toolset_via_registry(tool_registry, toolset_name)
+                    .await?;
+                let loaded_toolsets = self.load_toolsets();
+                Ok(ToolCallResult {
+                    content: if removed {
+                        format!("Toolset `{toolset_name}` unloaded for the current thread.")
+                    } else {
+                        format!("Toolset `{toolset_name}` was not loaded for the current thread.")
+                    },
+                    metadata: json!({
+                        "event_kind": "unload_toolset",
+                        "toolset": toolset_name,
+                        "loaded_toolsets": loaded_toolsets,
+                        "was_loaded": removed,
+                        "approval_required": false,
+                        "policy_extension_point": true,
+                    }),
+                    is_error: false,
+                })
+            }
+            _ => {
+                let context = crate::agent::ToolCallContext::for_thread(thread_id.clone());
+                if let Some(handler) = tool_registry.always_visible_handler(&request.name).await {
+                    handler.call_with_context(context, request).await
+                } else {
+                    let mut resolved_handler = None;
+                    for toolset_name in self.load_toolsets() {
+                        if let Some(handler) = tool_registry
+                            .toolset_handler(&toolset_name, &request.name)
+                            .await?
+                        {
+                            resolved_handler = Some(handler);
+                            break;
+                        }
+                    }
+                    let Some(handler) = resolved_handler else {
+                        bail!(
+                            "tool `{}` is not registered for thread `{}`",
+                            request.name,
+                            thread_id
+                        );
+                    };
+                    handler
+                        .call_with_context(
+                            crate::agent::ToolCallContext::for_thread(thread_id.clone()),
+                            request,
+                        )
+                        .await
+                }
+            }
+        };
+
+        match &result {
+            Ok(tool_result) => tracing::debug!(
+                thread_id = %thread_id,
+                tool_name = %tool_name,
+                loaded_toolset_count,
+                argument_field_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                is_error = tool_result.is_error,
+                event_kind = ?tool_result
+                    .metadata
+                    .get("event_kind")
+                    .and_then(|value| value.as_str()),
+                "completed thread-owned tool call"
+            ),
+            Err(error) => tracing::debug!(
+                thread_id = %thread_id,
+                tool_name = %tool_name,
+                loaded_toolset_count,
+                argument_field_count,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "thread-owned tool call failed"
+            ),
+        }
+        result
     }
 
     /// Execute one thread-scoped tool call through the attached global tool registry.
     pub async fn call_tool(&mut self, request: ToolCallRequest) -> Result<ToolCallResult> {
         let runtime_attachment = self.runtime_attachment()?.clone();
         runtime_attachment.ensure_tool_registry_ready().await?;
-        runtime_attachment
-            .tool_registry
-            .call_for_context(self, request)
+        self.call_tool_with_registry(&runtime_attachment.tool_registry, request)
             .await
     }
 
@@ -781,22 +1143,32 @@ impl Thread {
     ///
     /// assert_eq!(thread.messages()[0].content, "hello");
     /// ```
-    pub fn push_message(&mut self, message: ChatMessage) -> Result<()> {
+    pub fn push_message(&mut self, input: impl Into<ThreadMessageInput>) -> Result<()> {
+        let input = input.into();
+        let message = input.message;
         let turn_id = self.current_turn_mut()?.turn_id;
         info!(
             thread_id = %self.locator.thread_id,
             external_thread_id = %self.locator.external_thread_id,
             turn_id = %turn_id,
             role = message.role.as_label(),
+            scope = ?input.scope,
             tool_call_count = message.tool_calls.len(),
             has_tool_call_id = message.tool_call_id.is_some(),
             "appended formal thread message"
         );
-        if self.thread.created_at > message.created_at {
-            self.thread.created_at = message.created_at;
+        match input.scope {
+            ThreadMessageScope::PersistedHistory => {
+                if self.thread.created_at > message.created_at {
+                    self.thread.created_at = message.created_at;
+                }
+                self.thread.updated_at = message.created_at;
+                self.thread.messages.push(message);
+            }
+            ThreadMessageScope::RequestOnly => {
+                self.current_turn_mut()?.request_only_messages.push(message);
+            }
         }
-        self.thread.updated_at = message.created_at;
-        self.thread.messages.push(message);
         Ok(())
     }
 
@@ -987,6 +1359,7 @@ impl Thread {
             turn_id = %current_turn.turn_id,
             dropped_event_count = current_turn.buffered_events.len(),
             dropped_tool_event_count = current_turn.tool_events.len(),
+            dropped_request_only_message_count = current_turn.request_only_messages.len(),
             error = %error,
             message_count = self.messages().len(),
             "thread-owned turn failed without rolling back committed messages"
@@ -1132,6 +1505,7 @@ impl Thread {
             external_thread_id = %self.locator.external_thread_id,
             turn_id = %current_turn.turn_id,
             event_count = current_turn.buffered_events.len(),
+            request_only_message_count = current_turn.request_only_messages.len(),
             is_error = matches!(status, ThreadFinalizedTurnStatus::Failed { .. }),
             "finalized thread-owned turn"
         );

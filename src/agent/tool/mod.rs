@@ -516,212 +516,56 @@ impl ToolRegistry {
         definitions
     }
 
-    /// Return the thread-scoped visible tool definitions for one thread context.
-    pub async fn list_for_context(&self, thread_context: &Thread) -> Result<Vec<ToolDefinition>> {
-        self.list_for_context_with_compact(thread_context, false)
-            .await
-    }
-
-    /// Return the thread-scoped visible tool definitions and optionally expose `compact`.
-    pub async fn list_for_context_with_compact(
-        &self,
-        thread_context: &Thread,
-        compact_visible: bool,
-    ) -> Result<Vec<ToolDefinition>> {
-        let mut definitions = self.list_for_context_static(thread_context).await?;
-        if compact_visible {
-            definitions.push(compact_tool_definition());
-        }
-        definitions.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(definitions)
-    }
-
-    /// Return the thread-scoped visible tool definitions without dynamic compact projection.
-    pub async fn list_for_context_static(
-        &self,
-        thread_context: &Thread,
-    ) -> Result<Vec<ToolDefinition>> {
+    pub(crate) async fn always_visible_definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self.list().await;
-        definitions.push(load_toolset_definition());
-        definitions.push(unload_toolset_definition());
-
-        for toolset_name in thread_context.load_toolsets() {
-            definitions.extend(
-                self.resolve_toolset_handlers(&toolset_name)
-                    .await?
-                    .into_values()
-                    .map(|handler| handler.definition()),
-            );
-        }
-
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(definitions)
+        definitions
     }
 
-    /// Execute one tool request within the current thread context runtime.
-    pub async fn call_for_context(
+    pub(crate) async fn always_visible_handler(
         &self,
-        thread_context: &mut Thread,
-        request: ToolCallRequest,
-    ) -> Result<ToolCallResult> {
-        let thread_id = thread_context.locator.thread_id.clone();
-        let context = ToolCallContext::for_thread(thread_id.clone());
-        let tool_name = request.name.clone();
-        let started_at = Instant::now();
-        let loaded_toolset_count = thread_context.load_toolsets().len();
-        let argument_field_count = request
-            .arguments
-            .as_object()
-            .map(|arguments| arguments.len())
-            .unwrap_or_default();
-        debug!(
-            thread_id = %thread_id,
-            tool_name = %tool_name,
-            loaded_toolset_count,
-            argument_field_count,
-            "starting thread tool action"
-        );
-        let result = match request.name.as_str() {
-            "compact" => bail!("tool `compact` must be handled by the agent loop compact runtime"),
-            "load_toolset" => self.load_toolset(thread_context, request).await,
-            "unload_toolset" => self.unload_toolset(thread_context, request).await,
-            _ => {
-                let mut resolved_handler = self
-                    .always_visible_handlers
-                    .read()
-                    .await
-                    .get(&request.name)
-                    .cloned();
-
-                if resolved_handler.is_none() {
-                    for toolset_name in thread_context.load_toolsets() {
-                        let handlers = self.resolve_toolset_handlers(&toolset_name).await?;
-                        if let Some(handler) = handlers.get(&request.name).cloned() {
-                            resolved_handler = Some(handler);
-                            break;
-                        }
-                    }
-                }
-
-                let Some(handler) = resolved_handler else {
-                    bail!(
-                        "tool `{}` is not registered for thread `{}`",
-                        request.name,
-                        thread_id
-                    )
-                };
-                handler.call_with_context(context.clone(), request).await
-            }
-        };
-        match &result {
-            Ok(tool_result) => debug!(
-                thread_id = %thread_id,
-                tool_name = %tool_name,
-                loaded_toolset_count,
-                argument_field_count,
-                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                is_error = tool_result.is_error,
-                event_kind = ?tool_result
-                    .metadata
-                    .get("event_kind")
-                    .and_then(|value| value.as_str()),
-                "completed thread tool action"
-            ),
-            Err(error) => debug!(
-                thread_id = %thread_id,
-                tool_name = %tool_name,
-                loaded_toolset_count,
-                argument_field_count,
-                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                error = %error,
-                "thread tool action failed"
-            ),
-        }
-        result
+        tool_name: &str,
+    ) -> Option<Arc<dyn ToolHandler>> {
+        self.always_visible_handlers
+            .read()
+            .await
+            .get(tool_name)
+            .cloned()
     }
 
-    /// Open one optional tool entry for the current thread.
-    ///
-    /// At the moment this maps to loading one named toolset.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     agent::ToolRegistry,
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let registry = ToolRegistry::new();
-    /// let mut thread_context = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    ///
-    /// let _opened = registry.open_tool(&mut thread_context, "browser").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn open_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
-        let tool_name = tool_name.trim();
-        if tool_name.is_empty() {
-            bail!("open_tool requires a non-empty tool name");
-        }
-
-        self.resolve_toolset_handlers(tool_name).await?;
-        Ok(thread_context.load_toolset(tool_name))
+    pub(crate) async fn toolset_definitions(
+        &self,
+        toolset_name: &str,
+    ) -> Result<Vec<ToolDefinition>> {
+        Ok(self
+            .resolve_toolset_handlers(toolset_name)
+            .await?
+            .into_values()
+            .map(|handler| handler.definition())
+            .collect())
     }
 
-    /// Close one optional tool entry for the current thread.
-    ///
-    /// At the moment this maps to unloading one named toolset.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     agent::ToolRegistry,
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let registry = ToolRegistry::new();
-    /// let mut thread_context = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    ///
-    /// let _closed = registry.close_tool(&mut thread_context, "browser").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn close_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
-        let tool_name = tool_name.trim();
-        if tool_name.is_empty() {
-            bail!("close_tool requires a non-empty tool name");
-        }
-
-        let thread_id = thread_context.locator.thread_id.clone();
-        let is_loaded = thread_context
-            .load_toolsets()
-            .into_iter()
-            .any(|loaded_name| loaded_name == tool_name);
-        if is_loaded && let Ok(Some(runtime)) = self.resolve_toolset_runtime(tool_name).await {
-            runtime.on_unload(&thread_id).await?;
-        }
-
-        Ok(thread_context.unload_toolset(tool_name))
+    pub(crate) async fn toolset_handler(
+        &self,
+        toolset_name: &str,
+        tool_name: &str,
+    ) -> Result<Option<Arc<dyn ToolHandler>>> {
+        Ok(self
+            .resolve_toolset_handlers(toolset_name)
+            .await?
+            .get(tool_name)
+            .cloned())
     }
 
-    /// Return the compact toolset catalog prompt for one thread context.
-    pub async fn catalog_prompt_for_context(&self, thread_context: &Thread) -> Option<String> {
+    pub(crate) async fn render_toolset_catalog_prompt(
+        &self,
+        loaded_toolsets: &[String],
+    ) -> Option<String> {
         let entries = self.list_toolsets().await;
         if entries.is_empty() {
             return None;
         }
 
-        let loaded_toolsets = thread_context.load_toolsets();
         let loaded_summary = if loaded_toolsets.is_empty() {
             "none".to_string()
         } else {
@@ -736,6 +580,79 @@ impl ToolRegistry {
         Some(format!(
             "You can progressively load optional toolsets with `load_toolset` and remove them with `unload_toolset`.\nAvailable toolsets:\n{catalog}\nCurrently loaded toolsets for this thread: {loaded_summary}"
         ))
+    }
+
+    /// Compatibility wrapper that forwards thread-scoped visible tool projection back to `Thread`.
+    pub async fn list_for_context(&self, thread_context: &Thread) -> Result<Vec<ToolDefinition>> {
+        thread_context
+            .visible_tools_with_registry(self, false)
+            .await
+    }
+
+    /// Compatibility wrapper that forwards compact-aware tool projection back to `Thread`.
+    pub async fn list_for_context_with_compact(
+        &self,
+        thread_context: &Thread,
+        compact_visible: bool,
+    ) -> Result<Vec<ToolDefinition>> {
+        thread_context
+            .visible_tools_with_registry(self, compact_visible)
+            .await
+    }
+
+    /// Compatibility wrapper that forwards one thread-scoped tool call back to `Thread`.
+    pub async fn call_for_context(
+        &self,
+        thread_context: &mut Thread,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        thread_context.call_tool_with_registry(self, request).await
+    }
+
+    /// Compatibility wrapper for loading one thread-scoped toolset through `Thread`.
+    pub async fn open_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
+        self.call_for_context(
+            thread_context,
+            ToolCallRequest {
+                name: "load_toolset".to_string(),
+                arguments: json!({ "name": tool_name }),
+            },
+        )
+        .await
+        .map(|result| {
+            result
+                .metadata
+                .get("already_loaded")
+                .and_then(|value| value.as_bool())
+                .map(|already_loaded| !already_loaded)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Compatibility wrapper for unloading one thread-scoped toolset through `Thread`.
+    pub async fn close_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
+        self.call_for_context(
+            thread_context,
+            ToolCallRequest {
+                name: "unload_toolset".to_string(),
+                arguments: json!({ "name": tool_name }),
+            },
+        )
+        .await
+        .map(|result| {
+            result
+                .metadata
+                .get("was_loaded")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Compatibility wrapper that renders one thread-scoped toolset catalog prompt via `Thread`.
+    pub async fn catalog_prompt_for_context(&self, thread_context: &Thread) -> Option<String> {
+        thread_context
+            .toolset_catalog_prompt_with_registry(self)
+            .await
     }
 
     /// Return the program-defined toolset catalog entries.
@@ -850,7 +767,7 @@ impl ToolRegistry {
         }
     }
 
-    async fn resolve_toolset_runtime(
+    pub(crate) async fn toolset_runtime(
         &self,
         toolset_name: &str,
     ) -> Result<Option<Arc<dyn ToolsetRuntime>>> {
@@ -912,62 +829,6 @@ impl ToolRegistry {
         } else {
             handlers.remove("load_skill");
         }
-    }
-
-    async fn load_toolset(
-        &self,
-        thread_context: &mut Thread,
-        request: ToolCallRequest,
-    ) -> Result<ToolCallResult> {
-        let args: ManageToolsetArguments = parse_tool_arguments(request, "load_toolset")?;
-        let toolset_name = args.name.trim();
-        let inserted = self.open_tool(thread_context, toolset_name).await?;
-        let loaded_toolsets = thread_context.load_toolsets();
-
-        Ok(ToolCallResult {
-            content: if inserted {
-                format!("Toolset `{toolset_name}` loaded for the current thread.")
-            } else {
-                format!("Toolset `{toolset_name}` was already loaded for the current thread.")
-            },
-            metadata: json!({
-                "event_kind": "load_toolset",
-                "toolset": toolset_name,
-                "loaded_toolsets": loaded_toolsets,
-                "already_loaded": !inserted,
-                "approval_required": false,
-                "policy_extension_point": true,
-            }),
-            is_error: false,
-        })
-    }
-
-    async fn unload_toolset(
-        &self,
-        thread_context: &mut Thread,
-        request: ToolCallRequest,
-    ) -> Result<ToolCallResult> {
-        let args: ManageToolsetArguments = parse_tool_arguments(request, "unload_toolset")?;
-        let toolset_name = args.name.trim();
-        let removed = self.close_tool(thread_context, toolset_name).await?;
-        let loaded_toolsets = thread_context.load_toolsets();
-
-        Ok(ToolCallResult {
-            content: if removed {
-                format!("Toolset `{toolset_name}` unloaded for the current thread.")
-            } else {
-                format!("Toolset `{toolset_name}` was not loaded for the current thread.")
-            },
-            metadata: json!({
-                "event_kind": "unload_toolset",
-                "toolset": toolset_name,
-                "loaded_toolsets": loaded_toolsets,
-                "was_loaded": removed,
-                "approval_required": false,
-                "policy_extension_point": true,
-            }),
-            is_error: false,
-        })
     }
 }
 
@@ -1094,26 +955,27 @@ impl<'a> ToolRegistrySkillApi<'a> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // 仅用于生成 load/unload_toolset 的 schema，不直接在运行时读取字段。
 struct ManageToolsetArguments {
     /// Exact program-defined toolset name to load or unload.
     name: String,
 }
 
-fn load_toolset_definition() -> ToolDefinition {
+pub(crate) fn load_toolset_definition() -> ToolDefinition {
     tool_definition_from_args::<ManageToolsetArguments>(
         "load_toolset",
         "Load one program-defined toolset into the current internal thread so its tools become visible in later model steps.",
     )
 }
 
-fn unload_toolset_definition() -> ToolDefinition {
+pub(crate) fn unload_toolset_definition() -> ToolDefinition {
     tool_definition_from_args::<ManageToolsetArguments>(
         "unload_toolset",
         "Unload one program-defined toolset from the current internal thread so its tools disappear from later model steps.",
     )
 }
 
-fn compact_tool_definition() -> ToolDefinition {
+pub(crate) fn compact_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "compact".to_string(),
         description: "Compact the current thread chat history into one assistant summary plus a follow-up user continue message so the task can keep going with less context.".to_string(),

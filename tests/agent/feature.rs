@@ -9,7 +9,7 @@ use openjarvis::{
     compact::ContextBudgetReport,
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
-    thread::{Thread, ThreadContextLocator},
+    thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
 };
 use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
@@ -42,6 +42,19 @@ impl ToolHandler for DemoFeatureTool {
             is_error: false,
         })
     }
+}
+
+fn build_runtime_attachment(
+    registry: Arc<ToolRegistry>,
+    system_prompt: &str,
+) -> ThreadRuntimeAttachment {
+    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        AppConfig::default().agent_config().compact_config().clone(),
+        system_prompt,
+    ));
+    let memory_repository = registry.memory_repository();
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
 }
 
 #[tokio::test]
@@ -264,6 +277,77 @@ async fn feature_prompt_rebuilder_only_updates_live_feature_slots() {
             .messages()
             .iter()
             .any(|message| message.content.contains("<context capacity"))
+    );
+}
+
+#[tokio::test]
+async fn thread_initialization_keeps_feature_snapshot_stable_after_runtime_changes() {
+    // 测试场景: feature prompt 一旦由 Thread 初始化落盘，后续线程状态变化或重新 attach runtime 都不能覆盖旧快照。
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo toolset for stable snapshot"),
+            vec![Arc::new(DemoFeatureTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register");
+
+    let now = chrono::Utc::now();
+    let mut thread_context = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_xxx",
+            "thread_feature_snapshot",
+            "thread_feature_snapshot",
+        ),
+        now,
+    );
+    thread_context.attach_runtime(build_runtime_attachment(
+        Arc::clone(&registry),
+        "worker system prompt",
+    ));
+
+    let initialized = thread_context
+        .ensure_initialized()
+        .await
+        .expect("thread initialization should succeed");
+    let initial_catalog = thread_context
+        .system_messages()
+        .into_iter()
+        .find(|message| message.content.contains("Available toolsets"))
+        .expect("toolset catalog prompt should exist")
+        .content;
+
+    assert!(initialized);
+    assert!(initial_catalog.contains("Currently loaded toolsets for this thread: none"));
+
+    assert!(thread_context.load_toolset("demo"));
+    thread_context.attach_runtime(build_runtime_attachment(
+        Arc::clone(&registry),
+        "worker system prompt changed",
+    ));
+    let changed = thread_context
+        .ensure_initialized()
+        .await
+        .expect("re-attached runtime should keep old snapshot");
+
+    let stable_catalog = thread_context
+        .system_messages()
+        .into_iter()
+        .find(|message| message.content.contains("Available toolsets"))
+        .expect("toolset catalog prompt should still exist")
+        .content;
+
+    assert!(!changed);
+    assert_eq!(stable_catalog, initial_catalog);
+    assert!(
+        !stable_catalog.contains("Currently loaded toolsets for this thread: demo"),
+        "稳定初始化快照不能被运行时加载状态覆盖"
     );
 }
 

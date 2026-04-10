@@ -5,8 +5,7 @@ use chrono::Utc;
 use openjarvis::{
     agent::{
         FeaturePromptRebuilder, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
-        ToolRegistry,
-        ToolsetCatalogEntry, empty_tool_input_schema,
+        ToolRegistry, ToolsetCatalogEntry, empty_tool_input_schema,
     },
     config::AppConfig,
     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},

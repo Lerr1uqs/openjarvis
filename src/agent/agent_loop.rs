@@ -520,7 +520,7 @@ impl AgentLoop {
 
         let turn_completion = loop {
             ut_probe.on_loop_begin(loop_iteration, &thread_context);
-            let pre_turn_request_state = self.prepare_request_state(&thread_context).await?;
+            let pre_turn_request_state = self.prepare_request_state(&mut thread_context).await?;
             if self.should_runtime_compact(&thread_context, &pre_turn_request_state.budget_report) {
                 if let Some(outcome) = self
                     .execute_turn_compaction(
@@ -549,7 +549,7 @@ impl AgentLoop {
             }
 
             let turn_result = async {
-                let request_state = self.prepare_request_state(&thread_context).await?;
+                let request_state = self.prepare_request_state(&mut thread_context).await?;
                 ut_probe.on_request_prepared(loop_iteration, &request_state);
                 last_visible_tools = request_state.tools.clone();
                 last_budget_report = Some(request_state.budget_report.clone());
@@ -894,7 +894,10 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn prepare_request_state(&self, thread_context: &Thread) -> Result<RequestState> {
+    async fn prepare_request_state(&self, thread_context: &mut Thread) -> Result<RequestState> {
+        if thread_context.has_runtime() {
+            thread_context.refresh_request_time_memory().await?;
+        }
         let base_tools = if thread_context.has_runtime() {
             thread_context.visible_tools(false).await?
         } else {
@@ -974,7 +977,7 @@ impl AgentLoop {
         tool_call_id: Option<&str>,
         budget_report: &ContextBudgetReport,
     ) -> Result<Option<MessageCompactionOutcome>> {
-        let compactable_messages = thread_context.messages();
+        let compactable_messages = thread_context.compact_source_messages();
         if compactable_messages.is_empty() {
             let compact_event = build_compact_event(
                 reason,

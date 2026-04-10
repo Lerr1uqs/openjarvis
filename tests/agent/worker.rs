@@ -1,9 +1,12 @@
-use super::support::ThreadTestExt;
+use super::{memory::MemoryWorkspaceFixture, support::ThreadTestExt};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
-    agent::{AgentRequest, AgentRuntime, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent},
+    agent::{
+        AgentRequest, AgentRuntime, AgentWorker, AgentWorkerBuilder, AgentWorkerEvent,
+        HookRegistry, MemoryType, MemoryWriteRequest, ToolRegistry,
+    },
     config::{AppConfig, install_global_config},
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
@@ -426,6 +429,74 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
             .map(|message| message.content.as_str()),
         Some("follow up")
     );
+}
+
+#[tokio::test]
+async fn worker_does_not_directly_inject_memory_bodies_into_request_messages() {
+    // 测试场景: request-time memory 决策必须收口在 Thread；worker 不能因为命中 active keyword 就直接把正文拼进请求。
+    let sessions = SessionManager::new();
+    let fixture = MemoryWorkspaceFixture::new("openjarvis-worker-request-time-memory");
+    let registry = Arc::new(ToolRegistry::with_workspace_root_and_skill_roots(
+        fixture.root(),
+        Vec::new(),
+    ));
+    registry
+        .memory_repository()
+        .write(MemoryWriteRequest {
+            memory_type: MemoryType::Active,
+            path: "workflow/notion.md".to_string(),
+            title: "Notion 上传工作流".to_string(),
+            content: "上传到 notion 时走用户自定义模板".to_string(),
+            keywords: Some(vec!["notion".to_string(), "上传".to_string()]),
+        })
+        .expect("active memory fixture should write");
+    let runtime = AgentRuntime::with_parts(Arc::new(HookRegistry::new()), Arc::clone(&registry));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let worker = AgentWorker::with_runtime(
+        Arc::new(RecordingProvider {
+            requests: Arc::clone(&requests),
+        }),
+        "system prompt",
+        runtime,
+    );
+    let handle = worker.spawn();
+    let incoming = build_incoming("notion 上传细节是什么");
+    let locator = sessions
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+
+    handle
+        .request_tx
+        .send(AgentRequest {
+            locator,
+            incoming,
+            sessions,
+        })
+        .await
+        .expect("request should be accepted");
+
+    let events = collect_events(handle.event_rx, 4).await;
+    match &events[2] {
+        AgentWorkerEvent::TurnFinalized(turn) => {
+            assert!(turn.turn.snapshot.system_messages().iter().any(|message| {
+                message
+                    .content
+                    .contains("notion, 上传 -> workflow/notion.md")
+            }));
+        }
+        other => panic!("unexpected third event: {other:?}"),
+    }
+
+    let captured_requests = requests.lock().await;
+    assert!(captured_requests[0].messages.iter().any(|message| {
+        message
+            .content
+            .contains("notion, 上传 -> workflow/notion.md")
+    }));
+    assert!(!captured_requests[0].messages.iter().any(|message| {
+        message.content.contains("上传到 notion 时走用户自定义模板")
+    }));
 }
 
 async fn collect_events(

@@ -9,12 +9,12 @@
 
 - [x] 2.1 将 `AgentWorker` 中的线程初始化逻辑迁移为“attach runtime + 调用 `Thread::ensure_initialized()`”，移除 worker 对初始化消息的直接写入
 - [x] 2.2 调整 feature prompt 构造路径，使稳定 system/feature prompt 由 `Thread` 基于 attached feature provider 生成
-- [ ] 2.3 调整 memory 注入路径，使 request-time memory 由 `Thread` 基于 attached `MemoryRepository` 决定并通过 `push_message(...)` 进入当前 turn
-- [ ] 2.4 在 `tests/agent/worker.rs`、`tests/agent/feature.rs`、`tests/agent/memory/**` 中补充 UT，覆盖初始化快照保持稳定、memory 不由 Agent 直接注入、恢复后重新 attach runtime 的场景
+- [x] 2.3 调整 memory 注入路径，使 request-time memory 由 `Thread` 基于 attached `MemoryRepository` 决定并通过 `push_message(...)` 进入当前 turn
+- [x] 2.4 在 `tests/agent/worker.rs`、`tests/agent/feature.rs`、`tests/agent/memory/**` 中补充 UT，覆盖初始化快照保持稳定、memory 不由 Agent 直接注入、恢复后重新 attach runtime 的场景
 
 ## 3. 工具投影与工具调用下沉到 Thread
 
-- [ ] 3.1 保持 `ToolRegistry` 为全局单例目录，收敛其 thread-scoped owner 逻辑，仅保留 catalog、toolset 注册、handler 解析与全局路由职责
+- [x] 3.1 保持 `ToolRegistry` 为全局单例目录，收敛其 thread-scoped owner 逻辑，仅保留 catalog、toolset 注册、handler 解析与全局路由职责
 - [x] 3.2 在 `Thread` 上实现基于自身 loaded toolsets / feature / budget state 的 `visible_tools()` 投影入口
 - [x] 3.3 在 `Thread` 上实现通过全局 `ToolRegistry` 执行工具调用的入口，并同步更新 thread-owned tool audit 和 toolset state
 - [x] 3.4 在 `tests/agent/tool/registry.rs`、`tests/agent/tool/toolset.rs`、`tests/agent/agent_loop.rs` 中补充 UT，覆盖共享全局 registry 下的线程隔离、同一 turn 内 load/unload 生效和 thread-owned tool call 审计
