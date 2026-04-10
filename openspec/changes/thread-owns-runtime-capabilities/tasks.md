@@ -2,14 +2,14 @@
 
 - [x] 1.1 在 `src/thread.rs` 中引入 thread runtime attachment 结构，支持为 `Thread` 挂载 `ToolRegistry`、`MemoryRepository` 和 feature provider 集合
 - [x] 1.2 为 `Thread` 增加显式初始化 API，例如 `ensure_initialized()` / `is_initialized()`，替代基于空消息数组的隐式初始化判断
-- [x] 1.3 收敛消息写入接口，统一到 `push_message(...)`，并明确稳定前缀、当前 turn working set、request-only message 的内部边界
-- [x] 1.4 在 `tests/thread.rs` 与对应 support helper 中补充 UT，覆盖 attach runtime、初始化幂等、统一消息入口和 request-only message 边界
+- [x] 1.3 收敛消息写入接口，统一到 `push_message(...)`，并明确稳定前缀与当前 turn working set 的内部边界
+- [x] 1.4 在 `tests/thread.rs` 与对应 support helper 中补充 UT，覆盖 attach runtime、初始化幂等和统一消息入口边界
 
 ## 2. 初始化、Feature 与 Memory 迁移
 
 - [x] 2.1 将 `AgentWorker` 中的线程初始化逻辑迁移为“attach runtime + 调用 `Thread::ensure_initialized()`”，移除 worker 对初始化消息的直接写入
 - [x] 2.2 调整 feature prompt 构造路径，使稳定 system/feature prompt 由 `Thread` 基于 attached feature provider 生成
-- [x] 2.3 调整 memory 注入路径，使 request-time memory 由 `Thread` 基于 attached `MemoryRepository` 决定并通过 `push_message(...)` 进入当前 turn
+- [x] 2.3 删除 request-time memory 注入残留路径，确保 memory 只通过初始化 catalog 与 `memory` toolset 渐进式披露
 - [x] 2.4 在 `tests/agent/worker.rs`、`tests/agent/feature.rs`、`tests/agent/memory/**` 中补充 UT，覆盖初始化快照保持稳定、memory 不由 Agent 直接注入、恢复后重新 attach runtime 的场景
 
 ## 3. 工具投影与工具调用下沉到 Thread

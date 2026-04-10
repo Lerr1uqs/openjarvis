@@ -9,7 +9,7 @@
 - **THEN** 首版 snapshot 中包含当前 system prompt 的线程级快照
 
 ### Requirement: Agent loop SHALL 基于 `ThreadContext + current user input` 组装请求
-系统 SHALL 让 AgentLoop 主链路接收 `ThreadContext` 与当前轮 user input，而不是接收由外部预组装的 `MessageContext`。发送给 LLM 的 messages SHALL 通过 `ThreadContext.messages()` 从线程内部统一导出，AgentLoop SHALL 通过 `ThreadContext.push_message(...)` 注入 active memory、当前轮 user input 和 runtime instructions。
+系统 SHALL 让 AgentLoop 主链路接收 `ThreadContext` 与当前轮 user input，而不是接收由外部预组装的 `MessageContext`。发送给 LLM 的 messages SHALL 通过 `ThreadContext.messages()` 从线程内部统一导出，AgentLoop SHALL 通过 `ThreadContext.push_message(...)` 注入当前轮 user input 与 turn 内正式消息，而 SHALL NOT 在普通请求轮次中自动注入 active memory 正文、摘要或其他 memory recall message。
 
 #### Scenario: worker 只传当前 user input
 - **WHEN** worker 准备把某个线程请求交给 AgentLoop
@@ -25,18 +25,18 @@
 - **THEN** 落盘的 `ConversationTurn` 中只包含该轮 conversation messages
 - **THEN** 线程级 request context 不会作为重复前缀被写入每个 turn
 
-### Requirement: request context 与 request-time memory SHALL NOT 成为 compact source history
-系统 SHALL 继续只对 thread conversation 的 chat history 执行 compact。线程级 request context 和 request-time 注入的 memory SHALL NOT 被当作 compact source chat history，也 SHALL NOT 被 compact 结果替换。
+### Requirement: request context 与 active memory catalog SHALL NOT 成为 compact source history
+系统 SHALL 继续只对 thread conversation 的 chat history 执行 compact。线程级 request context 以及其中稳定持久化的 active memory catalog SHALL NOT 被当作 compact source chat history，也 SHALL NOT 被 compact 结果替换。
 
 #### Scenario: runtime compact 只替换 conversation chat history
 - **WHEN** 某个线程触发 runtime compact 或模型主动调用 `compact`
 - **THEN** compact 输入只包含该线程 conversation 中的 chat history
-- **THEN** 线程级 request context 和 request-time memory 不会出现在 compact source 或 compact replacement turn 中
+- **THEN** 线程级 request context 和 active memory catalog 不会出现在 compact source 或 compact replacement turn 中
 
-### Requirement: request-time memory SHALL 保持动态注入而非线程初始化固化
-系统 SHALL 将 memory 视为 request-time 的可选动态注入，而不是线程初始化时固定写入的 request context snapshot。即使未来接入 memory provider，memory 的存在与内容也 SHALL 由 AgentLoop 在运行时决定并通过 `ThreadContext.push_message(...)` 注入，而不是由 Router 或线程创建阶段一次性固化。
+### Requirement: memory SHALL NOT 使用 request-time 动态注入正文
+系统 SHALL 将 active memory 视为线程初始化阶段固化进 request context snapshot 的稳定 catalog，而不是普通请求轮次中的动态正文注入。模型若需要记忆详情，SHALL 通过显式加载 `memory` toolset 并调用 `memory_get`、`memory_search`、`memory_list` 等工具渐进式读取。
 
-#### Scenario: 命中 memory 时只影响当前请求
-- **WHEN** 某一轮请求命中 memory provider 并需要向 LLM 注入 memory
-- **THEN** 这些 memory messages 只会作为当前线程的 live messages 参与本轮 request 组装
-- **THEN** 它们不会被回写为线程初始化 request context 的永久内容
+#### Scenario: 命中 active memory keyword 时不会自动追加正文
+- **WHEN** 某一轮用户输入命中 active memory keyword
+- **THEN** AgentLoop 不会自动向请求中追加对应 memory 正文或摘要
+- **THEN** 模型只能通过 memory tool 渐进式读取详情

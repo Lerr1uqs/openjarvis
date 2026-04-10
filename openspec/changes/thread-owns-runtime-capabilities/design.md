@@ -7,7 +7,7 @@
 - `ToolRegistry` 既是全局工具目录，又隐含承担了部分线程运行时行为的入口。
 - memory repository、feature provider 这些本质上按 thread 生效的能力，还没有成为 `Thread` 自己的运行时依赖。
 
-这会导致一个根问题：线程相关能力虽然按 thread 隔离，但并不是由 `Thread` 自己拥有。只要后续继续增加 tool policy、memory recall、approval 或 feature prompt，职责就还会继续散在 worker/loop/runtime 之间。
+这会导致一个根问题：线程相关能力虽然按 thread 隔离，但并不是由 `Thread` 自己拥有。只要后续继续增加 tool policy、memory catalog、approval 或 feature prompt，职责就还会继续散在 worker/loop/runtime 之间。
 
 ## Goals / Non-Goals
 
@@ -17,7 +17,7 @@
 - 让线程初始化由 `Thread` 自己负责，外部模块只负责 attach runtime 和触发初始化。
 - 收敛消息写入入口，统一使用 `push_message(...)`。
 - 保持 `ToolRegistry` 为全局单例工具目录和 handler 解析层，而不是按 thread 复制 registry。
-- 让 per-thread loaded toolsets、可见工具投影、tool audit、memory 注入和 feature prompt 构造都通过 `Thread` 驱动。
+- 让 per-thread loaded toolsets、可见工具投影、tool audit、memory catalog 接线和 feature prompt 构造都通过 `Thread` 驱动。
 - 让 `AgentLoop` 只保留执行框架职责，不再直接管理 thread-scoped tool/memory/feature。
 
 **Non-Goals:**
@@ -75,7 +75,6 @@ Alternative considered:
 - assistant text
 - tool call message
 - tool result message
-- request-time memory message
 - 初始化阶段物化出的稳定 system message
 
 都应收敛到同一个 message mutation 入口。由 `Thread` 根据当前生命周期和 message scope 决定该消息进入：
@@ -126,18 +125,18 @@ Alternative considered:
 
 memory 与 feature prompt 虽然依赖全局基础设施，但行为上是 thread-scoped：
 
-- 某个线程是否注入 memory，属于该线程本轮请求视图的一部分
 - 某个线程初始化时看到什么 feature/system prompt，属于该线程自己的初始化快照
+- 某个线程初始化时看到什么 active memory catalog，也属于该线程自己的稳定 snapshot
 
 因此：
 
 - `Thread` 自己调用 attached `FeaturePromptProvider` 生成初始化 snapshot
-- `Thread` 自己调用 attached `MemoryRepository` 生成 request-time memory messages
-- `AgentLoop` 不再直接查 memory repository，也不直接重建 feature prompt
+- `Thread` 自己调用 attached `MemoryRepository` 构造初始化阶段的 active memory catalog prompt
+- `AgentLoop` 不再直接查 memory repository，也不直接重建 feature prompt，更不会自动注入 memory 正文
 
 Alternative considered:
 
-- 继续让 worker 负责 feature prompt，loop 负责 memory recall
+- 继续让 worker 负责 feature prompt，loop 负责 memory 相关接线
   Rejected，因为这是按执行阶段拆职责，不是按线程 ownership 拆职责。
 
 ### 6. `AgentLoop` 收缩为纯执行框架
@@ -183,7 +182,7 @@ Alternative considered:
 ## Risks / Trade-offs
 
 - [Risk] `Thread` 容易变成新的大对象 → Mitigation: 明确把持久化 state、current turn working set 和 runtime attachment 分层，禁止把 orchestration 逻辑塞回 `Thread`
-- [Risk] `push_message(...)` 统一入口如果没有 scope 约束，容易让持久化与 request-only message 混淆 → Mitigation: 由 `Thread` 内部维护明确的 message scope 和导出边界
+- [Risk] 旧的 request-time memory 注入残留路径会和新的渐进式披露模型冲突 → Mitigation: 显式删除 runtime memory recall 入口，只保留初始化 catalog 和 memory tool 渐进式读取
 - [Risk] ToolRegistry 去线程 owner 化后会牵动较多调用点和测试 → Mitigation: 先保留兼容转发层，分批迁移到 `Thread` API
 - [Risk] memory/feature 下沉到 `Thread` 后，初始化和请求期流程会更依赖 runtime attachment 完整性 → Mitigation: 为未 attach 状态提供显式错误，而不是静默降级
 
@@ -193,7 +192,7 @@ Alternative considered:
 2. 将 worker 中的初始化逻辑迁移为 `Thread::ensure_initialized()` 调用，移除 worker 对稳定前缀的直接写入。
 3. 收敛消息写入路径，统一迁移到 `push_message(...)`。
 4. 将可见工具投影与工具调用入口从 `AgentLoop`/runtime 下沉到 `Thread`，保留 `ToolRegistry` 全局目录职责。
-5. 将 memory recall 和 feature prompt 构造从 worker/loop 迁移到 `Thread` runtime attachment。
+5. 将 memory catalog 构造和 feature prompt 构造从 worker/loop 迁移到 `Thread` runtime attachment，并删除 request-time memory 注入残留路径。
 6. 让 `AgentLoop` 只通过 `Thread` API 驱动一次 turn。
 7. 更新 session restore、thread、worker、agent loop、tool registry 和 memory 相关测试。
 
@@ -205,4 +204,3 @@ Rollback strategy:
 
 - `push_message(...)` 是否需要显式 scope 参数，还是由当前生命周期和 message role 推导即可
 - `Thread` 未 attach runtime 时，`messages()` 是否允许只返回持久化视图，还是一律对需要 runtime 的入口报错
-- memory request-only message 是否需要进入 `Thread` 的显式当前 turn 子结构，还是只通过 message scope 标记即可

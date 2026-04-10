@@ -433,7 +433,7 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
 
 #[tokio::test]
 async fn worker_does_not_directly_inject_memory_bodies_into_request_messages() {
-    // 测试场景: request-time memory 决策必须收口在 Thread；worker 不能因为命中 active keyword 就直接把正文拼进请求。
+    // 测试场景: active memory 只以初始化 catalog 形式暴露；worker 不能因为命中 keyword 就直接把正文拼进请求。
     let sessions = SessionManager::new();
     let fixture = MemoryWorkspaceFixture::new("openjarvis-worker-request-time-memory");
     let registry = Arc::new(ToolRegistry::with_workspace_root_and_skill_roots(

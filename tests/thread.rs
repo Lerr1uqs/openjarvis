@@ -7,8 +7,8 @@ use openjarvis::{
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     thread::{
-        Thread, ThreadContextLocator, ThreadFinalizedTurnStatus, ThreadMessageInput,
-        ThreadRuntimeAttachment, ThreadToolEvent, ThreadToolEventKind, derive_internal_thread_id,
+        Thread, ThreadContextLocator, ThreadFinalizedTurnStatus, ThreadRuntimeAttachment,
+        ThreadToolEvent, ThreadToolEventKind, derive_internal_thread_id,
     },
 };
 use serde_json::json;
@@ -204,39 +204,6 @@ fn finalize_turn_failure_drops_inflight_turn_contents() {
             .content
             .contains("[openjarvis][agent_error]")
     );
-}
-
-#[test]
-fn request_only_messages_stay_in_request_view_but_do_not_persist_after_turn() {
-    // 测试场景: request-only message 只应存在于当前 turn 的请求视图中，turn 结束后不能污染持久化历史。
-    let now = Utc::now();
-    let mut thread = build_thread("thread_request_only");
-    thread
-        .begin_turn(Some("msg_request_only".to_string()), now)
-        .expect("turn should start");
-    thread
-        .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-        .expect("persisted user message should append");
-    thread
-        .push_message(ThreadMessageInput::request_only(ChatMessage::new(
-            ChatMessageRole::System,
-            "runtime memory prompt",
-            now,
-        )))
-        .expect("request-only memory should enter request view");
-
-    assert_eq!(thread.messages().len(), 2);
-    assert_eq!(thread.compact_source_messages().len(), 1);
-    assert!(thread.messages().iter().any(|message| {
-        message.role == ChatMessageRole::System && message.content == "runtime memory prompt"
-    }));
-
-    let finalized = thread
-        .finalize_turn_success("ok", now)
-        .expect("turn should finalize");
-
-    assert_eq!(finalized.snapshot.messages().len(), 1);
-    assert_eq!(finalized.snapshot.messages()[0].content, "hello");
 }
 
 #[test]

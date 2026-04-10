@@ -27,7 +27,7 @@
 - **THEN** loop 会通过 `Thread.call_tool(...)` 触发线程工具调用，而不是直接调用全局 runtime service
 
 ### Requirement: 线程级 request context SHALL 与 conversation history 分层
-系统 SHALL 在 `Thread` 内同时持有稳定 request context、已持久化 conversation history、当前 turn working set 和 runtime-only attachment，但这些边界的 ownership SHALL 全部归 `Thread`。`Thread.messages()` SHALL 返回当前线程完整请求视图；持久化 history、system prefix 与当前 turn request-only messages 的导出边界 MUST 由 `Thread` 显式控制，而不是由外部模块拼接消息向量。
+系统 SHALL 在 `Thread` 内同时持有稳定 request context、已持久化 conversation history、当前 turn working set 和 runtime-only attachment，但这些边界的 ownership SHALL 全部归 `Thread`。`Thread.messages()` SHALL 返回当前线程完整请求视图；持久化 history、system prefix 与当前 turn working set 的导出边界 MUST 由 `Thread` 显式控制，而不是由外部模块拼接消息向量。
 
 #### Scenario: 请求视图由 thread 统一导出
 - **WHEN** AgentLoop 需要为当前 turn 构造一次 LLM request
@@ -39,21 +39,21 @@
 - **THEN** 持久化快照中只包含 declarative thread state
 - **THEN** tool registry、memory repository 和 feature provider 这类 runtime attachment 不会被直接持久化
 
-### Requirement: request context 与 request-time memory SHALL NOT 成为 compact source history
-系统 SHALL 继续保证稳定 request context 不进入 compact source history。通过 `Thread.push_message(...)` 注入的 request-time memory 或其他 request-only runtime messages，只有在被 `Thread` 显式物化为 finalized turn history 后，才可以成为后续 compact source；未物化前 SHALL NOT 被 compact。
+### Requirement: request context 与 active memory catalog SHALL NOT 成为 compact source history
+系统 SHALL 继续保证稳定 request context 不进入 compact source history。active memory catalog 作为初始化阶段固化的 system snapshot 组成部分，也 SHALL NOT 被当作 compact source 或 compact 替换目标。
 
-#### Scenario: request-only memory 不会被提前 compact
-- **WHEN** 当前线程在一次请求中通过 attached memory repository 注入了 request-only memory message
-- **THEN** 该 memory message 会出现在当前 turn 的请求视图中
-- **THEN** 在它未被物化为 finalized history 前，不会进入 compact source
+#### Scenario: active memory catalog 不参与 compact
+- **WHEN** 当前线程已经在初始化阶段持有 active memory catalog system prompt，后续又触发 compact
+- **THEN** compact 输入只包含普通 conversation chat history
+- **THEN** active memory catalog 不会进入 compact source 或 compact replacement
 
-### Requirement: request-time memory SHALL 保持动态注入而非线程初始化固化
-系统 SHALL 将 memory 视为 `Thread` 当前 turn 的动态注入内容，而不是线程初始化阶段的固定 snapshot。即使 future memory provider 接入，memory 的查询、选择和注入也 SHALL 由 `Thread` 基于其 attached `MemoryRepository` 决定，并通过 `push_message(...)` 进入当前 turn 请求视图；AgentLoop SHALL NOT 直接查询 memory repository。
+### Requirement: memory SHALL NOT 保留 request-time 动态注入残留路径
+系统 SHALL 将 active memory 固定为线程初始化阶段的稳定 catalog snapshot，并通过 memory tool 渐进式披露正文。普通请求轮次中 SHALL NOT 再保留 request-time memory 注入、request-only memory message 或同类 runtime recall 路径；AgentLoop 与 `Thread` 都 SHALL NOT 在运行时自动查询 repository 并把 memory 正文拼进请求。
 
-#### Scenario: 命中 memory 时由 thread 自行注入
-- **WHEN** 某一轮请求命中 memory repository 并需要向模型注入 memory
-- **THEN** 由 `Thread` 自己从 attached repository 读取并注入这些 messages
-- **THEN** AgentLoop 不会绕过 `Thread` 直接把 memory message 拼进请求
+#### Scenario: 命中 active keyword 时不自动注入正文
+- **WHEN** 某一轮用户输入命中 active memory keyword
+- **THEN** 当前请求不会自动追加对应 memory 正文或摘要
+- **THEN** 模型若需要详情，只能显式调用 `memory` toolset
 
 ## ADDED Requirements
 
@@ -61,12 +61,12 @@
 系统 SHALL 要求任何进入 thread 请求视图的消息都通过统一的 `Thread.push_message(...)` 入口写入。外部模块 SHALL NOT 再按 user/tool/memory/system 分别调用多套 message mutation API。
 
 #### Scenario: turn 内所有消息都走统一入口
-- **WHEN** 当前 turn 先后写入 user message、assistant text、tool result 和 request-time memory
+- **WHEN** 当前 turn 先后写入 user message、assistant text 和 tool result
 - **THEN** 这些消息都会通过 `Thread.push_message(...)` 进入 thread 当前视图
 - **THEN** 它们后续是否持久化、是否参与 compact 由 `Thread` 自己决定
 
 ### Requirement: Thread SHALL 挂载 thread-scoped runtime service 并自行使用
-系统 SHALL 允许 `Thread` 在运行时挂载 thread-scoped runtime service，包括全局 `ToolRegistry`、`MemoryRepository` 和 feature provider 集合。一旦挂载完成，线程初始化、memory 注入、工具可见性计算和工具调用 SHALL 由 `Thread` 自己通过这些 service 执行，而不是由 AgentLoop 或 Worker 直接调用这些 service。
+系统 SHALL 允许 `Thread` 在运行时挂载 thread-scoped runtime service，包括全局 `ToolRegistry`、`MemoryRepository` 和 feature provider 集合。一旦挂载完成，线程初始化阶段的 active memory catalog 构造、工具可见性计算和工具调用 SHALL 由 `Thread` 自己通过这些 service 执行，而不是由 AgentLoop 或 Worker 直接调用这些 service。
 
 #### Scenario: 线程恢复后重新挂载 runtime service
 - **WHEN** 某个线程从持久化 store 恢复到内存并准备处理下一轮请求

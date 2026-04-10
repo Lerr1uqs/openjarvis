@@ -54,55 +54,6 @@ where
     names
 }
 
-/// Message visibility scope owned by the current thread turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadMessageScope {
-    PersistedHistory,
-    RequestOnly,
-}
-
-/// One unified thread message write request routed through `Thread::push_message(...)`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadMessageInput {
-    pub message: ChatMessage,
-    pub scope: ThreadMessageScope,
-}
-
-impl ThreadMessageInput {
-    /// Wrap one message as a request-only input that only lives in the current request view.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{ThreadMessageInput, ThreadMessageScope},
-    /// };
-    ///
-    /// let input = ThreadMessageInput::request_only(ChatMessage::new(
-    ///     ChatMessageRole::System,
-    ///     "runtime memory",
-    ///     Utc::now(),
-    /// ));
-    /// assert_eq!(input.scope, ThreadMessageScope::RequestOnly);
-    /// ```
-    pub fn request_only(message: ChatMessage) -> Self {
-        Self {
-            message,
-            scope: ThreadMessageScope::RequestOnly,
-        }
-    }
-}
-
-impl From<ChatMessage> for ThreadMessageInput {
-    fn from(message: ChatMessage) -> Self {
-        Self {
-            message,
-            scope: ThreadMessageScope::PersistedHistory,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ThreadToolEventKind {
     LoadToolset,
@@ -196,7 +147,6 @@ struct ThreadCurrentTurn {
     started_at: DateTime<Utc>,
     buffered_events: Vec<ThreadTurnEvent>,
     tool_events: Vec<ThreadToolEvent>,
-    request_only_messages: Vec<ChatMessage>,
 }
 
 impl ThreadCurrentTurn {
@@ -207,7 +157,6 @@ impl ThreadCurrentTurn {
             started_at,
             buffered_events: Vec::new(),
             tool_events: Vec::new(),
-            request_only_messages: Vec::new(),
         }
     }
 }
@@ -610,21 +559,17 @@ impl Thread {
     /// assert_eq!(thread.messages()[0].content, "hello");
     /// ```
     pub fn messages(&self) -> Vec<ChatMessage> {
-        let mut messages = self.thread.messages();
-        if let Some(current_turn) = &self.current_turn {
-            messages.extend(current_turn.request_only_messages.clone());
-        }
-        messages
+        self.thread.messages()
     }
 
-    /// Export the compact source message sequence without request-only runtime messages.
+    /// Export the compact source message sequence used by runtime compaction.
     ///
     /// # 示例
     /// ```rust
     /// use chrono::Utc;
     /// use openjarvis::{
     ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator, ThreadMessageInput},
+    ///     thread::{Thread, ThreadContextLocator},
     /// };
     ///
     /// let now = Utc::now();
@@ -635,16 +580,8 @@ impl Thread {
     /// thread.begin_turn(Some("msg_1".to_string()), now).expect("turn should start");
     /// thread
     ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .expect("persisted message should append");
-    /// thread
-    ///     .push_message(ThreadMessageInput::request_only(ChatMessage::new(
-    ///         ChatMessageRole::System,
-    ///         "runtime memory",
-    ///         now,
-    ///     )))
-    ///     .expect("request-only message should append");
+    ///     .expect("message should append");
     ///
-    /// assert_eq!(thread.messages().len(), 2);
     /// assert_eq!(thread.compact_source_messages().len(), 1);
     /// ```
     pub fn compact_source_messages(&self) -> Vec<ChatMessage> {
@@ -740,70 +677,6 @@ impl Thread {
     /// Return the memory repository attached to the current live thread runtime.
     pub fn memory_repository(&self) -> Result<Arc<MemoryRepository>> {
         Ok(Arc::clone(&self.runtime_attachment()?.memory_repository))
-    }
-
-    /// Refresh request-time memory messages for the current turn.
-    ///
-    /// 当前 memory 语义仍然遵循“渐进式披露”原则:
-    /// repository 不会根据关键词自动把正文塞进请求；因此这个入口目前只负责把
-    /// request-time memory 的 ownership 固定在 `Thread`，并在未来真正需要注入时通过
-    /// `push_message(...)` 写入 request-only working set。
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
-    ///     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
-    /// };
-    /// use std::sync::Arc;
-    ///
-    /// let tool_registry = Arc::new(ToolRegistry::new());
-    /// let memory_repository = Arc::new(MemoryRepository::new("."));
-    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
-    ///     Arc::clone(&tool_registry),
-    ///     Default::default(),
-    ///     "",
-    /// ));
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    /// thread.attach_runtime(ThreadRuntimeAttachment::new(
-    ///     tool_registry,
-    ///     memory_repository,
-    ///     feature_prompt_rebuilder,
-    ///     false,
-    /// ));
-    /// thread.begin_turn(Some("msg_1".to_string()), Utc::now())?;
-    ///
-    /// let injected = thread.refresh_request_time_memory().await?;
-    /// assert_eq!(injected, 0);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn refresh_request_time_memory(&mut self) -> Result<usize> {
-        let memory_repository = self.memory_repository()?;
-        let memory_messages = memory_repository.build_request_time_messages(self)?;
-        let current_turn = self.current_turn_mut()?;
-        current_turn.request_only_messages.clear();
-        let turn_id = current_turn.turn_id;
-        let memory_root = memory_repository.memory_root();
-        let mut injected_count = 0usize;
-        for memory_message in memory_messages {
-            self.push_message(ThreadMessageInput::request_only(memory_message))?;
-            injected_count += 1;
-        }
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            turn_id = %turn_id,
-            request_time_memory_count = injected_count,
-            memory_root = %memory_root.display(),
-            "refreshed thread-owned request-time memory messages"
-        );
-        Ok(injected_count)
     }
 
     /// Replace the current persisted message sequence.
@@ -1143,32 +1016,22 @@ impl Thread {
     ///
     /// assert_eq!(thread.messages()[0].content, "hello");
     /// ```
-    pub fn push_message(&mut self, input: impl Into<ThreadMessageInput>) -> Result<()> {
-        let input = input.into();
-        let message = input.message;
+    pub fn push_message(&mut self, message: ChatMessage) -> Result<()> {
         let turn_id = self.current_turn_mut()?.turn_id;
         info!(
             thread_id = %self.locator.thread_id,
             external_thread_id = %self.locator.external_thread_id,
             turn_id = %turn_id,
             role = message.role.as_label(),
-            scope = ?input.scope,
             tool_call_count = message.tool_calls.len(),
             has_tool_call_id = message.tool_call_id.is_some(),
             "appended formal thread message"
         );
-        match input.scope {
-            ThreadMessageScope::PersistedHistory => {
-                if self.thread.created_at > message.created_at {
-                    self.thread.created_at = message.created_at;
-                }
-                self.thread.updated_at = message.created_at;
-                self.thread.messages.push(message);
-            }
-            ThreadMessageScope::RequestOnly => {
-                self.current_turn_mut()?.request_only_messages.push(message);
-            }
+        if self.thread.created_at > message.created_at {
+            self.thread.created_at = message.created_at;
         }
+        self.thread.updated_at = message.created_at;
+        self.thread.messages.push(message);
         Ok(())
     }
 
@@ -1359,7 +1222,6 @@ impl Thread {
             turn_id = %current_turn.turn_id,
             dropped_event_count = current_turn.buffered_events.len(),
             dropped_tool_event_count = current_turn.tool_events.len(),
-            dropped_request_only_message_count = current_turn.request_only_messages.len(),
             error = %error,
             message_count = self.messages().len(),
             "thread-owned turn failed without rolling back committed messages"
@@ -1505,7 +1367,6 @@ impl Thread {
             external_thread_id = %self.locator.external_thread_id,
             turn_id = %current_turn.turn_id,
             event_count = current_turn.buffered_events.len(),
-            request_only_message_count = current_turn.request_only_messages.len(),
             is_error = matches!(status, ThreadFinalizedTurnStatus::Failed { .. }),
             "finalized thread-owned turn"
         );

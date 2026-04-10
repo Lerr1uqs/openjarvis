@@ -895,9 +895,6 @@ impl AgentLoop {
     }
 
     async fn prepare_request_state(&self, thread_context: &mut Thread) -> Result<RequestState> {
-        if thread_context.has_runtime() {
-            thread_context.refresh_request_time_memory().await?;
-        }
         let base_tools = if thread_context.has_runtime() {
             thread_context.visible_tools(false).await?
         } else {
