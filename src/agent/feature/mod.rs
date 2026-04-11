@@ -146,9 +146,9 @@ impl FeaturePromptProvider for ToolsetCatalogFeaturePromptProvider {
             TOOL_USE_MODE_PROMPT,
             context.created_at,
         )];
-        if let Some(catalog_prompt) = self
-            .tool_registry
-            .catalog_prompt_for_context(context.thread_context)
+        if let Some(catalog_prompt) = context
+            .thread_context
+            .toolset_catalog_prompt_with_registry(&self.tool_registry)
             .await
         {
             messages.push(ChatMessage::new(

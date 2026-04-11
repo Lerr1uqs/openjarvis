@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
             .await?;
     }
 
-    let definitions = registry.list_for_context_static(&thread_context).await?;
+    let definitions = registry.list_for_context(&thread_context).await?;
     let dump = ToolSchemaDump {
         workspace_root: args.workspace_root.display().to_string(),
         loaded_toolsets: thread_context.load_toolsets(),

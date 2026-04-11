@@ -10,7 +10,7 @@
 
 - 维护工作区下 `./.openjarvis/memory` 的事实来源。
 - 区分 `active memory` 和 `passive memory` 两类记忆。
-- 在 thread 初始化或重初始化时，为 `active memory` 派生稳定的 `keyword -> path` catalog。
+- 在 thread 初始化或重初始化时，为 `active memory` 派生稳定的 `keyword -> path` catalog 注入模型。
 - 通过 `memory` toolset 提供 `memory_get`、`memory_search`、`memory_write`、`memory_list`。
 
 ## 严格边界
@@ -51,8 +51,8 @@
 ## 运行时接线
 
 - Worker 在 thread 初始化时从 `MemoryRepository` 读取 active memory，并构造稳定的 catalog system prompt。
-- 这个 catalog 会持久化进 `Thread.system_prefix_messages()`，和其他固定 feature prompt 一起成为线程快照的一部分。
-- `AgentLoop` 在普通请求轮次中不会因为用户命中 keyword 自动追加 memory 正文或摘要。
+- 这个 catalog 会持久化进 `Thread` 的system prompt，和其他固定 feature prompt 一起成为线程快照的一部分。
+- `AgentLoop` 在普通请求轮次中不会因为用户命中 keyword 自动追加 memory 正文或摘要（这是以前的提案，现在废弃了）。
 - 模型若需要记忆详情，应先加载 `memory` toolset，再用 `memory_get` 或 `memory_search` 等工具逐步读取。
 
 ## 渐进式披露原则

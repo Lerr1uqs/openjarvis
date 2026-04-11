@@ -122,19 +122,50 @@ impl AgentRuntime {
         thread_context: &Thread,
         compact_visible: bool,
     ) -> Result<Vec<ToolDefinition>> {
-        self.tools
-            .list_for_context_with_compact(thread_context, compact_visible)
+        thread_context
+            .visible_tools_with_registry(&self.tools, compact_visible)
             .await
     }
 
     /// Open one optional tool entry for the current thread.
     pub async fn open_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
-        self.tools.open_tool(thread_context, tool_name).await
+        thread_context
+            .call_tool_with_registry(
+                &self.tools,
+                ToolCallRequest {
+                    name: "load_toolset".to_string(),
+                    arguments: serde_json::json!({ "name": tool_name }),
+                },
+            )
+            .await
+            .map(|result| {
+                result
+                    .metadata
+                    .get("already_loaded")
+                    .and_then(|value| value.as_bool())
+                    .map(|already_loaded| !already_loaded)
+                    .unwrap_or(false)
+            })
     }
 
     /// Close one optional tool entry for the current thread.
     pub async fn close_tool(&self, thread_context: &mut Thread, tool_name: &str) -> Result<bool> {
-        self.tools.close_tool(thread_context, tool_name).await
+        thread_context
+            .call_tool_with_registry(
+                &self.tools,
+                ToolCallRequest {
+                    name: "unload_toolset".to_string(),
+                    arguments: serde_json::json!({ "name": tool_name }),
+                },
+            )
+            .await
+            .map(|result| {
+                result
+                    .metadata
+                    .get("was_loaded")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            })
     }
 
     /// Execute one runtime-managed tool call inside the current thread.
@@ -143,7 +174,9 @@ impl AgentRuntime {
         thread_context: &mut Thread,
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
-        self.tools.call_for_context(thread_context, request).await
+        thread_context
+            .call_tool_with_registry(&self.tools, request)
+            .await
     }
 }
 

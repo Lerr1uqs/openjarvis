@@ -520,7 +520,7 @@ impl AgentLoop {
 
         let turn_completion = loop {
             ut_probe.on_loop_begin(loop_iteration, &thread_context);
-            let pre_turn_request_state = self.prepare_request_state(&thread_context).await?;
+            let pre_turn_request_state = self.prepare_request_state(&mut thread_context).await?;
             if self.should_runtime_compact(&thread_context, &pre_turn_request_state.budget_report) {
                 if let Some(outcome) = self
                     .execute_turn_compaction(
@@ -549,7 +549,7 @@ impl AgentLoop {
             }
 
             let turn_result = async {
-                let request_state = self.prepare_request_state(&thread_context).await?;
+                let request_state = self.prepare_request_state(&mut thread_context).await?;
                 ut_probe.on_request_prepared(loop_iteration, &request_state);
                 last_visible_tools = request_state.tools.clone();
                 last_budget_report = Some(request_state.budget_report.clone());
@@ -883,6 +883,9 @@ impl AgentLoop {
     }
 
     async fn prepare_thread_runtime(&self, thread_context: &mut Thread) -> Result<()> {
+        if thread_context.has_runtime() {
+            return Ok(());
+        }
         info!(
             thread_id = %thread_context.locator.thread_id,
             "preparing thread runtime"
@@ -891,8 +894,12 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn prepare_request_state(&self, thread_context: &Thread) -> Result<RequestState> {
-        let base_tools = self.runtime.list_tools(thread_context, false).await?;
+    async fn prepare_request_state(&self, thread_context: &mut Thread) -> Result<RequestState> {
+        let base_tools = if thread_context.has_runtime() {
+            thread_context.visible_tools(false).await?
+        } else {
+            self.runtime.list_tools(thread_context, false).await?
+        };
         let messages = thread_context.messages();
         let base_budget_report = self.budget_estimator.estimate(&messages, &base_tools);
         let compact_visible = self.auto_compact_enabled_for_thread(thread_context)
@@ -900,7 +907,11 @@ impl AgentLoop {
                 .auto_compactor
                 .compact_tool_visible(&base_budget_report);
         let tools = if compact_visible {
-            self.runtime.list_tools(thread_context, true).await?
+            if thread_context.has_runtime() {
+                thread_context.visible_tools(true).await?
+            } else {
+                self.runtime.list_tools(thread_context, true).await?
+            }
         } else {
             base_tools
         };
@@ -944,9 +955,13 @@ impl AgentLoop {
         thread_context: &mut Thread,
         tool_call: &ToolCallRequest,
     ) -> Result<super::ToolCallResult> {
-        self.runtime
-            .call_tool(thread_context, tool_call.clone())
-            .await
+        if thread_context.has_runtime() {
+            thread_context.call_tool(tool_call.clone()).await
+        } else {
+            self.runtime
+                .call_tool(thread_context, tool_call.clone())
+                .await
+        }
     }
 
     async fn execute_turn_compaction(
@@ -959,7 +974,7 @@ impl AgentLoop {
         tool_call_id: Option<&str>,
         budget_report: &ContextBudgetReport,
     ) -> Result<Option<MessageCompactionOutcome>> {
-        let compactable_messages = thread_context.messages();
+        let compactable_messages = thread_context.compact_source_messages();
         if compactable_messages.is_empty() {
             let compact_event = build_compact_event(
                 reason,
@@ -1285,7 +1300,7 @@ async fn commit_message<H>(
 where
     H: AgentCommittedMessageHandler,
 {
-    thread_context.append_message(message.clone())?;
+    thread_context.push_message(message.clone())?;
     for event in &turn_events {
         thread_context.buffer_turn_event(event.clone())?;
     }

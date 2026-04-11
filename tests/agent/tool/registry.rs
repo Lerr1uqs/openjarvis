@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
-        ToolsetCatalogEntry, empty_tool_input_schema,
+        FeaturePromptRebuilder, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
+        ToolRegistry, ToolsetCatalogEntry, empty_tool_input_schema,
     },
-    thread::{Thread, ThreadContextLocator},
+    config::AppConfig,
+    thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -32,6 +33,16 @@ impl ToolHandler for DemoRegistryTool {
             is_error: false,
         })
     }
+}
+
+fn build_runtime_attachment(registry: Arc<ToolRegistry>) -> ThreadRuntimeAttachment {
+    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        AppConfig::default().agent_config().compact_config().clone(),
+        "system prompt",
+    ));
+    let memory_repository = registry.memory_repository();
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
 }
 
 #[tokio::test]
@@ -139,4 +150,62 @@ async fn thread_state_is_loaded_from_thread_snapshot_only() {
             .any(|tool| tool.name == "demo__echo")
     );
     assert_eq!(loaded_thread.load_toolsets(), vec!["demo".to_string()]);
+}
+
+#[tokio::test]
+async fn thread_wrapper_visible_tools_uses_shared_registry_with_thread_scoped_state() {
+    // 测试场景: Thread.visible_tools() 应基于自己的 loaded toolsets 投影工具，而不是要求 Agent 直接碰 registry。
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo registry toolset"),
+            vec![Arc::new(DemoRegistryTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+
+    let mut thread_context = build_thread("thread_wrapper_visible");
+    thread_context.attach_runtime(build_runtime_attachment(Arc::clone(&registry)));
+    assert!(thread_context.load_toolset("demo"));
+
+    let tools = thread_context
+        .visible_tools(false)
+        .await
+        .expect("thread wrapper should project visible tools");
+
+    assert!(tools.iter().any(|tool| tool.name == "demo__echo"));
+}
+
+#[tokio::test]
+async fn thread_wrapper_call_tool_executes_with_thread_owned_audit() {
+    // 测试场景: Thread.call_tool() 应通过共享 registry 执行工具，并把加载状态保留在线程自身。
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("demo", "Demo registry toolset"),
+            vec![Arc::new(DemoRegistryTool)],
+        )
+        .await
+        .expect("demo toolset should register");
+
+    let mut thread_context = build_thread("thread_wrapper_call");
+    thread_context.attach_runtime(build_runtime_attachment(Arc::clone(&registry)));
+    let load_result = thread_context
+        .call_tool(ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "demo" }),
+        })
+        .await
+        .expect("thread should load demo toolset through wrapper");
+    let tool_result = thread_context
+        .call_tool(ToolCallRequest {
+            name: "demo__echo".to_string(),
+            arguments: json!({}),
+        })
+        .await
+        .expect("thread wrapper should execute routed tool");
+
+    assert_eq!(load_result.metadata["loaded_toolsets"], json!(["demo"]));
+    assert_eq!(tool_result.content, "registry-demo");
+    assert_eq!(thread_context.load_toolsets(), vec!["demo".to_string()]);
 }

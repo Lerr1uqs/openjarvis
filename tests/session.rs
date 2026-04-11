@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
-        ToolsetCatalogEntry, empty_tool_input_schema,
+        FeaturePromptRebuilder, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
+        ToolRegistry, ToolsetCatalogEntry, empty_tool_input_schema,
     },
+    config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ChatToolCall},
     model::{IncomingMessage, ReplyTarget},
     session::{
@@ -16,8 +17,8 @@ use openjarvis::{
         SqliteSessionStore,
     },
     thread::{
-        Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
-        derive_internal_thread_id,
+        Thread, ThreadContextLocator, ThreadRuntimeAttachment, ThreadToolEvent,
+        ThreadToolEventKind, derive_internal_thread_id,
     },
 };
 use serde_json::json;
@@ -54,6 +55,17 @@ impl Drop for SessionSqliteFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn build_runtime_attachment(system_prompt: &str) -> ThreadRuntimeAttachment {
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        AppConfig::default().agent_config().compact_config().clone(),
+        system_prompt,
+    ));
+    let memory_repository = registry.memory_repository();
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
 }
 
 #[async_trait]
@@ -441,6 +453,50 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
     assert_eq!(loaded.load_tool_events().len(), 1);
     assert!(thread_state.thread_context.is_some());
     assert_eq!(thread_state.loaded_toolsets, vec!["demo".to_string()]);
+}
+
+#[tokio::test]
+async fn memory_store_load_does_not_rehydrate_runtime_attachment() {
+    // 测试场景: runtime attachment 只属于 live thread，跨 store 恢复后必须重新 attach。
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let manager_a = SessionManager::with_store(Arc::clone(&store))
+        .await
+        .expect("manager_a should initialize");
+    let manager_b = SessionManager::with_store(Arc::clone(&store))
+        .await
+        .expect("manager_b should initialize");
+    let incoming = build_incoming("msg_runtime_restore", "hello runtime");
+    let locator = manager_a
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+    let now = Utc::now();
+    let mut thread_context = Thread::new(ThreadContextLocator::from(&locator), now);
+    thread_context.attach_runtime(build_runtime_attachment("system prompt"));
+    thread_context
+        .ensure_initialized()
+        .await
+        .expect("thread should initialize with attached runtime");
+
+    manager_a
+        .store_thread_context(&locator, thread_context, now)
+        .await
+        .expect("thread context should store");
+
+    let restored = manager_b
+        .load_thread_context(&locator)
+        .await
+        .expect("thread context should load")
+        .expect("restored thread should exist");
+
+    assert!(!restored.has_runtime());
+    assert!(restored.is_initialized());
+    assert!(
+        restored
+            .system_messages()
+            .iter()
+            .any(|message| message.content == "system prompt")
+    );
 }
 
 #[tokio::test]

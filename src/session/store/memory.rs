@@ -129,6 +129,7 @@ impl SessionStore for MemorySessionStore {
 
         let new_revision = actual_revision + 1;
         let mut stored = thread_context.clone();
+        stored.detach_runtime();
         stored.set_revision(new_revision);
         state.threads.insert(thread_id, stored);
         let session = state
