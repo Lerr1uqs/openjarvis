@@ -4,7 +4,7 @@
 
 ## What Changes
 
-- **BREAKING** 将 agent 对外发送语义从“finalized turn event batch”改为“message / event 级 committed 后立即发送”。
+- **BREAKING** 将 agent 对外发送语义从“finalized turn event batch”改为“单条 message / event committed 后立即发送”，不再把 tool call 与 tool result 打包成对发送。
 - 保留 `Thread` 作为消息 owner，但把“对外发送边界”与“turn 最终持久化边界”解耦。
 - 调整 `AgentLoop`、`Worker`、`Router` 和 `Session` 的协作方式，使文本输出、tool 事件和失败通知可以按顺序逐条发送。
 - 定义失败 turn 在 message 级发送模型下的收尾规则，明确哪些结果已经外发、哪些状态只进入最终 snapshot。

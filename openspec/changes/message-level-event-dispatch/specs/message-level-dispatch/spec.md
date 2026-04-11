@@ -1,12 +1,18 @@
 ## ADDED Requirements
 
-### Requirement: 系统 SHALL 按 committed message / event 级别对外发送结果
-系统 SHALL 在当前 turn 执行期间，按 committed message / event 级别对外发送用户可见结果，而不是等待 turn finalization 后再统一发送。只要某条 assistant text、tool 事件、tool 结果或失败通知已经进入 `Thread` 的正式当前 turn state，并完成对应 checkpoint，它就可以成为可外发 dispatch item。
+### Requirement: 系统 SHALL 按单条 committed message / event 级别对外发送结果
+系统 SHALL 在当前 turn 执行期间，按单条 committed message / event 级别对外发送用户可见结果，而不是等待 turn finalization 后再统一发送。只要某条 assistant text、tool 事件、tool 结果或失败通知已经进入 `Thread` 的正式当前 turn state，并完成对应 checkpoint，它就可以成为可外发 dispatch item。tool call 与 tool result SHALL 分别作为独立 dispatch item 发送，而 SHALL NOT 被要求成对打包后再发送。
 
 #### Scenario: 文本输出在 turn 未结束前即可发送
 - **WHEN** AgentLoop 在当前 turn 内生成了一条新的 assistant 文本消息，且该消息已经写入 `Thread`
 - **THEN** 系统会将该消息作为新的 dispatch item 对外发送
 - **THEN** channel 不需要等待 turn finalization 才看到这条文本
+
+#### Scenario: tool call 与 tool result 各自独立发送
+- **WHEN** AgentLoop 在同一 turn 内先提交一个 tool call，随后提交对应的 tool result
+- **THEN** 系统会先发送该 tool call dispatch item
+- **THEN** 系统会在稍后单独发送该 tool result dispatch item
+- **THEN** 这两个 dispatch items 不需要成对打包后再一起发送
 
 ### Requirement: 系统 SHALL 为 message-level dispatch 保持稳定顺序
 系统 SHALL 为同一 turn 内所有可外发 dispatch items 分配稳定的顺序号，并按该顺序对外发送。Router、channel adapter 和恢复链路 MUST 基于这个顺序号判断“哪些事件已经发送、哪些事件仍待发送”。

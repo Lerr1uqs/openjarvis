@@ -2,7 +2,7 @@
 
 当前系统继承了 `enforce-thread-owned-turn-boundaries` 的语义：`AgentLoop` 在一个 turn 内先把文本输出、tool 事件和 compact 事件缓冲到 turn 级 event batch，只有 turn finalization 完成后，Router 才统一外发并持久化对应 thread snapshot。这个模型保证了“用户看到的结果”和“最终落盘的 turn 状态”严格一致，但代价是中间文本、tool 结果和失败进展都必须等到 turn 结束后才能被用户看到。
 
-现在需要把用户可见事件改成按 message / event 级别发送，但又不能退回到“Router 在 `Thread` 之外自己拼消息真相”的旧模式。因此这个 change 的核心不是简单把发送时机提前，而是要重新定义：
+现在需要把用户可见事件改成按 message / event 级别发送，而且每个可见项都单独发送，不再要求 tool call 与 tool result 成对打包；同时又不能退回到“Router 在 `Thread` 之外自己拼消息真相”的旧模式。因此这个 change 的核心不是简单把发送时机提前，而是要重新定义：
 
 - 哪些 message / event 在何时算“可外发”
 - 外发后的 thread 状态如何 checkpoint
@@ -28,9 +28,9 @@
 
 ## Decisions
 
-### 1. 外发边界从 finalized turn 改为 committed message / event
+### 1. 外发边界从 finalized turn 改为单条 committed message / event
 
-系统将把“对外可见”的最小单位定义为 committed message / event，而不是 finalized turn。凡是已经进入 `Thread` 当前 turn state 且被标记为用户可见的文本输出、tool 调用记录、tool 结果或失败通知，都可以在 turn 未结束时按顺序外发。
+系统将把“对外可见”的最小单位定义为单条 committed message / event，而不是 finalized turn。凡是已经进入 `Thread` 当前 turn state 且被标记为用户可见的文本输出、tool 调用记录、tool 结果或失败通知，都可以在 turn 未结束时按顺序外发。每条 assistant 文本、每个 tool call、每个 tool result、每个 terminal failure item 都是独立 dispatch item，逐条发送，不做成对打包。
 
 这里的“committed”不是指 turn 已落盘完成，而是指：
 
@@ -51,7 +51,7 @@ Alternative considered:
 - `last_dispatched_seq`
 - 或等价的 turn-local cursor
 
-这样可以让外部模块通过 `Thread` 提供的 API 拿到“自上次发送之后新增的 dispatch items”，而不是自行 diff message 向量。
+这样可以让外部模块通过 `Thread` 提供的 API 拿到“自上次发送之后新增的 dispatch items”，而不是自行 diff message 向量。由于 dispatch 粒度已经明确为单条 item，Router 只需要顺序消费这些 item，而不需要再推断“哪些 item 应该合并成对发送”。
 
 Alternative considered:
 
@@ -151,6 +151,4 @@ Rollback strategy:
 
 ## Open Questions
 
-- 文本输出是否以“每条 assistant message”为最小外发单位，还是允许更细粒度的结构化文本事件？
-- tool call / tool result 是否继续沿用现有 turn event 结构，还是需要新的统一 dispatch item schema？
 - channel 若不支持真正的逐条中间事件展示，是否需要在 router 侧提供兼容降级策略？
