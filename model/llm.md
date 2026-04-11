@@ -24,6 +24,7 @@
 ## 核心能力
 
 - 当前支持 `mock` 和 `openai_compatible`。
+- 需要支持 `openai_compatible/anthropic/openai_response` 三种协议
 - `anthropic` 分支已经留好协议边界，但还没实现真实传输。
 - 把统一 `ChatMessage` 和 `ToolDefinition` 序列化为供应商请求格式。
 

@@ -25,5 +25,4 @@
 ## 使用方式
 
 - 持久化消息由 `Thread` 管理。
-- request-time 临时消息由 `AgentLoop` 局部管理。
-- LLM 请求序列由 `AgentLoop` 在运行时导出。
+- LLM 请求序列由 `AgentLoop` 在运行时从 `Thread` 导出。

@@ -5,22 +5,21 @@
 ## 定位
 
 - `AgentLoop` 是一次 agent turn 的执行器。
-- 它消费“已经初始化好的 `Thread` + 当前 incoming message”。
+- 它是一个执行框架 身份、工具、能力和上下文都来自：`Thread`
+- 接受incoming message 进行loop 循环执行
 - 它不拥有线程初始化和稳定 system prompt 注入的 ownership。
 
 ## 核心边界
 
 - worker 负责 `init_thread()`。
-- loop 负责 request-time runtime state。
-- loop 内的临时 system messages 和 live chat messages 只存在于本轮局部变量。
-- loop 结束时只把需要持久化的消息回收到 `Thread`。
+- loop不要进行临时messages管理 所有message都commit到thread中 messages从thread中取出
+- 负责对外发送event 在运行时执行hook
 
 ## 主流程
 
-1. 读取持久化 `Thread`
-2. 准备 request-time tools 与预算
-3. 追加当前用户消息
-4. 调用 LLM
-5. 执行工具并把 assistant/tool messages 追加回 working set
-6. 必要时触发 runtime compact
-7. 产出 commit messages 与更新后的 `Thread`
+1. 外部传入状态 `Thread` + 用户输入消息 incoming message
+2. commit消息到thread中
+3. 调用 LLM
+4. 执行工具并把 assistant/tool messages commit回 thread
+5. 必要时触发 runtime compact
+6. 其他feature执行

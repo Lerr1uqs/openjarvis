@@ -11,6 +11,7 @@ pub struct Thread {
    pub locator: ThreadContextLocator,
    pub thread: ThreadContext,
    pub state: ThreadState,
+   ... // 其他
 }
 ```
 

@@ -25,7 +25,7 @@
 - `MemoryRepository`
   本地 memory 仓库的统一访问边界，负责扫描、解析、写入和 catalog 派生。
 - `active memory`
-  需要在 thread 初始化时先向模型披露“有哪些记忆”的记忆类型；正文不主动注入。
+  需要在 thread 初始化时先向模型披露“有哪些记忆”的记忆类型；(也就是注入到system prompt中) 正文不主动注入。
 - `passive memory`
   不进入 thread init catalog，只能通过搜索、列表和读取工具按需使用的记忆类型。
 - `memory document`
