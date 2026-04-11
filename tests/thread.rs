@@ -37,7 +37,7 @@ fn build_runtime_attachment(system_prompt: &str) -> ThreadRuntimeAttachment {
         system_prompt,
     ));
     let memory_repository = registry.memory_repository();
-    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false, None)
 }
 
 #[test]
@@ -100,21 +100,19 @@ fn clear_to_initial_state_resets_persisted_and_runtime_state() {
         vec!["demo".to_string()],
         vec![event],
     );
-    thread.record_tool_event(ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now));
 
     thread.clear_to_initial_state(now);
 
     assert!(thread.non_system_messages().is_empty());
     assert!(thread.load_toolsets().is_empty());
     assert!(thread.load_tool_events().is_empty());
-    assert!(thread.pending_tool_events().is_empty());
     assert!(thread.system_messages().is_empty());
     assert!(!thread.auto_compact_enabled(false));
 }
 
 #[test]
-fn store_turn_state_binds_pending_tool_events_to_commit_id() {
-    // 测试场景: pending tool event 必须在 turn commit 时写入统一 turn_id。
+fn record_tool_event_requires_active_turn() {
+    // 测试场景: 没有 active turn 时记录 tool audit 必须直接失败，且不能留下任何 pending buffer。
     let now = Utc::now();
     let mut thread = build_thread("thread_events");
     let event = {
@@ -123,25 +121,47 @@ fn store_turn_state_binds_pending_tool_events_to_commit_id() {
         event.tool_call_id = Some("call_1".to_string());
         event
     };
-    thread.record_tool_event(event);
+    let error = thread
+        .record_tool_event(event)
+        .expect_err("tool audit without active turn should fail");
 
-    let turn_id = thread.commit_test_turn(
+    assert!(error
+        .to_string()
+        .contains("cannot record tool event without one active turn"));
+    assert!(thread.load_tool_events().is_empty());
+}
+
+#[test]
+fn finalize_turn_persists_tool_events_without_turn_identity() {
+    // 测试场景: active turn 内记录的 tool audit 在 finalize 后直接进入正式历史，且不再携带 turn_id。
+    let now = Utc::now();
+    let mut thread = build_thread("thread_events");
+    let event = {
+        let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now);
+        event.tool_name = Some("demo__echo".to_string());
+        event.tool_call_id = Some("call_1".to_string());
+        event
+    };
+
+    thread.commit_test_turn_with_state(
         Some("msg_runtime".to_string()),
         vec![ChatMessage::new(ChatMessageRole::User, "hello", now)],
         now,
         now,
+        Vec::new(),
+        vec![event],
     );
     let stored_events = thread.load_tool_events();
+    let serialized = serde_json::to_value(&stored_events[0]).expect("tool event should serialize");
 
-    assert!(thread.pending_tool_events().is_empty());
     assert_eq!(stored_events.len(), 1);
-    assert_eq!(stored_events[0].turn_id, Some(turn_id));
     assert_eq!(stored_events[0].tool_call_id.as_deref(), Some("call_1"));
+    assert!(serialized.get("turn_id").is_none());
 }
 
 #[test]
-fn finalize_turn_failure_drops_inflight_turn_contents() {
-    // 测试场景: turn 内发生异常失败时，已 append 的正式消息不能回滚，tool event 仍需绑定到失败 turn。
+fn finalize_turn_failure_preserves_committed_messages_without_synthesizing_failure_message() {
+    // 测试场景: finalize failure 只关闭 turn；已提交消息不能回滚，也不能自动再插入一条 failure message。
     let now = Utc::now();
     let mut thread = build_thread("thread_failed_turn");
     thread.commit_test_turn(
@@ -174,7 +194,9 @@ fn finalize_turn_failure_drops_inflight_turn_contents() {
     let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now);
     event.tool_name = Some("demo__echo".to_string());
     event.tool_call_id = Some("call_fail_1".to_string());
-    thread.record_tool_event(event);
+    thread
+        .record_tool_event(event)
+        .expect("tool event should record inside failed turn");
 
     let finalized = thread
         .finalize_turn_failure("network exploded", now)
@@ -198,11 +220,44 @@ fn finalize_turn_failure_drops_inflight_turn_contents() {
         ]
     );
     assert_eq!(finalized.snapshot.load_tool_events().len(), 1);
-    assert_eq!(finalized.events.len(), 1);
-    assert!(
-        finalized.events[0]
-            .content
-            .contains("[openjarvis][agent_error]")
+    assert_eq!(
+        finalized.reply,
+        "[openjarvis][agent_error] network exploded"
+    );
+    assert_eq!(finalized.snapshot.non_system_messages().len(), 3);
+}
+
+#[tokio::test]
+async fn thread_snapshot_no_longer_serializes_dispatch_progress() {
+    // 测试场景: Thread snapshot 只保留消息事实和 turn 生命周期，不再序列化 dispatch/ack 进度。
+    let now = Utc::now();
+    let mut thread = build_thread("thread_dispatch_state");
+    thread.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
+    thread
+        .begin_turn(Some("msg_dispatch".to_string()), now)
+        .expect("turn should start");
+    thread
+        .push_message(ChatMessage::new(ChatMessageRole::Assistant, "partial", now))
+        .await
+        .expect("assistant message should append");
+
+    thread
+        .finalize_turn_success("partial", now)
+        .expect("turn should finalize");
+    assert!(!thread.has_active_turn());
+    let serialized = serde_json::to_value(&thread).expect("thread should serialize");
+    assert!(serialized["state"].get("dispatch").is_none());
+    assert_eq!(
+        thread
+            .non_system_messages()
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["partial"]
     );
 }
 

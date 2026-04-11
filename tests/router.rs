@@ -8,7 +8,7 @@ use clap::Parser;
 use openjarvis::{
     agent::{
         AgentDispatchEvent, AgentLoopEventKind, AgentRequest, AgentRuntime, AgentWorker,
-        AgentWorkerEvent, AgentWorkerHandle, CommittedAgentMessage, FinalizedAgentTurn,
+        AgentWorkerEvent, AgentWorkerHandle, CommittedAgentDispatchItem, FinalizedAgentTurn,
         ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
         agent_loop::{TOOL_EVENT_PREVIEW_MAX_CHARS, truncate_tool_message},
         empty_tool_input_schema,
@@ -24,7 +24,7 @@ use openjarvis::{
     router::ChannelRouter,
     router::ChannelRouterBuilder,
     session::{MemorySessionStore, SessionKey, SessionManager, SessionStore},
-    thread::{Thread, ThreadContextLocator, ThreadTurnEvent},
+    thread::{Thread, ThreadContextLocator},
 };
 use serde_json::json;
 use std::{
@@ -56,6 +56,13 @@ struct MockAgentHarness {
 struct ObservedAgentRequest {
     request: AgentRequest,
     thread_context: Thread,
+}
+
+#[derive(Clone)]
+struct TestCommittedEvent {
+    kind: AgentLoopEventKind,
+    content: String,
+    metadata: serde_json::Value,
 }
 
 struct SequenceProvider {
@@ -1856,11 +1863,12 @@ async fn router_failed_turn_replies_with_full_error_chain() {
         .load_or_create_thread(&incoming)
         .await
         .expect("thread should resolve");
+    let locator_for_send = locator.clone();
     let sessions = router.sessions().clone();
 
     let send_task = tokio::spawn(async move {
         let request = AgentRequest {
-            locator: locator.clone(),
+            locator: locator_for_send.clone(),
             incoming: incoming.clone(),
             sessions,
         };
@@ -1875,20 +1883,22 @@ async fn router_failed_turn_replies_with_full_error_chain() {
                 request.incoming.received_at,
             )
             .expect("failed turn should start");
+        let mut reply_to_source = true;
         let user_message = ChatMessage::new(
             ChatMessageRole::User,
             request.incoming.content.clone(),
             request.incoming.received_at,
         );
         thread_context
-            .append_open_turn_message(user_message)
-            .expect("failed turn user message should buffer");
+            .push_message(user_message)
+            .await
+            .expect("failed turn user message should commit");
         let failure_message = ChatMessage::new(
             ChatMessageRole::Assistant,
             "[openjarvis][agent_error] failed to call llm provider `openai_compatible` model `demo-model` at `https://provider.test/v1`: provider said 429: rate limit exceeded",
             Utc::now(),
         );
-        let failure_event = ThreadTurnEvent {
+        let failure_event = TestCommittedEvent {
             kind: AgentLoopEventKind::TextOutput,
             content: failure_message.content.clone(),
             metadata: json!({
@@ -1898,21 +1908,14 @@ async fn router_failed_turn_replies_with_full_error_chain() {
             }),
         };
         thread_context
-            .append_open_turn_message(failure_message.clone())
-            .expect("failed turn reply should append");
-        thread_context
-            .buffer_turn_event(failure_event.clone())
-            .expect("failed turn event should buffer");
-        let turn_id = thread_context
-            .current_turn_id()
-            .expect("failed turn should expose one active turn id");
+            .push_message(failure_message.clone())
+            .await
+            .expect("failed turn reply should commit");
         send_committed_message(
             &event_tx,
             &request,
-            turn_id,
-            &mut thread_context,
-            failure_message,
-            build_dispatch_batch(&request, &[failure_event]),
+            build_dispatch_batch(&request, &mut reply_to_source, &[failure_event]),
+            failure_message.created_at,
         )
         .await;
         let turn = thread_context
@@ -2004,6 +2007,163 @@ async fn router_failed_turn_replies_with_full_error_chain() {
         thread.non_system_messages()[1]
             .content
             .contains("provider said 429: rate limit exceeded")
+    );
+}
+
+#[tokio::test]
+async fn router_does_not_persist_dispatch_cursor_after_sending_item() {
+    // 测试场景: router 发送单条 committed event 成功后，不会再向 session 回写任何 dispatch cursor。
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let incoming_tx = Arc::new(Mutex::new(None));
+    let (request_tx, _request_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8);
+    let event_keepalive_tx = event_tx.clone(); // test-only: keeps router event stream open until shutdown.
+    let sessions = SessionManager::new();
+    let mut router = ChannelRouterBuilder::new()
+        .agent_handle(AgentWorkerHandle {
+            request_tx,
+            event_rx,
+        })
+        .session_manager(sessions.clone())
+        .build()
+        .expect("router should build");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    router
+        .register_channel(Box::new(RecordingChannel {
+            name: "feishu",
+            sent: Arc::clone(&sent),
+            incoming_tx: Arc::clone(&incoming_tx),
+        }))
+        .await
+        .expect("channel should register");
+
+    let incoming = build_incoming_with(
+        "msg_dispatch_ack",
+        "ou_dispatch_ack",
+        Some("thread_dispatch_ack"),
+        "hello",
+    );
+    let locator = router
+        .sessions()
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+    let locator_for_send = locator.clone();
+    let sessions = router.sessions().clone();
+
+    let send_task = tokio::spawn(async move {
+        let request = AgentRequest {
+            locator: locator_for_send.clone(),
+            incoming: incoming.clone(),
+            sessions,
+        };
+        let mut thread_context = request
+            .sessions
+            .lock_thread_context(&request.locator, request.incoming.received_at)
+            .await
+            .expect("thread should lock");
+        thread_context
+            .begin_turn(
+                request.incoming.external_message_id.clone(),
+                request.incoming.received_at,
+            )
+            .expect("turn should start");
+        let mut reply_to_source = true;
+        let user_message = ChatMessage::new(
+            ChatMessageRole::User,
+            request.incoming.content.clone(),
+            request.incoming.received_at,
+        );
+        thread_context
+            .push_message(user_message)
+            .await
+            .expect("user message should commit");
+        let assistant_message = ChatMessage::new(ChatMessageRole::Assistant, "reply", Utc::now());
+        let assistant_event = TestCommittedEvent {
+            kind: AgentLoopEventKind::TextOutput,
+            content: "reply".to_string(),
+            metadata: json!({
+                "source": "router_ack_test",
+                "is_final": true,
+            }),
+        };
+        thread_context
+            .push_message(assistant_message.clone())
+            .await
+            .expect("assistant message should commit");
+        send_committed_message(
+            &event_tx,
+            &request,
+            build_dispatch_batch(&request, &mut reply_to_source, &[assistant_event]),
+            assistant_message.created_at,
+        )
+        .await;
+        let turn = thread_context
+            .finalize_turn_success("reply", Utc::now())
+            .expect("turn should finalize");
+        request
+            .sessions
+            .commit_finalized_turn_locked(&request.locator, &mut thread_context, &turn)
+            .await
+            .expect("turn should persist");
+        event_tx
+            .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {
+                locator: request.locator.clone(),
+                turn,
+            }))
+            .await
+            .expect("finalized turn should send");
+        event_tx
+            .send(AgentWorkerEvent::RequestCompleted(
+                openjarvis::agent::CompletedAgentRequest {
+                    locator: request.locator.clone(),
+                    completed_at: Utc::now(),
+                },
+            ))
+            .await
+            .expect("request should complete");
+    });
+
+    let driver = tokio::spawn(async move {
+        timeout(Duration::from_millis(500), async {
+            loop {
+                if sent.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("router should send the dispatch item");
+        shutdown_tx.send(()).expect("shutdown should send");
+    });
+
+    router
+        .run_until_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("router should exit cleanly");
+    send_task.await.expect("send task should finish");
+    driver.await.expect("driver should finish");
+    drop(event_keepalive_tx);
+
+    let stored_thread = router
+        .sessions()
+        .load_thread_context(&locator)
+        .await
+        .expect("thread should load")
+        .expect("thread should exist");
+    let serialized = serde_json::to_value(&stored_thread).expect("thread should serialize");
+    assert!(serialized["state"].get("dispatch").is_none());
+    assert_eq!(
+        stored_thread
+            .non_system_messages()
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hello", "reply"]
     );
 }
 
@@ -2337,19 +2497,22 @@ fn spawn_mock_agent_loop(
                             request.incoming.received_at,
                         )
                         .expect("first mock turn should start");
+                    let mut reply_to_source = true;
                     thread_context
-                        .append_open_turn_message(ChatMessage::new(
+                        .push_message(ChatMessage::new(
                             ChatMessageRole::User,
                             request.incoming.content.clone(),
                             request.incoming.received_at,
                         ))
-                        .expect("first mock turn user message should buffer");
+                        .await
+                        .expect("first mock turn user message should commit");
                     let assistant_message =
                         ChatMessage::new(ChatMessageRole::Assistant, "reply-first", Utc::now());
                     thread_context
-                        .append_open_turn_message(assistant_message.clone())
-                        .expect("first mock reply should buffer");
-                    let assistant_event = openjarvis::thread::ThreadTurnEvent {
+                        .push_message(assistant_message.clone())
+                        .await
+                        .expect("first mock reply should commit");
+                    let assistant_event = TestCommittedEvent {
                         kind: AgentLoopEventKind::TextOutput,
                         content: "reply-first".to_string(),
                         metadata: json!({
@@ -2357,19 +2520,11 @@ fn spawn_mock_agent_loop(
                             "is_final": true,
                         }),
                     };
-                    thread_context
-                        .buffer_turn_event(assistant_event.clone())
-                        .expect("first mock event should buffer");
-                    let turn_id = thread_context
-                        .current_turn_id()
-                        .expect("first mock turn should expose one active turn id");
                     send_committed_message(
                         &event_tx,
                         &request,
-                        turn_id,
-                        &mut thread_context,
-                        assistant_message,
-                        build_dispatch_batch(&request, &[assistant_event]),
+                        build_dispatch_batch(&request, &mut reply_to_source, &[assistant_event]),
+                        assistant_message.created_at,
                     )
                     .await;
                     let turn = thread_context
@@ -2409,13 +2564,15 @@ fn spawn_mock_agent_loop(
                             request.incoming.received_at,
                         )
                         .expect("second mock turn should start");
+                    let mut reply_to_source = true;
                     thread_context
-                        .append_open_turn_message(ChatMessage::new(
+                        .push_message(ChatMessage::new(
                             ChatMessageRole::User,
                             request.incoming.content.clone(),
                             request.incoming.received_at,
                         ))
-                        .expect("second mock turn user message should buffer");
+                        .await
+                        .expect("second mock turn user message should commit");
                     let tool_call_message =
                         ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now())
                             .with_tool_calls(vec![ChatToolCall {
@@ -2424,9 +2581,10 @@ fn spawn_mock_agent_loop(
                                 arguments: json!({ "path": "Cargo.toml" }),
                             }]);
                     thread_context
-                        .append_open_turn_message(tool_call_message.clone())
-                        .expect("tool-call message should buffer");
-                    let tool_call_event = openjarvis::thread::ThreadTurnEvent {
+                        .push_message(tool_call_message.clone())
+                        .await
+                        .expect("tool-call message should commit");
+                    let tool_call_event = TestCommittedEvent {
                         kind: AgentLoopEventKind::ToolCall,
                         content: "[openjarvis][tool_call] read {\"path\":\"Cargo.toml\"}"
                             .to_string(),
@@ -2436,28 +2594,21 @@ fn spawn_mock_agent_loop(
                             "tool_call_id": "call_mock_1",
                         }),
                     };
-                    thread_context
-                        .buffer_turn_event(tool_call_event.clone())
-                        .expect("tool call event should buffer");
-                    let turn_id = thread_context
-                        .current_turn_id()
-                        .expect("second mock turn should expose one active turn id");
                     send_committed_message(
                         &event_tx,
                         &request,
-                        turn_id,
-                        &mut thread_context,
-                        tool_call_message,
-                        build_dispatch_batch(&request, &[tool_call_event]),
+                        build_dispatch_batch(&request, &mut reply_to_source, &[tool_call_event]),
+                        tool_call_message.created_at,
                     )
                     .await;
                     let tool_result_message =
                         ChatMessage::new(ChatMessageRole::ToolResult, "ok", Utc::now())
                             .with_tool_call_id("call_mock_1");
                     thread_context
-                        .append_open_turn_message(tool_result_message.clone())
-                        .expect("tool result should buffer");
-                    let tool_result_event = openjarvis::thread::ThreadTurnEvent {
+                        .push_message(tool_result_message.clone())
+                        .await
+                        .expect("tool result should commit");
+                    let tool_result_event = TestCommittedEvent {
                         kind: AgentLoopEventKind::ToolResult,
                         content: "[openjarvis][tool_result] ok".to_string(),
                         metadata: json!({
@@ -2467,24 +2618,20 @@ fn spawn_mock_agent_loop(
                             "tool_call_id": "call_mock_1",
                         }),
                     };
-                    thread_context
-                        .buffer_turn_event(tool_result_event.clone())
-                        .expect("tool result event should buffer");
                     send_committed_message(
                         &event_tx,
                         &request,
-                        turn_id,
-                        &mut thread_context,
-                        tool_result_message,
-                        build_dispatch_batch(&request, &[tool_result_event]),
+                        build_dispatch_batch(&request, &mut reply_to_source, &[tool_result_event]),
+                        tool_result_message.created_at,
                     )
                     .await;
                     let assistant_message =
                         ChatMessage::new(ChatMessageRole::Assistant, "reply-second", Utc::now());
                     thread_context
-                        .append_open_turn_message(assistant_message.clone())
-                        .expect("final reply should buffer");
-                    let assistant_event = openjarvis::thread::ThreadTurnEvent {
+                        .push_message(assistant_message.clone())
+                        .await
+                        .expect("final reply should commit");
+                    let assistant_event = TestCommittedEvent {
                         kind: AgentLoopEventKind::TextOutput,
                         content: "reply-second".to_string(),
                         metadata: json!({
@@ -2492,16 +2639,11 @@ fn spawn_mock_agent_loop(
                             "is_final": true,
                         }),
                     };
-                    thread_context
-                        .buffer_turn_event(assistant_event.clone())
-                        .expect("final reply event should buffer");
                     send_committed_message(
                         &event_tx,
                         &request,
-                        turn_id,
-                        &mut thread_context,
-                        assistant_message,
-                        build_dispatch_batch(&request, &[assistant_event]),
+                        build_dispatch_batch(&request, &mut reply_to_source, &[assistant_event]),
+                        assistant_message.created_at,
                     )
                     .await;
                     let turn = thread_context
@@ -2575,16 +2717,15 @@ fn spawn_truncation_mock_agent_loop(
                             request.incoming.received_at,
                         )
                         .expect("truncation turn should start");
+                    let mut reply_to_source = true;
                     thread_context
-                        .append_open_turn_message(ChatMessage::new(
+                        .push_message(ChatMessage::new(
                             ChatMessageRole::User,
                             request.incoming.content.clone(),
                             request.incoming.received_at,
                         ))
-                        .expect("truncation turn user message should buffer");
-                    let turn_id = thread_context
-                        .current_turn_id()
-                        .expect("truncation turn should expose one active turn id");
+                        .await
+                        .expect("truncation turn user message should commit");
                     for index in 1..=6 {
                         let content = format!("message_{index}");
                         let assistant_message = ChatMessage::new(
@@ -2593,9 +2734,10 @@ fn spawn_truncation_mock_agent_loop(
                             Utc::now(),
                         );
                         thread_context
-                            .append_open_turn_message(assistant_message.clone())
-                            .expect("truncation message should buffer");
-                        let assistant_event = openjarvis::thread::ThreadTurnEvent {
+                            .push_message(assistant_message.clone())
+                            .await
+                            .expect("truncation message should commit");
+                        let assistant_event = TestCommittedEvent {
                             kind: AgentLoopEventKind::TextOutput,
                             content,
                             metadata: json!({
@@ -2603,16 +2745,15 @@ fn spawn_truncation_mock_agent_loop(
                                 "message_index": index,
                             }),
                         };
-                        thread_context
-                            .buffer_turn_event(assistant_event.clone())
-                            .expect("truncation event should buffer");
                         send_committed_message(
                             &event_tx,
                             &request,
-                            turn_id,
-                            &mut thread_context,
-                            assistant_message,
-                            build_dispatch_batch(&request, &[assistant_event]),
+                            build_dispatch_batch(
+                                &request,
+                                &mut reply_to_source,
+                                &[assistant_event],
+                            ),
+                            assistant_message.created_at,
                         )
                         .await;
                     }
@@ -2653,22 +2794,25 @@ fn spawn_truncation_mock_agent_loop(
                             request.incoming.received_at,
                         )
                         .expect("final truncation turn should start");
+                    let mut reply_to_source = true;
                     thread_context
-                        .append_open_turn_message(ChatMessage::new(
+                        .push_message(ChatMessage::new(
                             ChatMessageRole::User,
                             request.incoming.content.clone(),
                             request.incoming.received_at,
                         ))
-                        .expect("final truncation turn user message should buffer");
+                        .await
+                        .expect("final truncation turn user message should commit");
                     let assistant_message = ChatMessage::new(
                         ChatMessageRole::Assistant,
                         "final-after-truncation",
                         Utc::now(),
                     );
                     thread_context
-                        .append_open_turn_message(assistant_message.clone())
-                        .expect("final truncation reply should buffer");
-                    let assistant_event = openjarvis::thread::ThreadTurnEvent {
+                        .push_message(assistant_message.clone())
+                        .await
+                        .expect("final truncation reply should commit");
+                    let assistant_event = TestCommittedEvent {
                         kind: AgentLoopEventKind::TextOutput,
                         content: "final-after-truncation".to_string(),
                         metadata: json!({
@@ -2676,19 +2820,11 @@ fn spawn_truncation_mock_agent_loop(
                             "is_final": true,
                         }),
                     };
-                    thread_context
-                        .buffer_turn_event(assistant_event.clone())
-                        .expect("final truncation event should buffer");
-                    let turn_id = thread_context
-                        .current_turn_id()
-                        .expect("final truncation turn should expose one active turn id");
                     send_committed_message(
                         &event_tx,
                         &request,
-                        turn_id,
-                        &mut thread_context,
-                        assistant_message,
-                        build_dispatch_batch(&request, &[assistant_event]),
+                        build_dispatch_batch(&request, &mut reply_to_source, &[assistant_event]),
+                        assistant_message.created_at,
                     )
                     .await;
                     let turn = thread_context
@@ -2744,19 +2880,22 @@ fn spawn_single_turn_mock_agent_loop(
                 request.incoming.received_at,
             )
             .expect("single-turn mock should start");
+        let mut reply_to_source = true;
         thread_context
-            .append_open_turn_message(ChatMessage::new(
+            .push_message(ChatMessage::new(
                 ChatMessageRole::User,
                 request.incoming.content.clone(),
                 request.incoming.received_at,
             ))
-            .expect("single-turn mock user message should buffer");
+            .await
+            .expect("single-turn mock user message should commit");
         let assistant_message =
             ChatMessage::new(ChatMessageRole::Assistant, "reply-single", Utc::now());
         thread_context
-            .append_open_turn_message(assistant_message.clone())
-            .expect("single-turn reply should buffer");
-        let assistant_event = openjarvis::thread::ThreadTurnEvent {
+            .push_message(assistant_message.clone())
+            .await
+            .expect("single-turn reply should commit");
+        let assistant_event = TestCommittedEvent {
             kind: AgentLoopEventKind::TextOutput,
             content: "reply-single".to_string(),
             metadata: json!({
@@ -2764,19 +2903,11 @@ fn spawn_single_turn_mock_agent_loop(
                 "is_final": true,
             }),
         };
-        thread_context
-            .buffer_turn_event(assistant_event.clone())
-            .expect("single-turn event should buffer");
-        let turn_id = thread_context
-            .current_turn_id()
-            .expect("single-turn mock should expose one active turn id");
         send_committed_message(
             &event_tx,
             &request,
-            turn_id,
-            &mut thread_context,
-            assistant_message,
-            build_dispatch_batch(&request, &[assistant_event]),
+            build_dispatch_batch(&request, &mut reply_to_source, &[assistant_event]),
+            assistant_message.created_at,
         )
         .await;
         let turn = thread_context
@@ -2826,13 +2957,15 @@ fn spawn_compact_mock_agent_loop(
                 request.incoming.received_at,
             )
             .expect("compact mock turn should start");
+        let mut reply_to_source = true;
         compacted_thread
-            .append_open_turn_message(ChatMessage::new(
+            .push_message(ChatMessage::new(
                 ChatMessageRole::User,
                 request.incoming.content.clone(),
                 request.incoming.received_at,
             ))
-            .expect("compact mock turn user message should buffer");
+            .await
+            .expect("compact mock turn user message should commit");
         compacted_thread
             .replace_non_system_messages_after_compaction(vec![
                 ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", Utc::now()),
@@ -2845,9 +2978,10 @@ fn spawn_compact_mock_agent_loop(
             Utc::now(),
         );
         compacted_thread
-            .append_open_turn_message(assistant_message.clone())
-            .expect("compact reply should buffer");
-        let assistant_event = openjarvis::thread::ThreadTurnEvent {
+            .push_message(assistant_message.clone())
+            .await
+            .expect("compact reply should commit");
+        let assistant_event = TestCommittedEvent {
             kind: AgentLoopEventKind::TextOutput,
             content: "reply-after-compact".to_string(),
             metadata: json!({
@@ -2855,19 +2989,11 @@ fn spawn_compact_mock_agent_loop(
                 "is_final": true,
             }),
         };
-        compacted_thread
-            .buffer_turn_event(assistant_event.clone())
-            .expect("compact event should buffer");
-        let turn_id = compacted_thread
-            .current_turn_id()
-            .expect("compact mock turn should expose one active turn id");
         send_committed_message(
             &event_tx,
             &request,
-            turn_id,
-            &mut compacted_thread,
-            assistant_message,
-            build_dispatch_batch(&request, &[assistant_event]),
+            build_dispatch_batch(&request, &mut reply_to_source, &[assistant_event]),
+            assistant_message.created_at,
         )
         .await;
         let turn = compacted_thread
@@ -2924,9 +3050,10 @@ fn build_dispatch_event(
 
 fn build_dispatch_batch(
     request: &AgentRequest,
-    events: &[ThreadTurnEvent],
+    reply_to_source: &mut bool,
+    events: &[TestCommittedEvent],
 ) -> Vec<AgentDispatchEvent> {
-    events
+    let built = events
         .iter()
         .enumerate()
         .map(|(index, event)| {
@@ -2935,35 +3062,34 @@ fn build_dispatch_batch(
                 event.kind.clone(),
                 &event.content,
                 event.metadata.clone(),
-                index == 0,
+                *reply_to_source && index == 0,
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !built.is_empty() {
+        *reply_to_source = false;
+    }
+    built
 }
 
 async fn send_committed_message(
     event_tx: &mpsc::Sender<AgentWorkerEvent>,
     request: &AgentRequest,
-    turn_id: Uuid,
-    thread_context: &mut Thread,
-    message: ChatMessage,
     dispatch_events: Vec<AgentDispatchEvent>,
+    committed_at: chrono::DateTime<Utc>,
 ) {
-    request
-        .sessions
-        .persist_locked_thread_context(&request.locator, thread_context, message.created_at)
-        .await
-        .expect("committed message should persist");
-    event_tx
-        .send(AgentWorkerEvent::MessageCommitted(CommittedAgentMessage {
-            locator: request.locator.clone(),
-            turn_id,
-            message: message.clone(),
-            dispatch_events,
-            committed_at: message.created_at,
-        }))
-        .await
-        .expect("committed message should be sent");
+    for dispatch_event in dispatch_events {
+        event_tx
+            .send(AgentWorkerEvent::DispatchItemCommitted(
+                CommittedAgentDispatchItem {
+                    locator: request.locator.clone(),
+                    dispatch_event,
+                    committed_at,
+                },
+            ))
+            .await
+            .expect("committed message should be sent");
+    }
 }
 
 fn openjarvis_bin() -> String {

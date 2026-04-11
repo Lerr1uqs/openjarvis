@@ -20,7 +20,7 @@ use std::{
 use tracing::info;
 use uuid::Uuid;
 
-const SQLITE_SCHEMA_VERSION: i64 = 1;
+const SQLITE_SCHEMA_VERSION: i64 = 2;
 
 /// SQLite store backend that persists session metadata, thread snapshots, and dedup records.
 pub struct SqliteSessionStore {
@@ -131,13 +131,12 @@ CREATE TABLE IF NOT EXISTS thread_metadata (
 CREATE TABLE IF NOT EXISTS external_message_dedup (
     thread_id TEXT NOT NULL,
     external_message_id TEXT NOT NULL,
-    turn_id TEXT,
     completed_at TEXT NOT NULL,
     PRIMARY KEY(thread_id, external_message_id),
     FOREIGN KEY(thread_id) REFERENCES thread_metadata(thread_id) ON DELETE CASCADE
 );
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 "#,
                         )
                         .context("failed to initialize sqlite session store schema")?;
@@ -145,6 +144,37 @@ PRAGMA user_version = 1;
                         sqlite_path = %sqlite_path.display(),
                         schema_version = SQLITE_SCHEMA_VERSION,
                         "initialized sqlite session store schema"
+                    );
+                    Ok(())
+                }
+                1 => {
+                    connection
+                        .execute_batch(
+                            r#"
+ALTER TABLE external_message_dedup RENAME TO external_message_dedup_v1;
+
+CREATE TABLE external_message_dedup (
+    thread_id TEXT NOT NULL,
+    external_message_id TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY(thread_id, external_message_id),
+    FOREIGN KEY(thread_id) REFERENCES thread_metadata(thread_id) ON DELETE CASCADE
+);
+
+INSERT INTO external_message_dedup (thread_id, external_message_id, completed_at)
+SELECT thread_id, external_message_id, completed_at
+FROM external_message_dedup_v1;
+
+DROP TABLE external_message_dedup_v1;
+
+PRAGMA user_version = 2;
+"#,
+                        )
+                        .context("failed to migrate sqlite session store schema to v2")?;
+                    info!(
+                        sqlite_path = %sqlite_path.display(),
+                        schema_version = SQLITE_SCHEMA_VERSION,
+                        "migrated sqlite session store schema to remove turn_id"
                     );
                     Ok(())
                 }
@@ -418,15 +448,14 @@ WHERE thread_id = ?6
             if let Some(record) = dedup_record {
                 tx.execute(
                     r#"
-INSERT INTO external_message_dedup (thread_id, external_message_id, turn_id, completed_at)
-VALUES (?1, ?2, ?3, ?4)
+INSERT INTO external_message_dedup (thread_id, external_message_id, completed_at)
+VALUES (?1, ?2, ?3)
 ON CONFLICT(thread_id, external_message_id)
-DO UPDATE SET turn_id = excluded.turn_id, completed_at = excluded.completed_at
+DO UPDATE SET completed_at = excluded.completed_at
 "#,
                     params![
                         record.thread_id.to_string(),
                         record.external_message_id,
-                        record.turn_id.map(|value| value.to_string()),
                         record.completed_at.to_rfc3339(),
                     ],
                 )
@@ -463,26 +492,19 @@ DO UPDATE SET turn_id = excluded.turn_id, completed_at = excluded.completed_at
             connection
                 .query_row(
                     r#"
-SELECT turn_id, completed_at
+SELECT completed_at
 FROM external_message_dedup
 WHERE thread_id = ?1 AND external_message_id = ?2
 "#,
                     params![thread_id, external_message_id],
-                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()
                 .context("failed to load sqlite external message dedup record")?
-                .map(|(turn_id, completed_at)| {
+                .map(|completed_at| {
                     Ok::<ExternalMessageDedupRecord, anyhow::Error>(ExternalMessageDedupRecord {
                         thread_id: record_thread_id,
                         external_message_id: external_message_id.clone(),
-                        turn_id: turn_id
-                            .map(|value| {
-                                Uuid::parse_str(&value).with_context(|| {
-                                    format!("invalid stored dedup turn_id `{value}`")
-                                })
-                            })
-                            .transpose()?,
                         completed_at: DateTime::parse_from_rfc3339(&completed_at)
                             .with_context(|| {
                                 format!("invalid stored dedup completed_at `{completed_at}`")
@@ -508,18 +530,17 @@ WHERE thread_id = ?1 AND external_message_id = ?2
     ) -> SessionStoreResult<()> {
         let thread_id = locator.thread_id.to_string();
         let external_message_id = record.external_message_id.clone();
-        let turn_id = record.turn_id.map(|value| value.to_string());
         let completed_at = record.completed_at.to_rfc3339();
         self.run_blocking(move |connection| {
             connection
                 .execute(
                     r#"
-INSERT INTO external_message_dedup (thread_id, external_message_id, turn_id, completed_at)
-VALUES (?1, ?2, ?3, ?4)
+INSERT INTO external_message_dedup (thread_id, external_message_id, completed_at)
+VALUES (?1, ?2, ?3)
 ON CONFLICT(thread_id, external_message_id)
-DO UPDATE SET turn_id = excluded.turn_id, completed_at = excluded.completed_at
+DO UPDATE SET completed_at = excluded.completed_at
 "#,
-                    params![thread_id, external_message_id, turn_id, completed_at],
+                    params![thread_id, external_message_id, completed_at],
                 )
                 .context("failed to upsert sqlite external_message_dedup record")?;
             Ok(())

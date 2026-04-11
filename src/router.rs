@@ -2,7 +2,7 @@
 
 use crate::agent::{
     AgentDispatchEvent, AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle,
-    CommittedAgentMessage,
+    CommittedAgentDispatchItem,
 };
 use crate::attachment_syntax::AttachmentSyntaxParser;
 use crate::channels::feishu::FeishuChannel;
@@ -436,7 +436,6 @@ impl ChannelRouter {
                             .mark_external_message_processed(
                                 &locator,
                                 external_message_id,
-                                None,
                                 message.received_at,
                             )
                             .await?;
@@ -463,7 +462,6 @@ impl ChannelRouter {
                         .mark_external_message_processed(
                             &locator,
                             external_message_id,
-                            None,
                             message.received_at,
                         )
                         .await?;
@@ -482,13 +480,13 @@ impl ChannelRouter {
 
     async fn handle_agent_event(&self, event: AgentWorkerEvent) -> Result<()> {
         match event {
-            AgentWorkerEvent::MessageCommitted(message) => {
-                self.dispatch_committed_message(message).await
+            AgentWorkerEvent::DispatchItemCommitted(item) => {
+                self.dispatch_committed_item(item).await
             }
             AgentWorkerEvent::TurnFinalized(turn) => {
                 info!(
                     thread_id = %turn.locator.thread_id,
-                    turn_id = %turn.turn.turn_id,
+                    external_message_id = ?turn.turn.external_message_id,
                     "router observed finalized thread-owned turn"
                 );
                 Ok(())
@@ -568,19 +566,15 @@ impl ChannelRouter {
             .map_err(|error| anyhow::anyhow!("failed to enqueue outgoing message: {error}"))
     }
 
-    async fn dispatch_committed_message(&self, committed: CommittedAgentMessage) -> Result<()> {
+    async fn dispatch_committed_item(&self, committed: CommittedAgentDispatchItem) -> Result<()> {
         info!(
             thread_id = %committed.locator.thread_id,
-            turn_id = %committed.turn_id,
-            role = committed.message.role.as_label(),
-            dispatch_event_count = committed.dispatch_events.len(),
+            event_kind = ?committed.dispatch_event.kind,
             committed_at = %committed.committed_at,
-            "router dispatching committed thread message"
+            "router dispatching committed agent event"
         );
-        for event in committed.dispatch_events {
-            self.process_agent_dispatch_event(event).await?;
-        }
-        Ok(())
+        self.process_agent_dispatch_event(committed.dispatch_event)
+            .await
     }
 
     async fn mark_message_seen(&self, external_message_id: Option<&str>) -> bool {

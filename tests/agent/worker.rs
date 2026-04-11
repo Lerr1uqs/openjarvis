@@ -47,26 +47,17 @@ async fn worker_spawn_emits_thread_sync_then_finalized_turn() {
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 4).await;
+    let events = collect_events(handle.event_rx, 3).await;
 
     match &events[0] {
-        AgentWorkerEvent::MessageCommitted(message) => {
-            assert_eq!(message.message.content, "hello");
-            assert!(message.dispatch_events.is_empty());
+        AgentWorkerEvent::DispatchItemCommitted(item) => {
+            assert_eq!(item.dispatch_event.content, "mock-reply");
+            assert!(item.dispatch_event.reply_to_source);
         }
         other => panic!("unexpected first event: {other:?}"),
     }
 
     match &events[1] {
-        AgentWorkerEvent::MessageCommitted(message) => {
-            assert_eq!(message.message.content, "mock-reply");
-            assert_eq!(message.dispatch_events.len(), 1);
-            assert_eq!(message.dispatch_events[0].content, "mock-reply");
-        }
-        other => panic!("unexpected second event: {other:?}"),
-    }
-
-    match &events[2] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert_eq!(turn.locator.thread_id, locator.thread_id);
             assert_eq!(
@@ -79,14 +70,14 @@ async fn worker_spawn_emits_thread_sync_then_finalized_turn() {
                 vec!["hello".to_string(), "mock-reply".to_string()]
             );
         }
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected second event: {other:?}"),
     }
 
-    match &events[3] {
+    match &events[2] {
         AgentWorkerEvent::RequestCompleted(completed) => {
             assert_eq!(completed.locator.thread_id, locator.thread_id);
         }
-        other => panic!("unexpected fourth event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
 }
 
@@ -193,14 +184,14 @@ async fn worker_builds_request_from_thread_messages_plus_current_user_turn() {
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 4).await;
-    match &events[2] {
+    let events = collect_events(handle.event_rx, 3).await;
+    match &events[1] {
         AgentWorkerEvent::TurnFinalized(_) => {}
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected second event: {other:?}"),
     }
-    match &events[3] {
+    match &events[2] {
         AgentWorkerEvent::RequestCompleted(_) => {}
-        other => panic!("unexpected fourth event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
     let captured_requests = requests.lock().await;
     let messages = &captured_requests[0].messages;
@@ -304,9 +295,9 @@ async fn worker_failed_turn_is_finalized_inside_thread_boundary() {
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 4).await;
+    let events = collect_events(handle.event_rx, 3).await;
 
-    match &events[2] {
+    match &events[1] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert!(matches!(
                 turn.turn.status,
@@ -320,14 +311,14 @@ async fn worker_failed_turn_is_finalized_inside_thread_boundary() {
                     .contains("provider said 429: rate limit exceeded")
             );
         }
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected second event: {other:?}"),
     }
 
-    match &events[3] {
+    match &events[2] {
         AgentWorkerEvent::RequestCompleted(completed) => {
             assert_eq!(completed.locator.thread_id, locator.thread_id);
         }
-        other => panic!("unexpected fourth event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
 }
 
@@ -360,19 +351,19 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
         .await
         .expect("first request should be accepted");
 
-    let first_events = collect_events(first_handle.event_rx, 4).await;
-    match &first_events[2] {
+    let first_events = collect_events(first_handle.event_rx, 3).await;
+    match &first_events[1] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert_eq!(
                 turn.turn.snapshot.system_messages()[0].content,
                 "system prompt A"
             );
         }
-        other => panic!("unexpected first worker completion event: {other:?}"),
+        other => panic!("unexpected first worker finalized event: {other:?}"),
     };
-    match &first_events[3] {
+    match &first_events[2] {
         AgentWorkerEvent::RequestCompleted(_) => {}
-        other => panic!("unexpected fourth event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
     let first_captured_requests = first_requests.lock().await;
     assert_eq!(
@@ -402,19 +393,19 @@ async fn worker_preserves_existing_thread_system_prompt_snapshot() {
         .await
         .expect("second request should be accepted");
 
-    let second_events = collect_events(second_handle.event_rx, 4).await;
-    match &second_events[2] {
+    let second_events = collect_events(second_handle.event_rx, 3).await;
+    match &second_events[1] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert_eq!(
                 turn.turn.snapshot.system_messages()[0].content,
                 "system prompt A"
             );
         }
-        other => panic!("unexpected third worker completion event: {other:?}"),
+        other => panic!("unexpected recovered worker finalized event: {other:?}"),
     }
-    match &second_events[3] {
+    match &second_events[2] {
         AgentWorkerEvent::RequestCompleted(_) => {}
-        other => panic!("unexpected fourth event: {other:?}"),
+        other => panic!("unexpected third event: {other:?}"),
     }
 
     let second_captured_requests = second_requests.lock().await;
@@ -476,8 +467,8 @@ async fn worker_does_not_directly_inject_memory_bodies_into_request_messages() {
         .await
         .expect("request should be accepted");
 
-    let events = collect_events(handle.event_rx, 4).await;
-    match &events[2] {
+    let events = collect_events(handle.event_rx, 3).await;
+    match &events[1] {
         AgentWorkerEvent::TurnFinalized(turn) => {
             assert!(turn.turn.snapshot.system_messages().iter().any(|message| {
                 message
@@ -485,7 +476,7 @@ async fn worker_does_not_directly_inject_memory_bodies_into_request_messages() {
                     .contains("notion, 上传 -> workflow/notion.md")
             }));
         }
-        other => panic!("unexpected third event: {other:?}"),
+        other => panic!("unexpected second event: {other:?}"),
     }
 
     let captured_requests = requests.lock().await;

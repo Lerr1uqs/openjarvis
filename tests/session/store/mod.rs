@@ -46,10 +46,10 @@ fn build_locator(session_id: Uuid, incoming: &IncomingMessage) -> ThreadLocator 
     ThreadLocator::new(session_id, incoming, external_thread_id, thread_id)
 }
 
-fn build_compacted_thread_context(locator: &ThreadLocator, now: DateTime<Utc>) -> (Thread, Uuid) {
+fn build_compacted_thread_context(locator: &ThreadLocator, now: DateTime<Utc>) -> Thread {
     let mut thread_context = Thread::new(ThreadContextLocator::from(locator), now);
     thread_context.enable_auto_compact();
-    let turn_id = thread_context.commit_test_turn_with_state(
+    thread_context.commit_test_turn_with_state(
         None,
         vec![
             ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
@@ -60,7 +60,7 @@ fn build_compacted_thread_context(locator: &ThreadLocator, now: DateTime<Utc>) -
         vec!["demo".to_string()],
         Vec::new(),
     );
-    (thread_context, turn_id)
+    thread_context
 }
 
 struct SqliteFixture {

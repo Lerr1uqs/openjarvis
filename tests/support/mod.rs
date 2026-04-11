@@ -8,7 +8,6 @@ use openjarvis::{
     session::{SessionManager, SessionStoreResult, ThreadLocator},
     thread::{Thread, ThreadContextLocator, ThreadToolEvent},
 };
-use uuid::Uuid;
 
 pub trait ThreadTestExt {
     fn non_system_messages(&self) -> Vec<ChatMessage>;
@@ -20,7 +19,7 @@ pub trait ThreadTestExt {
         messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
-    ) -> Uuid;
+    );
     fn commit_test_turn_with_state(
         &mut self,
         external_message_id: Option<String>,
@@ -29,7 +28,7 @@ pub trait ThreadTestExt {
         completed_at: DateTime<Utc>,
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
-    ) -> Uuid;
+    );
     fn append_open_turn_message(&mut self, message: ChatMessage) -> Result<()>;
     fn replace_non_system_messages_after_compaction(
         &mut self,
@@ -77,23 +76,20 @@ impl ThreadTestExt for Thread {
         messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
-    ) -> Uuid {
+    ) {
         let reply = messages
             .iter()
             .rev()
             .find(|message| message.role == ChatMessageRole::Assistant)
             .map(|message| message.content.clone())
             .unwrap_or_default();
-        let turn_id = self
-            .begin_turn(external_message_id, started_at)
+        self.begin_turn(external_message_id, started_at)
             .expect("test turn should start");
         for message in messages {
-            self.push_message(message)
-                .expect("test message should append");
+            append_message_without_persist(self, message);
         }
         self.finalize_turn_success(reply, completed_at)
             .expect("test turn should finalize");
-        turn_id
     }
 
     fn commit_test_turn_with_state(
@@ -104,16 +100,30 @@ impl ThreadTestExt for Thread {
         completed_at: DateTime<Utc>,
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
-    ) -> Uuid {
+    ) {
         self.replace_loaded_toolsets(loaded_toolsets);
+        let reply = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ChatMessageRole::Assistant)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        self.begin_turn(external_message_id, started_at)
+            .expect("test turn should start");
         for event in tool_events {
-            self.record_tool_event(event);
+            self.record_tool_event(event)
+                .expect("tool event should record inside active test turn");
         }
-        self.commit_test_turn(external_message_id, messages, started_at, completed_at)
+        for message in messages {
+            append_message_without_persist(self, message);
+        }
+        self.finalize_turn_success(reply, completed_at)
+            .expect("test turn should finalize");
     }
 
     fn append_open_turn_message(&mut self, message: ChatMessage) -> Result<()> {
-        self.push_message(message)
+        append_message_without_persist(self, message);
+        Ok(())
     }
 
     fn replace_non_system_messages_after_compaction(
@@ -122,6 +132,14 @@ impl ThreadTestExt for Thread {
     ) -> Result<()> {
         self.replace_messages_after_compaction(compacted_messages)
     }
+}
+
+fn append_message_without_persist(thread: &mut Thread, message: ChatMessage) {
+    if thread.thread.created_at > message.created_at {
+        thread.thread.created_at = message.created_at;
+    }
+    thread.thread.updated_at = message.created_at;
+    thread.thread.messages.push(message);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,7 +167,7 @@ pub trait SessionManagerTestExt {
         messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
-    ) -> SessionStoreResult<Uuid>;
+    ) -> SessionStoreResult<()>;
     async fn commit_test_turn_messages_with_state(
         &self,
         locator: &ThreadLocator,
@@ -159,7 +177,7 @@ pub trait SessionManagerTestExt {
         completed_at: DateTime<Utc>,
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
-    ) -> SessionStoreResult<Uuid>;
+    ) -> SessionStoreResult<()>;
     async fn commit_test_turn_messages_with_thread_context(
         &self,
         locator: &ThreadLocator,
@@ -168,7 +186,7 @@ pub trait SessionManagerTestExt {
         messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
-    ) -> SessionStoreResult<Uuid>;
+    ) -> SessionStoreResult<()>;
 }
 
 #[async_trait]
@@ -207,7 +225,7 @@ impl SessionManagerTestExt for SessionManager {
         messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
-    ) -> SessionStoreResult<Uuid> {
+    ) -> SessionStoreResult<()> {
         self.commit_test_turn_messages_with_state(
             locator,
             external_message_id,
@@ -229,12 +247,12 @@ impl SessionManagerTestExt for SessionManager {
         completed_at: DateTime<Utc>,
         loaded_toolsets: Vec<String>,
         tool_events: Vec<ThreadToolEvent>,
-    ) -> SessionStoreResult<Uuid> {
+    ) -> SessionStoreResult<()> {
         let mut thread_context = self
             .load_thread_context(locator)
             .await?
             .unwrap_or_else(|| Thread::new(ThreadContextLocator::from(locator), completed_at));
-        let turn_id = thread_context.commit_test_turn_with_state(
+        thread_context.commit_test_turn_with_state(
             external_message_id.clone(),
             messages,
             started_at,
@@ -245,10 +263,10 @@ impl SessionManagerTestExt for SessionManager {
         self.store_thread_context(locator, thread_context, completed_at)
             .await?;
         if let Some(message_id) = external_message_id.as_deref() {
-            self.mark_external_message_processed(locator, message_id, Some(turn_id), completed_at)
+            self.mark_external_message_processed(locator, message_id, completed_at)
                 .await?;
         }
-        Ok(turn_id)
+        Ok(())
     }
 
     async fn commit_test_turn_messages_with_thread_context(
@@ -259,11 +277,11 @@ impl SessionManagerTestExt for SessionManager {
         messages: Vec<ChatMessage>,
         started_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
-    ) -> SessionStoreResult<Uuid> {
+    ) -> SessionStoreResult<()> {
         let mut thread_context = thread_context
             .unwrap_or_else(|| Thread::new(ThreadContextLocator::from(locator), completed_at));
         thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        let turn_id = thread_context.commit_test_turn(
+        thread_context.commit_test_turn(
             external_message_id.clone(),
             messages,
             started_at,
@@ -272,9 +290,9 @@ impl SessionManagerTestExt for SessionManager {
         self.store_thread_context(locator, thread_context, completed_at)
             .await?;
         if let Some(message_id) = external_message_id.as_deref() {
-            self.mark_external_message_processed(locator, message_id, Some(turn_id), completed_at)
+            self.mark_external_message_processed(locator, message_id, completed_at)
                 .await?;
         }
-        Ok(turn_id)
+        Ok(())
     }
 }

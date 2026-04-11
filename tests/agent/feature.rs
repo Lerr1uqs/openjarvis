@@ -54,7 +54,7 @@ fn build_runtime_attachment(
         system_prompt,
     ));
     let memory_repository = registry.memory_repository();
-    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false, None)
 }
 
 #[tokio::test]

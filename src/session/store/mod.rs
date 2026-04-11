@@ -33,7 +33,6 @@ pub struct StoredSessionRecord {
 pub struct ExternalMessageDedupRecord {
     pub thread_id: Uuid,
     pub external_message_id: String,
-    pub turn_id: Option<Uuid>,
     pub completed_at: DateTime<Utc>,
 }
 

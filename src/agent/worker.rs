@@ -16,17 +16,14 @@ use crate::config::{
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
-use crate::session::{SessionManager, ThreadLocator};
-use crate::thread::{
-    Thread, ThreadFinalizedTurn, ThreadRuntimeAttachment, ThreadTurnEvent, ThreadTurnEventKind,
-};
+use crate::session::{SessionManager, SessionThreadPersistence, ThreadLocator};
+use crate::thread::{Thread, ThreadFinalizedTurn, ThreadRuntimeAttachment};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::warn;
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
@@ -42,11 +39,9 @@ pub struct FinalizedAgentTurn {
 }
 
 #[derive(Debug, Clone)]
-pub struct CommittedAgentMessage {
+pub struct CommittedAgentDispatchItem {
     pub locator: ThreadLocator,
-    pub turn_id: Uuid,
-    pub message: ChatMessage,
-    pub dispatch_events: Vec<AgentDispatchEvent>,
+    pub dispatch_event: AgentDispatchEvent,
     pub committed_at: DateTime<Utc>,
 }
 
@@ -58,7 +53,7 @@ pub struct CompletedAgentRequest {
 
 #[derive(Debug, Clone)]
 pub enum AgentWorkerEvent {
-    MessageCommitted(CommittedAgentMessage),
+    DispatchItemCommitted(CommittedAgentDispatchItem),
     TurnFinalized(FinalizedAgentTurn),
     RequestCompleted(CompletedAgentRequest),
 }
@@ -76,7 +71,6 @@ pub struct AgentWorker {
 }
 
 struct WorkerCommittedMessageHandler {
-    sessions: SessionManager,
     locator: ThreadLocator,
     event_tx: mpsc::Sender<AgentWorkerEvent>,
 }
@@ -85,24 +79,24 @@ struct WorkerCommittedMessageHandler {
 impl AgentCommittedMessageHandler for WorkerCommittedMessageHandler {
     async fn on_committed_message(
         &mut self,
-        turn_id: Uuid,
-        thread_context: &mut Thread,
+        _thread_context: &mut Thread,
         message: ChatMessage,
         dispatch_events: Vec<AgentDispatchEvent>,
     ) -> Result<()> {
-        self.sessions
-            .persist_locked_thread_context(&self.locator, thread_context, message.created_at)
-            .await?;
-        self.event_tx
-            .send(AgentWorkerEvent::MessageCommitted(CommittedAgentMessage {
-                locator: self.locator.clone(),
-                turn_id,
-                committed_at: message.created_at,
-                message,
-                dispatch_events,
-            }))
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to report committed message: {error}"))?;
+        for dispatch_event in dispatch_events {
+            self.event_tx
+                .send(AgentWorkerEvent::DispatchItemCommitted(
+                    CommittedAgentDispatchItem {
+                        locator: self.locator.clone(),
+                        committed_at: message.created_at,
+                        dispatch_event,
+                    },
+                ))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to report committed dispatch item: {error}")
+                })?;
+        }
         Ok(())
     }
 }
@@ -227,7 +221,7 @@ impl AgentWorkerBuilder {
 }
 
 impl AgentWorker {
-    fn build_thread_runtime_attachment(&self) -> ThreadRuntimeAttachment {
+    fn build_thread_runtime_attachment(&self, sessions: SessionManager) -> ThreadRuntimeAttachment {
         let tool_registry = self.agent_loop.runtime().tools();
         let memory_repository = tool_registry.memory_repository();
         ThreadRuntimeAttachment::new(
@@ -235,11 +229,16 @@ impl AgentWorker {
             memory_repository,
             Arc::clone(&self.thread_initializer),
             self.compact_config.enabled() && self.compact_config.auto_compact(),
+            Some(Arc::new(SessionThreadPersistence::new(sessions))),
         )
     }
 
-    async fn initialize_thread(&self, thread_context: &mut Thread) -> Result<bool> {
-        thread_context.attach_runtime(self.build_thread_runtime_attachment());
+    async fn initialize_thread(
+        &self,
+        thread_context: &mut Thread,
+        sessions: SessionManager,
+    ) -> Result<bool> {
+        thread_context.attach_runtime(self.build_thread_runtime_attachment(sessions));
         thread_context.ensure_initialized().await
     }
 
@@ -426,24 +425,19 @@ impl AgentWorker {
     ) -> Result<AgentLoopOutput> {
         let mut thread_context = request
             .sessions
-            .lock_thread_context(&request.locator, request.incoming.received_at)
-            .await?;
-        if self.initialize_thread(&mut thread_context).await? {
-            request
-                .sessions
-                .persist_locked_thread_context(
-                    &request.locator,
-                    &mut thread_context,
+            .load_thread_context(&request.locator)
+            .await?
+            .unwrap_or_else(|| {
+                Thread::new(
+                    crate::thread::ThreadContextLocator::from(&request.locator),
                     request.incoming.received_at,
                 )
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to persist initialized thread: {error}")
-                })?;
-        }
+            });
+        let _ = self
+            .initialize_thread(&mut thread_context, request.sessions.clone())
+            .await?;
 
         let mut committed_message_handler = WorkerCommittedMessageHandler {
-            sessions: request.sessions.clone(),
             locator: request.locator.clone(),
             event_tx: event_tx.clone(),
         };
@@ -465,11 +459,7 @@ impl AgentWorker {
                 for completed_turn in &loop_output.turns {
                     request
                         .sessions
-                        .commit_finalized_turn_locked(
-                            &request.locator,
-                            &mut thread_context,
-                            &completed_turn.turn,
-                        )
+                        .commit_finalized_turn(&request.locator, &completed_turn.turn)
                         .await?;
                     event_tx
                         .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {
@@ -509,54 +499,42 @@ impl AgentWorker {
                     failure_reply.clone(),
                     committed_at,
                 );
-                thread_context.push_message(failure_message.clone())?;
-                let failure_event = ThreadTurnEvent {
-                    kind: ThreadTurnEventKind::TextOutput,
-                    content: failure_reply.clone(),
-                    metadata: serde_json::json!({
-                        "source": "worker_fallback_failure",
-                        "is_final": true,
-                        "is_error": true,
-                    }),
-                };
-                thread_context.buffer_turn_event(failure_event.clone())?;
-                request
-                    .sessions
-                    .persist_locked_thread_context(
-                        &request.locator,
-                        &mut thread_context,
-                        committed_at,
-                    )
-                    .await?;
+                thread_context.push_message(failure_message.clone()).await?;
                 event_tx
-                    .send(AgentWorkerEvent::MessageCommitted(CommittedAgentMessage {
-                        locator: request.locator.clone(),
-                        turn_id: thread_context.current_turn_id().ok_or_else(|| {
-                            anyhow::anyhow!("failed thread did not expose one active turn id")
-                        })?,
-                        message: failure_message,
-                        dispatch_events: vec![
-                            AgentEventSender::from_incoming_and_locator(
+                    .send(AgentWorkerEvent::DispatchItemCommitted(
+                        CommittedAgentDispatchItem {
+                            locator: request.locator.clone(),
+                            dispatch_event: AgentEventSender::from_incoming_and_locator(
                                 &request.incoming,
                                 &thread_context.locator,
                             )
-                            .prepare_dispatch_event(failure_event, true),
-                        ],
-                        committed_at,
-                    }))
+                            .prepare_dispatch_event(
+                                super::agent_loop::AgentLoopEvent {
+                                    kind: super::agent_loop::AgentLoopEventKind::TextOutput,
+                                    content: failure_reply.clone(),
+                                    metadata: serde_json::json!({
+                                        "source": "worker_fallback_failure",
+                                        "is_final": true,
+                                        "is_error": true,
+                                    }),
+                                },
+                                request.incoming.external_message_id.clone(),
+                                true,
+                            ),
+                            committed_at,
+                        },
+                    ))
                     .await
                     .map_err(|send_error| {
-                        anyhow::anyhow!("failed to report fallback committed message: {send_error}")
+                        anyhow::anyhow!(
+                            "failed to report fallback committed dispatch item: {send_error}"
+                        )
                     })?;
                 let finalized_turn =
                     thread_context.finalize_turn_failure(format!("{error:#}"), Utc::now())?;
                 request
                     .sessions
-                    .commit_finalized_turn_locked(
-                        &request.locator,
-                        &mut thread_context,
-                        &finalized_turn,
-                    )
+                    .commit_finalized_turn(&request.locator, &finalized_turn)
                     .await?;
                 event_tx
                     .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {

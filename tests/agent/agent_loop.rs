@@ -4,13 +4,14 @@ use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        AgentEventSender, AgentLoop, AgentLoopEventKind, AgentLoopOutput, AgentRuntime,
-        ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
+        AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEventKind, AgentLoopOutput,
+        AgentRuntime, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
         agent_loop::{
-            AgentLoopUTCompactSnapshot, AgentLoopUTLLMResponseSnapshot, AgentLoopUTLoopState,
-            AgentLoopUTProber, AgentLoopUTRequestSnapshot, AgentLoopUTToolCallSnapshot,
-            AgentLoopUTToolResultSnapshot, TOOL_EVENT_PREVIEW_MAX_CHARS, UTProbe,
-            truncate_tool_log_preview, truncate_tool_message,
+            AgentCommittedMessageHandler, AgentLoopUTCompactSnapshot,
+            AgentLoopUTLLMResponseSnapshot, AgentLoopUTLoopState, AgentLoopUTProber,
+            AgentLoopUTRequestSnapshot, AgentLoopUTToolCallSnapshot, AgentLoopUTToolResultSnapshot,
+            TOOL_EVENT_PREVIEW_MAX_CHARS, UTProbe, truncate_tool_log_preview,
+            truncate_tool_message,
         },
         empty_tool_input_schema,
     },
@@ -177,32 +178,30 @@ fn last_turn(output: &AgentLoopOutput) -> &openjarvis::agent::CompletedAgentTurn
         .expect("agent loop should finalize at least one turn")
 }
 
-fn flattened_dispatch_kinds(output: &AgentLoopOutput) -> Vec<AgentLoopEventKind> {
-    output
-        .turns
-        .iter()
-        .flat_map(|turn| {
-            turn.turn
-                .events
-                .iter()
-                .map(|event| event.kind.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+fn collected_event_kinds(events: &[AgentDispatchEvent]) -> Vec<AgentLoopEventKind> {
+    events.iter().map(|event| event.kind.clone()).collect()
 }
 
-fn flattened_dispatch_contents(output: &AgentLoopOutput) -> Vec<String> {
-    output
-        .turns
-        .iter()
-        .flat_map(|turn| {
-            turn.turn
-                .events
-                .iter()
-                .map(|event| event.content.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+fn collected_event_contents(events: &[AgentDispatchEvent]) -> Vec<String> {
+    events.iter().map(|event| event.content.clone()).collect()
+}
+
+async fn run_locked_thread_with_recorded_events(
+    loop_runner: &AgentLoop,
+    incoming: &IncomingMessage,
+    mut thread_context: Thread,
+) -> (AgentLoopOutput, Vec<AgentDispatchEvent>) {
+    let mut handler = RecordingDispatchHandler::default();
+    let output = loop_runner
+        .run_locked_thread(
+            build_event_sender(incoming, &thread_context),
+            incoming,
+            &mut thread_context,
+            &mut handler,
+        )
+        .await
+        .expect("loop should succeed");
+    (output, handler.events)
 }
 
 #[derive(Default)]
@@ -214,6 +213,24 @@ struct RecordingUTProbe {
     tool_results: Vec<AgentLoopUTToolResultSnapshot>,
     compacts: Vec<AgentLoopUTCompactSnapshot>,
     loop_end: Vec<AgentLoopUTLoopState>,
+}
+
+#[derive(Default)]
+struct RecordingDispatchHandler {
+    events: Vec<AgentDispatchEvent>,
+}
+
+#[async_trait]
+impl AgentCommittedMessageHandler for RecordingDispatchHandler {
+    async fn on_committed_message(
+        &mut self,
+        _thread_context: &mut Thread,
+        _message: ChatMessage,
+        dispatch_events: Vec<AgentDispatchEvent>,
+    ) -> Result<()> {
+        self.events.extend(dispatch_events);
+        Ok(())
+    }
 }
 
 impl AgentLoopUTProber for RecordingUTProbe {
@@ -259,23 +276,17 @@ async fn run_v1_returns_finalized_turn_batch_for_plain_text_reply() {
     let thread_context = build_thread("thread_loop_text");
     let incoming = build_incoming("hello", "thread_loop_text");
 
-    let output = loop_runner
-        .run_v1(
-            build_event_sender(&incoming, &thread_context),
-            &incoming,
-            thread_context.clone(),
-        )
-        .await
-        .expect("loop should succeed");
+    let (output, events) =
+        run_locked_thread_with_recorded_events(&loop_runner, &incoming, thread_context).await;
 
     let turn = only_turn(&output);
     assert_eq!(output.reply, "loop-reply");
     assert_eq!(
-        flattened_dispatch_kinds(&output),
+        collected_event_kinds(&events),
         vec![AgentLoopEventKind::TextOutput]
     );
     assert_eq!(
-        flattened_dispatch_contents(&output),
+        collected_event_contents(&events),
         vec!["loop-reply".to_string()]
     );
     assert_eq!(
@@ -286,6 +297,97 @@ async fn run_v1_returns_finalized_turn_batch_for_plain_text_reply() {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
         vec!["hello".to_string(), "loop-reply".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn run_locked_thread_emits_committed_events_in_message_order() {
+    // 测试场景: 同一 turn 内的文本、tool call、tool result、最终文本必须按单条 committed message 顺序即时发送。
+    let runtime = AgentRuntime::new();
+    runtime
+        .tools()
+        .register(Arc::new(EchoTool))
+        .await
+        .expect("echo tool should register");
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(ScriptedLLMProvider::new(vec![
+            LLMResponse {
+                message: Some(ChatMessage::new(
+                    ChatMessageRole::Assistant,
+                    "thinking",
+                    Utc::now(),
+                )),
+                tool_calls: vec![LLMToolCall {
+                    id: "call_1".to_string(),
+                    name: "demo__echo".to_string(),
+                    arguments: json!({}),
+                }],
+            },
+            LLMResponse {
+                message: Some(ChatMessage::new(
+                    ChatMessageRole::Assistant,
+                    "done",
+                    Utc::now(),
+                )),
+                tool_calls: Vec::new(),
+            },
+        ])),
+        runtime,
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+    );
+    let incoming = build_incoming("hello", "thread_dispatch_seq");
+    let mut thread_context = build_thread("thread_dispatch_seq");
+    let mut handler = RecordingDispatchHandler::default();
+
+    let output = loop_runner
+        .run_locked_thread(
+            build_event_sender(&incoming, &thread_context),
+            &incoming,
+            &mut thread_context,
+            &mut handler,
+        )
+        .await
+        .expect("loop should succeed");
+
+    assert_eq!(output.reply, "done");
+    assert_eq!(
+        handler
+            .events
+            .iter()
+            .map(|event| event.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            AgentLoopEventKind::TextOutput,
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::TextOutput,
+        ]
+    );
+    assert_eq!(
+        handler
+            .events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "thinking",
+            "[openjarvis][tool_call] demo__echo {}",
+            "[openjarvis][tool_result] echo-result",
+            "done",
+        ]
+    );
+    assert!(handler.events[0].reply_to_source);
+    assert!(
+        handler.events[1..]
+            .iter()
+            .all(|event| !event.reply_to_source)
+    );
+    assert!(
+        handler
+            .events
+            .windows(2)
+            .all(|window| window[0].source_message_id == window[1].source_message_id)
     );
 }
 
@@ -342,7 +444,7 @@ async fn run_v1_drops_failed_turn_contents_when_llm_generate_errors() {
             turn.turn.reply.clone(),
         ]
     );
-    assert!(flattened_dispatch_contents(&output)[0].contains("[openjarvis][agent_error]"));
+    assert!(turn.turn.reply.contains("[openjarvis][agent_error]"));
     assert_eq!(probe.request_prepared.len(), 1);
     assert!(probe.llm_responses.is_empty());
     assert_eq!(probe.loop_end.len(), 1);
@@ -414,7 +516,7 @@ async fn run_v1_with_ut_probe_exposes_thread_owned_turn_state() {
             .content,
         "run tool"
     );
-    assert_eq!(probe.loop_end[0].turn_events.len(), 3);
+    assert!(probe.loop_end[0].turn_events.is_empty());
     assert_eq!(
         probe.loop_end[0]
             .request_messages
@@ -423,7 +525,7 @@ async fn run_v1_with_ut_probe_exposes_thread_owned_turn_state() {
         Some("call_demo_probe_1")
     );
     assert_eq!(output.turns.len(), 1);
-    assert_eq!(flattened_dispatch_kinds(&output).len(), 4);
+    assert_eq!(output.turns.len(), 1);
     assert_eq!(output.reply, "done");
 }
 
@@ -528,7 +630,7 @@ async fn run_v1_batches_multiple_tool_calls_and_probes_each_iteration() {
             .collect::<Vec<_>>(),
         vec![(0, "call_demo_batch_1"), (0, "call_demo_batch_2")]
     );
-    assert_eq!(probe.loop_end[0].turn_events.len(), 5);
+    assert!(probe.loop_end[0].turn_events.is_empty());
     assert_eq!(output.turns.len(), 1);
     assert_eq!(
         first_turn
@@ -555,17 +657,6 @@ async fn run_v1_batches_multiple_tool_calls_and_probes_each_iteration() {
     assert_eq!(
         first_turn.turn.snapshot.non_system_messages()[3].tool_calls[0].id,
         "call_demo_batch_2"
-    );
-    assert_eq!(
-        flattened_dispatch_kinds(&output),
-        vec![
-            AgentLoopEventKind::TextOutput,
-            AgentLoopEventKind::ToolCall,
-            AgentLoopEventKind::ToolCall,
-            AgentLoopEventKind::ToolResult,
-            AgentLoopEventKind::ToolResult,
-            AgentLoopEventKind::TextOutput,
-        ]
     );
     assert_eq!(final_turn.turn.reply, "batch done");
 }
@@ -610,14 +701,8 @@ async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
     let thread_context = build_thread("thread_loop_tool");
     let incoming = build_incoming("run tool", "thread_loop_tool");
 
-    let output = loop_runner
-        .run_v1(
-            build_event_sender(&incoming, &thread_context),
-            &incoming,
-            thread_context,
-        )
-        .await
-        .expect("loop should succeed");
+    let (output, events) =
+        run_locked_thread_with_recorded_events(&loop_runner, &incoming, thread_context).await;
 
     let final_turn = last_turn(&output);
     assert_eq!(
@@ -648,7 +733,7 @@ async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
         Some("demo__echo")
     );
     assert_eq!(
-        flattened_dispatch_kinds(&output),
+        collected_event_kinds(&events),
         vec![
             AgentLoopEventKind::TextOutput,
             AgentLoopEventKind::ToolCall,
@@ -698,19 +783,11 @@ async fn run_v1_truncates_tool_events_but_keeps_full_tool_result_history() {
     let thread_context = build_thread("thread_long_tool");
     let incoming = build_incoming("run long tool", "thread_long_tool");
 
-    let output = loop_runner
-        .run_v1(
-            build_event_sender(&incoming, &thread_context),
-            &incoming,
-            thread_context,
-        )
-        .await
-        .expect("loop should succeed");
+    let (output, events) =
+        run_locked_thread_with_recorded_events(&loop_runner, &incoming, thread_context).await;
 
-    let tool_result_event = output
-        .turns
+    let tool_result_event = events
         .iter()
-        .flat_map(|turn| turn.turn.events.iter())
         .find(|event| event.kind == AgentLoopEventKind::ToolResult)
         .expect("tool result event should exist");
     assert!(tool_result_event.content.contains("...(truncated"));
@@ -804,13 +881,20 @@ async fn run_v1_tool_requested_compact_replaces_thread_owned_active_view() {
         .collect::<Vec<_>>();
     let final_turn = last_turn(&output);
     assert_eq!(output.reply, "after compact");
+    assert_eq!(probe.compacts.len(), 1);
     assert_eq!(
-        flattened_dispatch_kinds(&output),
+        final_turn
+            .turn
+            .snapshot
+            .non_system_messages()
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>(),
         vec![
-            AgentLoopEventKind::ToolCall,
-            AgentLoopEventKind::Compact,
-            AgentLoopEventKind::ToolResult,
-            AgentLoopEventKind::TextOutput,
+            ChatMessageRole::Assistant,
+            ChatMessageRole::User,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Assistant,
         ]
     );
     assert_eq!(compact_result_snapshot.len(), 2);

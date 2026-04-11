@@ -42,7 +42,7 @@ fn build_runtime_attachment(registry: Arc<ToolRegistry>) -> ThreadRuntimeAttachm
         "system prompt",
     ));
     let memory_repository = registry.memory_repository();
-    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false, None)
 }
 
 #[tokio::test]

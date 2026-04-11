@@ -14,7 +14,7 @@ use openjarvis::{
     model::{IncomingMessage, ReplyTarget},
     session::{
         MemorySessionStore, SessionKey, SessionManager, SessionStore, SessionStoreError,
-        SqliteSessionStore,
+        SessionThreadPersistence, SqliteSessionStore,
     },
     thread::{
         Thread, ThreadContextLocator, ThreadRuntimeAttachment, ThreadToolEvent,
@@ -65,7 +65,7 @@ fn build_runtime_attachment(system_prompt: &str) -> ThreadRuntimeAttachment {
         system_prompt,
     ));
     let memory_repository = registry.memory_repository();
-    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false)
+    ThreadRuntimeAttachment::new(registry, memory_repository, rebuilder, false, None)
 }
 
 #[async_trait]
@@ -389,7 +389,9 @@ async fn commit_messages_with_state_persists_loaded_toolsets_and_tool_events() {
         thread_state.tool_events[0].toolset_name.as_deref(),
         Some("demo")
     );
-    assert!(thread_state.tool_events[0].turn_id.is_some());
+    let serialized =
+        serde_json::to_value(&thread_state.tool_events[0]).expect("tool event should serialize");
+    assert!(serialized.get("turn_id").is_none());
 }
 
 #[tokio::test]
@@ -453,6 +455,72 @@ async fn store_and_load_thread_context_roundtrips_runtime_state() {
     assert_eq!(loaded.load_tool_events().len(), 1);
     assert!(thread_state.thread_context.is_some());
     assert_eq!(thread_state.loaded_toolsets, vec!["demo".to_string()]);
+}
+
+#[tokio::test]
+async fn push_message_persists_messages_without_active_turn_snapshot() {
+    // 测试场景: push_message 成功返回后，store 只持久化正式消息和 state；active turn 不会进入持久化 snapshot。
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let manager = SessionManager::with_store(Arc::clone(&store))
+        .await
+        .expect("manager should initialize");
+    let reloader = SessionManager::with_store(store)
+        .await
+        .expect("reloader should initialize");
+    let incoming = build_incoming("msg_dispatch_checkpoint", "checkpoint");
+    let locator = manager
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+    let now = Utc::now();
+    let mut thread = Thread::new(ThreadContextLocator::from(&locator), now);
+    thread.seed_persisted_messages(vec![ChatMessage::new(
+        ChatMessageRole::System,
+        "system prompt",
+        now,
+    )]);
+    let registry = Arc::new(ToolRegistry::with_skill_roots(Vec::new()));
+    let memory_repository = registry.memory_repository();
+    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
+        Arc::clone(&registry),
+        AppConfig::default().agent_config().compact_config().clone(),
+        "system prompt",
+    ));
+    thread.attach_runtime(ThreadRuntimeAttachment::new(
+        registry,
+        memory_repository,
+        rebuilder,
+        false,
+        Some(Arc::new(SessionThreadPersistence::new(manager.clone()))),
+    ));
+    thread
+        .begin_turn(incoming.external_message_id.clone(), now)
+        .expect("turn should start");
+    thread
+        .push_message(ChatMessage::new(ChatMessageRole::User, "checkpoint", now))
+        .await
+        .expect("user message should append");
+    thread
+        .push_message(ChatMessage::new(ChatMessageRole::Assistant, "partial", now))
+        .await
+        .expect("assistant message should append");
+
+    let loaded = reloader
+        .load_thread_context(&locator)
+        .await
+        .expect("active snapshot should reload")
+        .expect("thread should exist");
+    assert!(!loaded.has_active_turn());
+    assert_eq!(
+        loaded
+            .non_system_messages()
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["checkpoint", "partial"]
+    );
+    let serialized = serde_json::to_value(&loaded).expect("thread should serialize");
+    assert!(serialized["state"].get("dispatch").is_none());
 }
 
 #[tokio::test]

@@ -23,11 +23,10 @@ async fn memory_store_roundtrips_thread_snapshot_and_dedup_record() {
         .expect("session should resolve");
     let locator = build_locator(session.id, &incoming);
     let now = Utc::now();
-    let (thread_context, turn_id) = build_compacted_thread_context(&locator, now);
+    let thread_context = build_compacted_thread_context(&locator, now);
     let dedup_record = ExternalMessageDedupRecord {
         thread_id: locator.thread_id,
         external_message_id: "msg_memory_store".to_string(),
-        turn_id: Some(turn_id),
         completed_at: now,
     };
 
@@ -55,7 +54,7 @@ async fn memory_store_roundtrips_thread_snapshot_and_dedup_record() {
     assert_eq!(loaded.non_system_messages()[1].content, "继续");
     assert_eq!(loaded.load_toolsets(), vec!["demo".to_string()]);
     assert!(loaded.auto_compact_enabled(false));
-    assert_eq!(loaded_dedup.turn_id, Some(turn_id));
+    assert_eq!(loaded_dedup.completed_at, now);
 }
 
 #[tokio::test]
@@ -72,7 +71,7 @@ async fn memory_store_rejects_stale_revision_writes() {
         .expect("session should resolve");
     let locator = build_locator(session.id, &incoming);
     let now = Utc::now();
-    let (thread_context, _turn_id) = build_compacted_thread_context(&locator, now);
+    let thread_context = build_compacted_thread_context(&locator, now);
 
     store
         .save_thread_context(&thread_context, now, None)

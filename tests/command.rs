@@ -227,12 +227,10 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
         vec!["demo".to_string()],
         vec![load_event],
     );
-    thread_context.record_tool_event(ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now));
 
     let messages_before = thread_context.messages();
     let toolsets_before = thread_context.load_toolsets();
     let tool_events_before = thread_context.load_tool_events();
-    let pending_tool_events_before = thread_context.pending_tool_events().to_vec();
     let auto_compact_before = thread_context.auto_compact_enabled(false);
 
     registry
@@ -254,10 +252,6 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
     assert_eq!(thread_context.messages(), messages_before);
     assert_eq!(thread_context.load_toolsets(), toolsets_before);
     assert_eq!(thread_context.load_tool_events(), tool_events_before);
-    assert_eq!(
-        thread_context.pending_tool_events(),
-        pending_tool_events_before.as_slice()
-    );
     assert_eq!(
         thread_context.auto_compact_enabled(false),
         auto_compact_before
@@ -328,7 +322,6 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
         vec!["demo".to_string()],
         vec![event],
     );
-    thread_context.record_tool_event(ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, now));
 
     let reply = registry
         .try_execute_with_thread_context(&incoming, &mut thread_context)
@@ -343,7 +336,6 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
     assert!(thread_context.non_system_messages().is_empty());
     assert!(thread_context.load_toolsets().is_empty());
     assert!(thread_context.load_tool_events().is_empty());
-    assert!(thread_context.pending_tool_events().is_empty());
     assert!(!thread_context.auto_compact_enabled(false));
 }
 

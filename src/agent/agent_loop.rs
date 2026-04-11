@@ -16,10 +16,7 @@ use crate::{
     config::{AgentCompactConfig, LLMConfig},
     llm::{LLMProvider, LLMRequest},
     model::{IncomingMessage, ReplyTarget},
-    thread::{
-        Thread, ThreadFinalizedTurn, ThreadToolEvent, ThreadToolEventKind, ThreadTurnEvent,
-        ThreadTurnEventKind,
-    },
+    thread::{Thread, ThreadFinalizedTurn, ThreadToolEvent, ThreadToolEventKind},
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -32,8 +29,20 @@ const TOOL_LOG_PREVIEW_MAX_CHARS: usize = 512;
 /// Default max character count used for channel-facing `ToolCall` and `ToolResult` event text.
 pub const TOOL_EVENT_PREVIEW_MAX_CHARS: usize = 300;
 
-pub type AgentLoopEvent = ThreadTurnEvent;
-pub type AgentLoopEventKind = ThreadTurnEventKind;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentLoopEventKind {
+    TextOutput,
+    ToolCall,
+    ToolResult,
+    Compact,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentLoopEvent {
+    pub kind: AgentLoopEventKind,
+    pub content: String,
+    pub metadata: Value,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentDispatchEvent {
@@ -73,9 +82,9 @@ impl AgentEventSender {
     /// ```rust
     /// use chrono::Utc;
     /// use openjarvis::{
-    ///     agent::AgentEventSender,
+    ///     agent::{AgentEventSender, AgentLoopEvent, AgentLoopEventKind},
     ///     model::{IncomingMessage, ReplyTarget},
-    ///     thread::{ThreadContextLocator, ThreadTurnEvent, ThreadTurnEventKind},
+    ///     thread::ThreadContextLocator,
     /// };
     /// use serde_json::json;
     /// use uuid::Uuid;
@@ -105,11 +114,11 @@ impl AgentEventSender {
     /// );
     ///
     /// let sender = AgentEventSender::from_incoming_and_locator(&incoming, &locator);
-    /// let dispatch = sender.prepare_dispatch_event(ThreadTurnEvent {
-    ///     kind: ThreadTurnEventKind::TextOutput,
+    /// let dispatch = sender.prepare_dispatch_event(AgentLoopEvent {
+    ///     kind: AgentLoopEventKind::TextOutput,
     ///     content: "done".to_string(),
     ///     metadata: json!({}),
-    /// }, true);
+    /// }, None, true);
     /// assert_eq!(dispatch.session_thread_id, "thread_internal");
     /// ```
     pub fn from_incoming_and_locator(
@@ -129,10 +138,11 @@ impl AgentEventSender {
         }
     }
 
-    /// Materialize one committed message event into a router-ready dispatch payload.
+    /// Materialize one committed agent event into a router-ready payload.
     pub fn prepare_dispatch_event(
         &self,
         event: AgentLoopEvent,
+        source_message_id: Option<String>,
         reply_to_source: bool,
     ) -> AgentDispatchEvent {
         AgentDispatchEvent {
@@ -141,7 +151,7 @@ impl AgentEventSender {
             metadata: event.metadata,
             channel: self.channel.clone(),
             external_thread_id: self.external_thread_id.clone(),
-            source_message_id: self.source_message_id.clone(),
+            source_message_id,
             target: self.target.clone(),
             session_id: self.session_id.clone(),
             session_channel: self.session_channel.clone(),
@@ -168,7 +178,6 @@ pub struct CompletedAgentTurn {
 pub trait AgentCommittedMessageHandler: Send {
     async fn on_committed_message(
         &mut self,
-        turn_id: uuid::Uuid,
         thread_context: &mut Thread,
         message: ChatMessage,
         dispatch_events: Vec<AgentDispatchEvent>,
@@ -181,7 +190,6 @@ struct NoopCommittedMessageHandler;
 impl AgentCommittedMessageHandler for NoopCommittedMessageHandler {
     async fn on_committed_message(
         &mut self,
-        _turn_id: uuid::Uuid,
         _thread_context: &mut Thread,
         _message: ChatMessage,
         _dispatch_events: Vec<AgentDispatchEvent>,
@@ -287,7 +295,7 @@ impl<'a> AgentLoopUTProberHandle<'a> {
         AgentLoopUTLoopState {
             iteration,
             request_messages: thread_context.messages(),
-            turn_events: thread_context.current_turn_events(),
+            turn_events: Vec::new(),
         }
     }
 
@@ -511,9 +519,9 @@ impl AgentLoop {
         commit_message(
             &event_tx,
             &mut thread_context,
-            &mut reply_to_source,
             initial_message,
-            Vec::new(),
+            None,
+            &mut reply_to_source,
             on_committed_message,
         )
         .await?;
@@ -543,7 +551,7 @@ impl AgentLoop {
                         outcome: Some(outcome),
                         error: None,
                         request_messages: thread_context.messages(),
-                        turn_events: thread_context.current_turn_events(),
+                        turn_events: Vec::new(),
                     });
                 }
             }
@@ -592,16 +600,16 @@ impl AgentLoop {
                     commit_message(
                         &event_tx,
                         &mut thread_context,
-                        &mut reply_to_source,
                         assistant_message.clone(),
-                        vec![AgentLoopEvent {
+                        Some(AgentLoopEvent {
                             kind: AgentLoopEventKind::TextOutput,
                             content: assistant_message.content.clone(),
                             metadata: json!({
                                 "source": "llm_response",
                                 "is_final": true,
                             }),
-                        }],
+                        }),
+                        &mut reply_to_source,
                         on_committed_message,
                     )
                     .await?;
@@ -622,16 +630,16 @@ impl AgentLoop {
                     commit_message(
                         &event_tx,
                         &mut thread_context,
-                        &mut reply_to_source,
                         message.clone(),
-                        vec![AgentLoopEvent {
+                        Some(AgentLoopEvent {
                             kind: AgentLoopEventKind::TextOutput,
                             content: message.content.clone(),
                             metadata: json!({
                                 "source": "llm_response",
                                 "is_final": false,
                             }),
-                        }],
+                        }),
+                        &mut reply_to_source,
                         on_committed_message,
                     )
                     .await?;
@@ -649,9 +657,9 @@ impl AgentLoop {
                     commit_message(
                         &event_tx,
                         &mut thread_context,
-                        &mut reply_to_source,
                         build_tool_call_message(provider_tool_call, tool_call_message_created_at),
-                        vec![build_tool_call_event(&tool_call, &provider_tool_call.id)],
+                        Some(build_tool_call_event(&tool_call, &provider_tool_call.id)),
+                        &mut reply_to_source,
                         on_committed_message,
                     )
                     .await?;
@@ -739,7 +747,7 @@ impl AgentLoop {
                             &tool_call,
                             &provider_tool_call.id,
                             &tool_result,
-                        ));
+                        ))?;
                         info!(
                             thread_id = %thread_id,
                             tool_name = %tool_call.name,
@@ -764,13 +772,13 @@ impl AgentLoop {
                     commit_message(
                         &event_tx,
                         &mut thread_context,
-                        &mut reply_to_source,
                         tool_result_message,
-                        vec![build_tool_result_event(
+                        Some(build_tool_result_event(
                             &tool_call,
                             &provider_tool_call.id,
                             &tool_result,
-                        )],
+                        )),
+                        &mut reply_to_source,
                         on_committed_message,
                     )
                     .await?;
@@ -818,9 +826,8 @@ impl AgentLoop {
                     commit_message(
                         &event_tx,
                         &mut thread_context,
-                        &mut reply_to_source,
                         failure_message,
-                        vec![AgentLoopEvent {
+                        Some(AgentLoopEvent {
                             kind: AgentLoopEventKind::TextOutput,
                             content: failure_reply.clone(),
                             metadata: json!({
@@ -828,7 +835,8 @@ impl AgentLoop {
                                 "is_final": true,
                                 "is_error": true,
                             }),
-                        }],
+                        }),
+                        &mut reply_to_source,
                         on_committed_message,
                     )
                     .await?;
@@ -970,22 +978,12 @@ impl AgentLoop {
         thread_id: &str,
         thread_context: &mut Thread,
         reason: &str,
-        requested_by_model: bool,
-        tool_call_id: Option<&str>,
+        _requested_by_model: bool,
+        _tool_call_id: Option<&str>,
         budget_report: &ContextBudgetReport,
     ) -> Result<Option<MessageCompactionOutcome>> {
         let compactable_messages = thread_context.compact_source_messages();
         if compactable_messages.is_empty() {
-            let compact_event = build_compact_event(
-                reason,
-                requested_by_model,
-                false,
-                budget_report,
-                None,
-                tool_call_id,
-                None,
-            );
-            thread_context.buffer_turn_event(compact_event)?;
             return Ok(None);
         }
 
@@ -1017,15 +1015,6 @@ impl AgentLoop {
             return Ok(None);
         };
         thread_context.replace_messages_after_compaction(outcome.compacted_messages.clone())?;
-        thread_context.buffer_turn_event(build_compact_event(
-            reason,
-            requested_by_model,
-            false,
-            budget_report,
-            Some(&outcome),
-            tool_call_id,
-            None,
-        ))?;
         info!(
             thread_id,
             reason,
@@ -1072,15 +1061,6 @@ impl AgentLoop {
                 .metadata
                 .clone(),
                 true,
-            ));
-            thread_context.buffer_turn_event(build_compact_event(
-                "tool_requested",
-                true,
-                true,
-                budget_report,
-                None,
-                Some(tool_call_id),
-                Some(&error_message),
             ))?;
             let result = super::ToolCallResult {
                 content: error_message.clone(),
@@ -1099,7 +1079,7 @@ impl AgentLoop {
                 outcome: None,
                 error: Some(error_message),
                 request_messages: thread_context.messages(),
-                turn_events: thread_context.current_turn_events(),
+                turn_events: Vec::new(),
             });
             return Ok(result);
         }
@@ -1122,20 +1102,41 @@ impl AgentLoop {
                         kind: HookEventKind::PostToolUse,
                         payload: json!({
                             "tool": tool_call.name.clone(),
-                            "result": thread_context.current_turn_events().last().map(|event| event.metadata.clone()),
+                            "result": outcome.as_ref().map(|value| {
+                                build_compact_event(
+                                    "tool_requested",
+                                    true,
+                                    false,
+                                    budget_report,
+                                    Some(value),
+                                    Some(tool_call_id),
+                                    None,
+                                )
+                                .metadata
+                            }),
                         }),
                     })
                     .await?;
                 thread_context.record_tool_event(build_compact_thread_tool_event(
                     tool_call,
                     tool_call_id,
-                    thread_context
-                        .current_turn_events()
-                        .last()
-                        .map(|event| event.metadata.clone())
+                    outcome
+                        .as_ref()
+                        .map(|value| {
+                            build_compact_event(
+                                "tool_requested",
+                                true,
+                                false,
+                                budget_report,
+                                Some(value),
+                                Some(tool_call_id),
+                                None,
+                            )
+                            .metadata
+                        })
                         .unwrap_or_else(default_compact_event_metadata),
                     false,
-                ));
+                ))?;
                 ut_probe.on_compact(AgentLoopUTCompactSnapshot {
                     iteration: loop_iteration,
                     reason: "tool_requested".to_string(),
@@ -1145,7 +1146,7 @@ impl AgentLoop {
                     outcome: outcome.clone(),
                     error: None,
                     request_messages: thread_context.messages(),
-                    turn_events: thread_context.current_turn_events(),
+                    turn_events: Vec::new(),
                 });
                 let content = outcome
                     .as_ref()
@@ -1193,15 +1194,6 @@ impl AgentLoop {
                     .metadata
                     .clone(),
                     true,
-                ));
-                thread_context.buffer_turn_event(build_compact_event(
-                    "tool_requested",
-                    true,
-                    true,
-                    budget_report,
-                    None,
-                    Some(tool_call_id),
-                    Some(&error_message),
                 ))?;
                 ut_probe.on_compact(AgentLoopUTCompactSnapshot {
                     iteration: loop_iteration,
@@ -1212,7 +1204,7 @@ impl AgentLoop {
                     outcome: None,
                     error: Some(error_message.clone()),
                     request_messages: thread_context.messages(),
-                    turn_events: thread_context.current_turn_events(),
+                    turn_events: Vec::new(),
                 });
                 Ok(super::ToolCallResult {
                     content: error_message,
@@ -1292,31 +1284,33 @@ fn finalize_completed_turn(turn: ThreadFinalizedTurn) -> CompletedAgentTurn {
 async fn commit_message<H>(
     event_tx: &AgentEventSender,
     thread_context: &mut Thread,
-    reply_to_source: &mut bool,
     message: ChatMessage,
-    turn_events: Vec<AgentLoopEvent>,
+    event: Option<AgentLoopEvent>,
+    reply_to_source: &mut bool,
     on_committed_message: &mut H,
 ) -> Result<()>
 where
     H: AgentCommittedMessageHandler,
 {
-    thread_context.push_message(message.clone())?;
-    for event in &turn_events {
-        thread_context.buffer_turn_event(event.clone())?;
-    }
-    let dispatch_events = turn_events
+    let source_message_id = thread_context.current_turn_external_message_id();
+    thread_context.push_message(message.clone()).await?;
+    let dispatch_events = event
         .into_iter()
         .map(|event| {
-            let dispatch = event_tx.prepare_dispatch_event(event, *reply_to_source);
-            *reply_to_source = false;
-            dispatch
+            event_tx.prepare_dispatch_event(
+                event,
+                source_message_id
+                    .clone()
+                    .or_else(|| event_tx.source_message_id.clone()),
+                *reply_to_source,
+            )
         })
         .collect::<Vec<_>>();
-    let turn_id = thread_context
-        .current_turn_id()
-        .context("thread did not expose one active turn id for committed message")?;
+    if !dispatch_events.is_empty() {
+        *reply_to_source = false;
+    }
     on_committed_message
-        .on_committed_message(turn_id, thread_context, message, dispatch_events)
+        .on_committed_message(thread_context, message, dispatch_events)
         .await?;
     Ok(())
 }
@@ -1337,10 +1331,14 @@ async fn build_loop_output_metadata(
         "used_tool_name": used_tool_names.first().cloned(),
         "used_tool_names": used_tool_names,
         "loaded_toolsets": turn.snapshot.load_toolsets(),
-        "event_count": turn.events.len(),
+        "message_count": turn
+            .snapshot
+            .messages()
+            .iter()
+            .filter(|message| message.role != ChatMessageRole::System)
+            .count(),
         "context_budget": last_budget_report,
         "turn_status": turn.status,
-        "turn_id": turn.turn_id,
     })
 }
 
