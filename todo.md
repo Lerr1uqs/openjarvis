@@ -59,6 +59,7 @@ codex resume 019d511c-18c5-70a1-9636-87c66f63bbb5
 ```
 - [ ] 莫名其妙的之前的message还会注入进来？飞书机制？
 - [ ] acpx codex exec "xxx" 添加主动式记忆？
+- [ ] overwrite_active_history ut helper函数？应该怎么表示
 ```
 ```json
 asdsa
