@@ -1,10 +1,10 @@
 use chrono::Utc;
 use openjarvis::{
-    config::{AppConfig, LLMConfig, install_global_config},
+    config::{AppConfig, LLMConfig, LLMProviderProfileConfig, install_global_config},
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMRequest, build_provider, build_provider_from_global_config},
 };
-use std::{env::temp_dir, fs, path::PathBuf};
+use std::{collections::HashMap, env::temp_dir, fs, path::PathBuf};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -25,7 +25,9 @@ async fn mock_provider_returns_configured_response() {
 
     assert_eq!(
         reply
-            .message
+            .items
+            .into_iter()
+            .find(|item| item.role == ChatMessageRole::Assistant)
             .expect("mock provider should return text")
             .content,
         "收到"
@@ -51,7 +53,9 @@ async fn mock_protocol_builds_same_provider_even_with_vendor_style_provider_name
 
     assert_eq!(
         reply
-            .message
+            .items
+            .into_iter()
+            .find(|item| item.role == ChatMessageRole::Assistant)
             .expect("mock provider should return text")
             .content,
         "pong"
@@ -78,7 +82,9 @@ async fn provider_can_build_from_explicit_and_global_config_paths() {
         .expect("explicit provider should reply");
     assert_eq!(
         explicit_reply
-            .message
+            .items
+            .into_iter()
+            .find(|item| item.role == ChatMessageRole::Assistant)
             .expect("explicit provider should return text")
             .content,
         "from-global-config"
@@ -101,7 +107,9 @@ async fn provider_can_build_from_explicit_and_global_config_paths() {
         .expect("global provider should reply");
     assert_eq!(
         global_reply
-            .message
+            .items
+            .into_iter()
+            .find(|item| item.role == ChatMessageRole::Assistant)
             .expect("global provider should return text")
             .content,
         "from-global-config"
@@ -146,7 +154,9 @@ async fn mock_provider_does_not_require_api_key_path() {
 
     assert_eq!(
         reply
-            .message
+            .items
+            .into_iter()
+            .find(|item| item.role == ChatMessageRole::Assistant)
             .expect("mock provider should return text")
             .content,
         "still-mock"
@@ -207,6 +217,39 @@ fn zai_alias_builds_openai_compatible_provider() {
     };
 
     build_provider(&config).expect("zai alias should build as openai-compatible provider");
+}
+
+#[test]
+fn multi_provider_openai_responses_profile_builds_provider() {
+    // 测试场景: build_provider 必须按 active_provider 解析多 provider 配置，并选择 Responses transport。
+    let config = LLMConfig {
+        active_provider: Some("responses".to_string()),
+        providers: HashMap::from([
+            (
+                "responses".to_string(),
+                LLMProviderProfileConfig {
+                    protocol: "openai_responses".to_string(),
+                    model: "gpt-5-mini".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key: "test-key".to_string(),
+                    ..LLMProviderProfileConfig::default()
+                },
+            ),
+            (
+                "claude".to_string(),
+                LLMProviderProfileConfig {
+                    protocol: "anthropic".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    base_url: "https://api.anthropic.com".to_string(),
+                    api_key: "anthropic-key".to_string(),
+                    ..LLMProviderProfileConfig::default()
+                },
+            ),
+        ]),
+        ..LLMConfig::default()
+    };
+
+    build_provider(&config).expect("multi provider responses profile should build");
 }
 
 fn build_messages(system_prompt: &str, user_message: &str) -> Vec<ChatMessage> {

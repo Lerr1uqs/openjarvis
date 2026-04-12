@@ -179,13 +179,16 @@ impl ContextBudgetEstimator {
     /// assert_eq!(estimator.context_window_tokens(), 8192);
     /// ```
     pub fn from_config(llm: &LLMConfig, compact: &AgentCompactConfig) -> Self {
+        let configured_max_output_tokens = llm
+            .resolve_active_provider()
+            .ok()
+            .and_then(|provider| provider.max_output_tokens);
         Self {
             context_window_tokens: llm.context_window_tokens(),
-            reserved_output_tokens: llm
-                .max_output_tokens
+            reserved_output_tokens: configured_max_output_tokens
                 .or_else(|| compact.configured_reserved_output_tokens())
                 .unwrap_or_else(|| llm.max_output_tokens()),
-            tokenizer: llm.tokenizer.clone(),
+            tokenizer: llm.effective_tokenizer(),
         }
     }
 

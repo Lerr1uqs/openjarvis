@@ -8,6 +8,7 @@ pub enum ChatMessageRole {
     System,
     User,
     Assistant,
+    Reasoning,
     Toolcall,
     ToolResult,
 }
@@ -19,6 +20,7 @@ impl ChatMessageRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Reasoning => "reasoning",
             Self::Toolcall => "toolcall",
             Self::ToolResult => "tool_result",
         }
@@ -34,6 +36,8 @@ pub struct ChatToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,6 +48,8 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ChatToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_item_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -59,6 +65,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_item_id: None,
             created_at,
         }
     }
@@ -72,6 +79,12 @@ impl ChatMessage {
     /// Attach the originating `tool_call_id` to a tool result message.
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Attach the originating provider output item id to the message.
+    pub fn with_provider_item_id(mut self, provider_item_id: impl Into<String>) -> Self {
+        self.provider_item_id = Some(provider_item_id.into());
         self
     }
 }

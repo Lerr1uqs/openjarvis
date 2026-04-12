@@ -156,6 +156,7 @@ async fn load_turn_keeps_tool_call_id_history() {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "config.yaml" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::ToolResult, "ok", Utc::now())
@@ -217,6 +218,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:4".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "agent-doc/agent.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
@@ -224,6 +226,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:5".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "arch/system.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
@@ -231,6 +234,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:6".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "src/mod.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
@@ -238,6 +242,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:7".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "src/agent/mod.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::ToolResult, "agent-doc", now)
@@ -253,6 +258,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:8".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "model/session.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
@@ -260,6 +266,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:9".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "model/thread.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::Toolcall, "", now).with_tool_calls(vec![
@@ -267,6 +274,7 @@ async fn large_commit_history_keeps_tool_calls_and_results_intact() {
                         id: "read:10".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "README.md" }),
+                        provider_item_id: None,
                     },
                 ]),
                 ChatMessage::new(ChatMessageRole::ToolResult, "session-model", now)

@@ -22,19 +22,22 @@ async fn main() -> Result<()> {
     let config = load_config(args.config_path.as_deref())?;
     let llm_config = config.llm_config();
     ensure_real_provider_config(llm_config)?;
+    let resolved_provider = llm_config
+        .resolve_active_provider()
+        .context("llm_test requires one resolved active provider")?;
     let system_prompt = resolve_system_prompt(&args);
 
     eprintln!(
         "llm_test: protocol={}, provider={}, model={}, base_url={}",
-        llm_config.effective_protocol(),
-        llm_config.provider,
-        llm_config.model,
-        llm_config.base_url
+        resolved_provider.effective_protocol(),
+        resolved_provider.name,
+        resolved_provider.model,
+        resolved_provider.base_url
     );
-    if !llm_config.api_key_path.as_os_str().is_empty() {
+    if !resolved_provider.api_key_path.as_os_str().is_empty() {
         eprintln!(
             "llm_test: api_key_path={}",
-            llm_config.api_key_path.display()
+            resolved_provider.api_key_path.display()
         );
     }
     eprintln!("llm_test: using_system_prompt={system_prompt}");
@@ -49,8 +52,11 @@ async fn main() -> Result<()> {
         .context("llm test request failed")?;
 
     let content = reply
-        .message
+        .items
+        .into_iter()
+        .filter(|item| item.role == ChatMessageRole::Assistant)
         .map(|message| message.content)
+        .find(|content| !content.trim().is_empty())
         .context("llm test response did not contain assistant text")?;
     println!("{content}");
     Ok(())
@@ -111,19 +117,22 @@ fn ensure_real_provider_config(config: &LLMConfig) -> Result<()> {
     // 作用: 校验当前配置适合做真实 LLM 连通性测试，避免误走 mock protocol。
     // 参数: config 为当前加载出的 llm 子配置。
     match config.effective_protocol() {
-        "openai_compatible" => {}
+        "openai_compatible" | "openai_responses" => {}
         "mock" => bail!("llm_test expects a real provider, but llm.protocol resolved to mock"),
         "anthropic" => bail!("llm_test does not support anthropic providers yet"),
         other => bail!("llm_test does not support llm protocol `{other}`"),
     }
 
-    if config.model.trim().is_empty() {
+    let resolved = config
+        .resolve_active_provider()
+        .context("llm_test requires one resolved active provider")?;
+    if resolved.model.trim().is_empty() {
         bail!("llm.model is required");
     }
-    if config.base_url.trim().is_empty() {
+    if resolved.base_url.trim().is_empty() {
         bail!("llm.base_url is required");
     }
-    if config.api_key.trim().is_empty() && config.api_key_path.as_os_str().is_empty() {
+    if resolved.api_key.trim().is_empty() && resolved.api_key_path.as_os_str().is_empty() {
         bail!("llm.api_key or llm.api_key_path is required");
     }
 

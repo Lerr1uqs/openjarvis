@@ -416,24 +416,23 @@ async fn router_delivers_truncated_tool_events_but_full_final_reply() {
         Arc::new(SequenceProvider {
             responses: Arc::new(Mutex::new(vec![
                 LLMResponse {
-                    message: Some(ChatMessage::new(
-                        ChatMessageRole::Assistant,
-                        "开始执行",
-                        Utc::now(),
-                    )),
-                    tool_calls: vec![openjarvis::llm::LLMToolCall {
-                        id: "call_router_long_1".to_string(),
-                        name: "demo__long_echo".to_string(),
-                        arguments: long_arguments.clone(),
-                    }],
+                    items: vec![
+                        ChatMessage::new(ChatMessageRole::Assistant, "开始执行", Utc::now()),
+                        ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now())
+                            .with_tool_calls(vec![openjarvis::llm::LLMToolCall {
+                                id: "call_router_long_1".to_string(),
+                                name: "demo__long_echo".to_string(),
+                                arguments: long_arguments.clone(),
+                                provider_item_id: None,
+                            }]),
+                    ],
                 },
                 LLMResponse {
-                    message: Some(ChatMessage::new(
+                    items: vec![ChatMessage::new(
                         ChatMessageRole::Assistant,
                         "done",
                         Utc::now(),
-                    )),
-                    tool_calls: Vec::new(),
+                    )],
                 },
             ])),
         }),
@@ -2579,6 +2578,7 @@ fn spawn_mock_agent_loop(
                                 id: "call_mock_1".to_string(),
                                 name: "read".to_string(),
                                 arguments: json!({ "path": "Cargo.toml" }),
+                                provider_item_id: None,
                             }]);
                     thread_context
                         .push_message(tool_call_message.clone())
@@ -3098,23 +3098,26 @@ fn openjarvis_bin() -> String {
 
 fn text_response(content: &str) -> LLMResponse {
     LLMResponse {
-        message: Some(ChatMessage::new(
+        items: vec![ChatMessage::new(
             ChatMessageRole::Assistant,
             content,
             Utc::now(),
-        )),
-        tool_calls: Vec::new(),
+        )],
     }
 }
 
 fn tool_only_response(name: &str, arguments: serde_json::Value) -> LLMResponse {
     LLMResponse {
-        message: None,
-        tool_calls: vec![ChatToolCall {
-            id: "call_builtin_mcp".to_string(),
-            name: name.to_string(),
-            arguments,
-        }],
+        items: vec![
+            ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now()).with_tool_calls(vec![
+                ChatToolCall {
+                    id: "call_builtin_mcp".to_string(),
+                    name: name.to_string(),
+                    arguments,
+                    provider_item_id: None,
+                },
+            ]),
+        ],
     }
 }
 

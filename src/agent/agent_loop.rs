@@ -222,8 +222,7 @@ pub struct AgentLoopUTRequestSnapshot {
 #[derive(Debug, Clone)]
 pub struct AgentLoopUTLLMResponseSnapshot {
     pub iteration: usize,
-    pub message: Option<ChatMessage>,
-    pub tool_calls: Vec<crate::llm::LLMToolCall>,
+    pub items: Vec<ChatMessage>,
 }
 
 /// Integration-test snapshot captured before one tool execution starts.
@@ -321,8 +320,7 @@ impl<'a> AgentLoopUTProberHandle<'a> {
     fn on_llm_response(&mut self, iteration: usize, response: &crate::llm::LLMResponse) {
         let snapshot = AgentLoopUTLLMResponseSnapshot {
             iteration,
-            message: response.message.clone(),
-            tool_calls: response.tool_calls.clone(),
+            items: response.items.clone(),
         };
         if let Some(probe) = self.probe.as_deref_mut() {
             probe.on_llm_response(&snapshot);
@@ -578,94 +576,89 @@ impl AgentLoop {
 
                 let response = self.llm.generate(LLMRequest { messages, tools }).await?;
                 ut_probe.on_llm_response(loop_iteration, &response);
+                let provider_tool_calls = collect_response_tool_calls(&response.items)?;
+                let final_assistant_index = response
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        item.role == ChatMessageRole::Assistant && !item.content.trim().is_empty()
+                    })
+                    .map(|(index, _)| index)
+                    .last();
+                let turn_reply = final_assistant_index
+                    .and_then(|index| response.items.get(index))
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default();
+                let has_tool_calls = !provider_tool_calls.is_empty();
 
                 info!(
-                    toolcalls_count = %response.tool_calls.len(),
-                    content = response
-                        .message
-                        .as_ref()
-                        .map(|m| m.content.chars().take(50).collect::<String>())
-                        .unwrap_or("None".into()),
+                    item_count = response.items.len(),
+                    toolcalls_count = provider_tool_calls.len(),
+                    item_roles = ?response
+                        .items
+                        .iter()
+                        .map(|item| item.role.as_label())
+                        .collect::<Vec<_>>(),
+                    content = turn_reply.chars().take(50).collect::<String>(),
                     "[LLM-GENERATE] after"
                 );
 
-                if response.tool_calls.is_empty() {
-                    let assistant_message = response
-                        .message
-                        .context("llm response did not contain assistant text or tool calls")?;
-                    if assistant_message.content.trim().is_empty() {
-                        bail!("llm final response did not contain assistant text");
-                    }
-
-                    commit_message(
-                        &event_tx,
-                        &mut thread_context,
-                        assistant_message.clone(),
-                        Some(AgentLoopEvent {
-                            kind: AgentLoopEventKind::TextOutput,
-                            content: assistant_message.content.clone(),
-                            metadata: json!({
-                                "source": "llm_response",
-                                "is_final": true,
-                            }),
-                        }),
-                        &mut reply_to_source,
-                        on_committed_message,
-                    )
-                    .await?;
-                    return Ok::<TurnLoopSuccess, anyhow::Error>(TurnLoopSuccess {
-                        reply: assistant_message.content,
-                        completed: true,
-                    });
+                if response.items.is_empty() {
+                    bail!("llm response did not contain any conversation items");
                 }
 
-                let turn_reply = response
-                    .message
-                    .as_ref()
-                    .map(|message| message.content.clone())
-                    .unwrap_or_default();
-                if let Some(message) = response.message.as_ref()
-                    && !message.content.trim().is_empty()
-                {
-                    commit_message(
-                        &event_tx,
-                        &mut thread_context,
-                        message.clone(),
-                        Some(AgentLoopEvent {
-                            kind: AgentLoopEventKind::TextOutput,
-                            content: message.content.clone(),
-                            metadata: json!({
-                                "source": "llm_response",
-                                "is_final": false,
-                            }),
-                        }),
-                        &mut reply_to_source,
-                        on_committed_message,
-                    )
-                    .await?;
-                }
-                let tool_call_message_created_at = response
-                    .message
-                    .as_ref()
-                    .map(|message| message.created_at)
-                    .unwrap_or_else(Utc::now);
-                for provider_tool_call in &response.tool_calls {
-                    let tool_call = ToolCallRequest {
-                        name: provider_tool_call.name.clone(),
-                        arguments: provider_tool_call.arguments.clone(),
+                for (index, item) in response.items.iter().cloned().enumerate() {
+                    let event = match item.role {
+                        ChatMessageRole::Reasoning => None,
+                        ChatMessageRole::Assistant if !item.content.trim().is_empty() => {
+                            Some(AgentLoopEvent {
+                                kind: AgentLoopEventKind::TextOutput,
+                                content: item.content.clone(),
+                                metadata: json!({
+                                    "source": "llm_response",
+                                    "is_final": !has_tool_calls && final_assistant_index == Some(index),
+                                    "response_item_role": item.role.as_label(),
+                                }),
+                            })
+                        }
+                        ChatMessageRole::Assistant => None,
+                        ChatMessageRole::Toolcall => {
+                            let provider_tool_call = extract_tool_call_from_message(&item)?;
+                            let tool_call = ToolCallRequest {
+                                name: provider_tool_call.name.clone(),
+                                arguments: provider_tool_call.arguments.clone(),
+                            };
+                            Some(build_tool_call_event(&tool_call, &provider_tool_call.id))
+                        }
+                        ChatMessageRole::ToolResult => None,
+                        ChatMessageRole::System | ChatMessageRole::User => {
+                            bail!("llm provider returned unsupported item role `{}`", item.role.as_label());
+                        }
                     };
                     commit_message(
                         &event_tx,
                         &mut thread_context,
-                        build_tool_call_message(provider_tool_call, tool_call_message_created_at),
-                        Some(build_tool_call_event(&tool_call, &provider_tool_call.id)),
+                        item,
+                        event,
                         &mut reply_to_source,
                         on_committed_message,
                     )
                     .await?;
                 }
 
-                for provider_tool_call in response.tool_calls {
+                if !has_tool_calls {
+                    if turn_reply.trim().is_empty() {
+                        bail!("llm final response did not contain assistant text");
+                    }
+
+                    return Ok::<TurnLoopSuccess, anyhow::Error>(TurnLoopSuccess {
+                        reply: turn_reply,
+                        completed: true,
+                    });
+                }
+
+                for provider_tool_call in provider_tool_calls {
                     let tool_call = ToolCallRequest {
                         name: provider_tool_call.name.clone(),
                         arguments: provider_tool_call.arguments.clone(),
@@ -1281,6 +1274,29 @@ fn finalize_completed_turn(turn: ThreadFinalizedTurn) -> CompletedAgentTurn {
     CompletedAgentTurn { turn }
 }
 
+fn collect_response_tool_calls(items: &[ChatMessage]) -> Result<Vec<crate::llm::LLMToolCall>> {
+    items
+        .iter()
+        .filter(|item| item.role == ChatMessageRole::Toolcall)
+        .map(extract_tool_call_from_message)
+        .collect()
+}
+
+fn extract_tool_call_from_message(message: &ChatMessage) -> Result<crate::llm::LLMToolCall> {
+    if message.role != ChatMessageRole::Toolcall {
+        bail!(
+            "expected toolcall message when extracting provider tool call, got `{}`",
+            message.role.as_label()
+        );
+    }
+    let tool_call_count = message.tool_calls.len();
+    if tool_call_count != 1 {
+        bail!("toolcall message must contain exactly one tool call, got {tool_call_count}");
+    }
+
+    Ok(message.tool_calls[0].clone())
+}
+
 async fn commit_message<H>(
     event_tx: &AgentEventSender,
     thread_context: &mut Thread,
@@ -1340,14 +1356,6 @@ async fn build_loop_output_metadata(
         "context_budget": last_budget_report,
         "turn_status": turn.status,
     })
-}
-
-fn build_tool_call_message(
-    tool_call: &crate::llm::LLMToolCall,
-    created_at: chrono::DateTime<Utc>,
-) -> ChatMessage {
-    ChatMessage::new(ChatMessageRole::Toolcall, "", created_at)
-        .with_tool_calls(vec![tool_call.clone()])
 }
 
 fn format_tool_result_content(content: &str, is_error: bool) -> String {

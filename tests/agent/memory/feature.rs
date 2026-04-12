@@ -52,15 +52,38 @@ struct RecordingProvider {
 impl LLMProvider for RecordingProvider {
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse> {
         self.requests.lock().await.push(request);
-        Ok(LLMResponse {
-            message: Some(ChatMessage::new(
+        Ok(scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "ok",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        })
+            Vec::new(),
+        ))
     }
+}
+
+fn scripted_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LLMToolCall {
+    LLMToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+        provider_item_id: None,
+    }
+}
+
+fn scripted_llm_response(
+    message: Option<ChatMessage>,
+    tool_calls: Vec<LLMToolCall>,
+) -> LLMResponse {
+    let mut items = Vec::new();
+    if let Some(message) = message {
+        items.push(message);
+    }
+    items.extend(tool_calls.into_iter().map(|tool_call| {
+        ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now()).with_tool_calls(vec![tool_call])
+    }));
+    LLMResponse { items }
 }
 
 #[tokio::test]
@@ -76,44 +99,44 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
 
     let writer_worker = AgentWorker::with_runtime(
         Arc::new(ScriptedLLMProvider::new(vec![
-            LLMResponse {
-                message: Some(ChatMessage::new(
+            scripted_llm_response(
+                Some(ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "我先加载记忆工具",
                     Utc::now(),
                 )),
-                tool_calls: vec![LLMToolCall {
-                    id: "call_load_memory".to_string(),
-                    name: "load_toolset".to_string(),
-                    arguments: json!({ "name": "memory" }),
-                }],
-            },
-            LLMResponse {
-                message: Some(ChatMessage::new(
+                vec![scripted_tool_call(
+                    "call_load_memory",
+                    "load_toolset",
+                    json!({ "name": "memory" }),
+                )],
+            ),
+            scripted_llm_response(
+                Some(ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "正在写入记忆",
                     Utc::now(),
                 )),
-                tool_calls: vec![LLMToolCall {
-                    id: "call_memory_write".to_string(),
-                    name: "memory_write".to_string(),
-                    arguments: json!({
+                vec![scripted_tool_call(
+                    "call_memory_write",
+                    "memory_write",
+                    json!({
                         "path": "workflow/notion.md",
                         "title": "Notion 上传工作流",
                         "content": "上传到 notion 时走用户自定义模板",
                         "type": "active",
                         "keywords": ["notion", "上传"],
                     }),
-                }],
-            },
-            LLMResponse {
-                message: Some(ChatMessage::new(
+                )],
+            ),
+            scripted_llm_response(
+                Some(ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "记住了",
                     Utc::now(),
                 )),
-                tool_calls: Vec::new(),
-            },
+                Vec::new(),
+            ),
         ])),
         "system prompt",
         runtime.clone(),

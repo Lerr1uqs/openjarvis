@@ -28,18 +28,21 @@ async fn run_ping(cli: &LlmProviderPingCli) -> Result<()> {
     let config = load_config(cli.config.as_deref())?;
     let llm_config = config.llm_config();
     ensure_connectivity_provider_config(llm_config)?;
+    let resolved_provider = llm_config
+        .resolve_active_provider()
+        .context("llm_provider_ping requires one resolved active provider")?;
 
     eprintln!(
         "llm_provider_ping: protocol={}, provider={}, model={}, base_url={}",
-        llm_config.effective_protocol(),
-        llm_config.provider,
-        llm_config.model,
-        llm_config.base_url
+        resolved_provider.effective_protocol(),
+        resolved_provider.name,
+        resolved_provider.model,
+        resolved_provider.base_url
     );
-    if !llm_config.api_key_path.as_os_str().is_empty() {
+    if !resolved_provider.api_key_path.as_os_str().is_empty() {
         eprintln!(
             "llm_provider_ping: api_key_path={}",
-            llm_config.api_key_path.display()
+            resolved_provider.api_key_path.display()
         );
     }
     eprintln!("llm_provider_ping: sending fixed ping request");
@@ -54,8 +57,11 @@ async fn run_ping(cli: &LlmProviderPingCli) -> Result<()> {
         .context("llm provider ping request failed")?;
 
     let content = reply
-        .message
+        .items
+        .into_iter()
+        .filter(|item| item.role == ChatMessageRole::Assistant)
         .map(|message| message.content)
+        .find(|content| !content.trim().is_empty())
         .context("llm provider ping response did not contain assistant text")?;
     ensure_expected_pong(&content)?;
 
@@ -73,7 +79,7 @@ fn load_config(config_path: Option<&Path>) -> Result<AppConfig> {
 
 fn ensure_connectivity_provider_config(config: &LLMConfig) -> Result<()> {
     match config.effective_protocol() {
-        "openai_compatible" => {}
+        "openai_compatible" | "openai_responses" => {}
         "mock" => {
             bail!("llm_provider_ping expects a real provider, but llm.protocol resolved to mock")
         }
@@ -81,13 +87,16 @@ fn ensure_connectivity_provider_config(config: &LLMConfig) -> Result<()> {
         other => bail!("llm_provider_ping does not support llm protocol `{other}`"),
     }
 
-    if config.model.trim().is_empty() {
+    let resolved = config
+        .resolve_active_provider()
+        .context("llm_provider_ping requires one resolved active provider")?;
+    if resolved.model.trim().is_empty() {
         bail!("llm.model is required");
     }
-    if config.base_url.trim().is_empty() {
+    if resolved.base_url.trim().is_empty() {
         bail!("llm.base_url is required");
     }
-    if config.api_key.trim().is_empty() && config.api_key_path.as_os_str().is_empty() {
+    if resolved.api_key.trim().is_empty() && resolved.api_key_path.as_os_str().is_empty() {
         bail!("llm.api_key or llm.api_key_path is required");
     }
 

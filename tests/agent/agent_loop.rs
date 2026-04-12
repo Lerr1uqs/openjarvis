@@ -63,6 +63,9 @@ impl LLMProvider for FailingLLMProvider {
 struct EchoTool;
 
 struct LongResultTool;
+struct WeatherTool;
+struct RouteTool;
+struct HotelTool;
 
 #[async_trait]
 impl ToolHandler for EchoTool {
@@ -98,6 +101,66 @@ impl ToolHandler for LongResultTool {
     async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
         Ok(ToolCallResult {
             content: "R".repeat(512),
+            metadata: json!({}),
+            is_error: false,
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for WeatherTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__weather".to_string(),
+            description: "Weather tool for responses-style loop tests".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "{\"forecast\":\"sunny\",\"temp\":23}".to_string(),
+            metadata: json!({}),
+            is_error: false,
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for RouteTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__route".to_string(),
+            description: "Route planner tool for responses-style loop tests".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "{\"trains\":[\"G7311\"]}".to_string(),
+            metadata: json!({}),
+            is_error: false,
+        })
+    }
+}
+
+#[async_trait]
+impl ToolHandler for HotelTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "demo__hotel".to_string(),
+            description: "Hotel search tool for responses-style loop tests".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: openjarvis::agent::ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "{\"hotels\":[\"West Lake Hotel\"]}".to_string(),
             metadata: json!({}),
             is_error: false,
         })
@@ -164,6 +227,29 @@ fn build_thread_with_system_messages(external_thread_id: &str, system_count: usi
 
 fn build_event_sender(incoming: &IncomingMessage, thread_context: &Thread) -> AgentEventSender {
     AgentEventSender::from_incoming_and_locator(incoming, &thread_context.locator)
+}
+
+fn scripted_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LLMToolCall {
+    LLMToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+        provider_item_id: None,
+    }
+}
+
+fn scripted_llm_response(
+    message: Option<ChatMessage>,
+    tool_calls: Vec<LLMToolCall>,
+) -> LLMResponse {
+    let mut items = Vec::new();
+    if let Some(message) = message {
+        items.push(message);
+    }
+    items.extend(tool_calls.into_iter().map(|tool_call| {
+        ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now()).with_tool_calls(vec![tool_call])
+    }));
+    LLMResponse { items }
 }
 
 fn only_turn(output: &AgentLoopOutput) -> &openjarvis::agent::CompletedAgentTurn {
@@ -311,26 +397,22 @@ async fn run_locked_thread_emits_committed_events_in_message_order() {
         .expect("echo tool should register");
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(ScriptedLLMProvider::new(vec![
-            LLMResponse {
-                message: Some(ChatMessage::new(
+            scripted_llm_response(
+                Some(ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "thinking",
                     Utc::now(),
                 )),
-                tool_calls: vec![LLMToolCall {
-                    id: "call_1".to_string(),
-                    name: "demo__echo".to_string(),
-                    arguments: json!({}),
-                }],
-            },
-            LLMResponse {
-                message: Some(ChatMessage::new(
+                vec![scripted_tool_call("call_1", "demo__echo", json!({}))],
+            ),
+            scripted_llm_response(
+                Some(ChatMessage::new(
                     ChatMessageRole::Assistant,
                     "done",
                     Utc::now(),
                 )),
-                tool_calls: Vec::new(),
-            },
+                Vec::new(),
+            ),
         ])),
         runtime,
         LLMConfig::default(),
@@ -461,26 +543,26 @@ async fn run_v1_with_ut_probe_exposes_thread_owned_turn_state() {
         .await
         .expect("echo tool should register");
     let provider = ScriptedLLMProvider::new(vec![
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "我先查一下",
                 Utc::now(),
             )),
-            tool_calls: vec![LLMToolCall {
-                id: "call_demo_probe_1".to_string(),
-                name: "demo__echo".to_string(),
-                arguments: json!({"query": "demo"}),
-            }],
-        },
-        LLMResponse {
-            message: Some(ChatMessage::new(
+            vec![scripted_tool_call(
+                "call_demo_probe_1",
+                "demo__echo",
+                json!({"query": "demo"}),
+            )],
+        ),
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "done",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        },
+            Vec::new(),
+        ),
     ]);
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),
@@ -540,33 +622,29 @@ async fn run_v1_batches_multiple_tool_calls_and_probes_each_iteration() {
         .await
         .expect("echo tool should register");
     let provider = ScriptedLLMProvider::new(vec![
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "我会连续调用两个工具",
                 Utc::now(),
             )),
-            tool_calls: vec![
-                LLMToolCall {
-                    id: "call_demo_batch_1".to_string(),
-                    name: "demo__echo".to_string(),
-                    arguments: json!({"query": "first"}),
-                },
-                LLMToolCall {
-                    id: "call_demo_batch_2".to_string(),
-                    name: "demo__echo".to_string(),
-                    arguments: json!({"query": "second"}),
-                },
+            vec![
+                scripted_tool_call("call_demo_batch_1", "demo__echo", json!({"query": "first"})),
+                scripted_tool_call(
+                    "call_demo_batch_2",
+                    "demo__echo",
+                    json!({"query": "second"}),
+                ),
             ],
-        },
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        ),
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "batch done",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        },
+            Vec::new(),
+        ),
     ]);
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),
@@ -671,26 +749,26 @@ async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
         .await
         .expect("echo tool should register");
     let provider = ScriptedLLMProvider::new(vec![
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "我先查一下",
                 Utc::now(),
             )),
-            tool_calls: vec![LLMToolCall {
-                id: "call_demo_1".to_string(),
-                name: "demo__echo".to_string(),
-                arguments: json!({"query": "demo"}),
-            }],
-        },
-        LLMResponse {
-            message: Some(ChatMessage::new(
+            vec![scripted_tool_call(
+                "call_demo_1",
+                "demo__echo",
+                json!({"query": "demo"}),
+            )],
+        ),
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "done",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        },
+            Vec::new(),
+        ),
     ]);
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),
@@ -744,6 +822,132 @@ async fn run_v1_executes_tool_calls_and_persists_tool_events_in_snapshot() {
 }
 
 #[tokio::test]
+async fn run_v1_preserves_reasoning_and_multi_tool_order_across_iterations() {
+    // 测试场景: Responses 风格的 reasoning -> tool_call -> tool_result -> final assistant 链路必须保序写入 Thread。
+    let runtime = AgentRuntime::new();
+    runtime
+        .tools()
+        .register(Arc::new(WeatherTool))
+        .await
+        .expect("weather tool should register");
+    runtime
+        .tools()
+        .register(Arc::new(RouteTool))
+        .await
+        .expect("route tool should register");
+    runtime
+        .tools()
+        .register(Arc::new(HotelTool))
+        .await
+        .expect("hotel tool should register");
+    let provider = ScriptedLLMProvider::new(vec![
+        LLMResponse {
+            items: vec![
+                ChatMessage::new(ChatMessageRole::Reasoning, "先看杭州天气", Utc::now())
+                    .with_provider_item_id("rsn_weather"),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now())
+                    .with_provider_item_id("fc_weather")
+                    .with_tool_calls(vec![scripted_tool_call(
+                        "call_weather",
+                        "demo__weather",
+                        json!({"city": "杭州"}),
+                    )]),
+            ],
+        },
+        LLMResponse {
+            items: vec![
+                ChatMessage::new(
+                    ChatMessageRole::Reasoning,
+                    "天气适合出行，再查路线和酒店",
+                    Utc::now(),
+                )
+                .with_provider_item_id("rsn_trip"),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now())
+                    .with_provider_item_id("fc_route")
+                    .with_tool_calls(vec![scripted_tool_call(
+                        "call_route",
+                        "demo__route",
+                        json!({"from": "上海", "to": "杭州"}),
+                    )]),
+                ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now())
+                    .with_provider_item_id("fc_hotel")
+                    .with_tool_calls(vec![scripted_tool_call(
+                        "call_hotel",
+                        "demo__hotel",
+                        json!({"city": "杭州", "nights": 2}),
+                    )]),
+            ],
+        },
+        LLMResponse {
+            items: vec![ChatMessage::new(
+                ChatMessageRole::Assistant,
+                "已为你整理杭州三日行程",
+                Utc::now(),
+            )],
+        },
+    ]);
+    let loop_runner = AgentLoop::with_compact_config(
+        Arc::new(provider),
+        runtime,
+        LLMConfig::default(),
+        AgentCompactConfig::default(),
+    );
+    let thread_context = build_thread("thread_responses_reasoning");
+    let incoming = build_incoming("帮我规划杭州行程", "thread_responses_reasoning");
+
+    let (output, events) =
+        run_locked_thread_with_recorded_events(&loop_runner, &incoming, thread_context).await;
+
+    let snapshot_roles = last_turn(&output)
+        .turn
+        .snapshot
+        .non_system_messages()
+        .iter()
+        .map(|message| message.role.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot_roles,
+        vec![
+            ChatMessageRole::User,
+            ChatMessageRole::Reasoning,
+            ChatMessageRole::Toolcall,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Reasoning,
+            ChatMessageRole::Toolcall,
+            ChatMessageRole::Toolcall,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Assistant,
+        ]
+    );
+    assert_eq!(
+        last_turn(&output).turn.snapshot.non_system_messages()[1]
+            .provider_item_id
+            .as_deref(),
+        Some("rsn_weather")
+    );
+    assert_eq!(
+        last_turn(&output).turn.snapshot.non_system_messages()[4]
+            .provider_item_id
+            .as_deref(),
+        Some("rsn_trip")
+    );
+    assert_eq!(
+        collected_event_kinds(&events),
+        vec![
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolCall,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::ToolResult,
+            AgentLoopEventKind::TextOutput,
+        ]
+    );
+    assert_eq!(last_turn(&output).turn.reply, "已为你整理杭州三日行程");
+}
+
+#[tokio::test]
 async fn run_v1_truncates_tool_events_but_keeps_full_tool_result_history() {
     // 测试场景: 对外事件要截断长 tool 文本，但 Thread finalized snapshot 中必须保留完整 tool result。
     let runtime = AgentRuntime::new();
@@ -753,26 +957,26 @@ async fn run_v1_truncates_tool_events_but_keeps_full_tool_result_history() {
         .await
         .expect("long tool should register");
     let provider = ScriptedLLMProvider::new(vec![
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "准备调用长工具",
                 Utc::now(),
             )),
-            tool_calls: vec![LLMToolCall {
-                id: "call_demo_long_1".to_string(),
-                name: "demo__long_echo".to_string(),
-                arguments: json!({"query": "demo"}),
-            }],
-        },
-        LLMResponse {
-            message: Some(ChatMessage::new(
+            vec![scripted_tool_call(
+                "call_demo_long_1",
+                "demo__long_echo",
+                json!({"query": "demo"}),
+            )],
+        ),
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "long done",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        },
+            Vec::new(),
+        ),
     ]);
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),
@@ -823,22 +1027,18 @@ async fn run_v1_tool_requested_compact_replaces_thread_owned_active_view() {
     }))
     .expect("compact config should parse");
     let provider = ScriptedLLMProvider::new(vec![
-        LLMResponse {
-            message: None,
-            tool_calls: vec![LLMToolCall {
-                id: "call_compact_1".to_string(),
-                name: "compact".to_string(),
-                arguments: json!({}),
-            }],
-        },
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        scripted_llm_response(
+            None,
+            vec![scripted_tool_call("call_compact_1", "compact", json!({}))],
+        ),
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "after compact",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        },
+            Vec::new(),
+        ),
     ]);
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),
@@ -933,22 +1133,22 @@ async fn run_v1_auto_compact_feature_exposes_compact_tool_and_keeps_system_prefi
         ..LLMConfig::default()
     };
     let provider = ScriptedLLMProvider::new(vec![
-        LLMResponse {
-            message: None,
-            tool_calls: vec![LLMToolCall {
-                id: "call_auto_compact_1".to_string(),
-                name: "compact".to_string(),
-                arguments: json!({}),
-            }],
-        },
-        LLMResponse {
-            message: Some(ChatMessage::new(
+        scripted_llm_response(
+            None,
+            vec![scripted_tool_call(
+                "call_auto_compact_1",
+                "compact",
+                json!({}),
+            )],
+        ),
+        scripted_llm_response(
+            Some(ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "after auto compact",
                 Utc::now(),
             )),
-            tool_calls: Vec::new(),
-        },
+            Vec::new(),
+        ),
     ]);
     let loop_runner = AgentLoop::with_compact_config(
         Arc::new(provider),

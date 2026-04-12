@@ -56,6 +56,7 @@ fn store_turn_preserves_tool_call_metadata_in_message_history() {
                     id: "call_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "Cargo.toml" }),
+                    provider_item_id: None,
                 },
             ]),
             ChatMessage::new(ChatMessageRole::ToolResult, "file-content", now)
@@ -125,9 +126,11 @@ fn record_tool_event_requires_active_turn() {
         .record_tool_event(event)
         .expect_err("tool audit without active turn should fail");
 
-    assert!(error
-        .to_string()
-        .contains("cannot record tool event without one active turn"));
+    assert!(
+        error
+            .to_string()
+            .contains("cannot record tool event without one active turn")
+    );
     assert!(thread.load_tool_events().is_empty());
 }
 

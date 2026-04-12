@@ -191,13 +191,20 @@ impl CompactProvider for LLMCompactProvider {
             .await
             .context("compact provider failed to generate a summary")?;
 
-        if !response.tool_calls.is_empty() {
+        if response
+            .items
+            .iter()
+            .any(|item| item.role == ChatMessageRole::Toolcall)
+        {
             bail!("compact provider must not return tool calls");
         }
 
         let content = response
-            .message
+            .items
+            .into_iter()
+            .filter(|message| message.role == ChatMessageRole::Assistant)
             .map(|message| message.content)
+            .find(|content| !content.trim().is_empty())
             .context("compact provider returned no assistant message")?;
 
         parse_compact_summary(&content)

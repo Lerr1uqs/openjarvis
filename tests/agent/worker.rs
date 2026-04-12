@@ -114,12 +114,11 @@ impl LLMProvider for RecordingProvider {
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse> {
         self.requests.lock().await.push(request);
         Ok(LLMResponse {
-            message: Some(ChatMessage::new(
+            items: vec![ChatMessage::new(
                 ChatMessageRole::Assistant,
                 "ok",
                 Utc::now(),
-            )),
-            tool_calls: Vec::new(),
+            )],
         })
     }
 }
@@ -231,6 +230,50 @@ llm:
 
     assert_eq!(worker.runtime().hooks().len().await, 1);
     assert!(worker.sandbox().is_placeholder());
+}
+
+#[tokio::test]
+async fn worker_from_config_uses_llm_system_prompt_override() {
+    let sessions = SessionManager::new();
+    let config: AppConfig = serde_yaml::from_str(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "mock"
+  system_prompt: "config system prompt"
+"#,
+    )
+    .expect("config should parse");
+    let worker = AgentWorker::from_config(&config)
+        .await
+        .expect("worker should build from config");
+    let handle = worker.spawn();
+    let incoming = build_incoming("hello");
+    let locator = sessions
+        .load_or_create_thread(&incoming)
+        .await
+        .expect("thread should resolve");
+
+    handle
+        .request_tx
+        .send(AgentRequest {
+            locator,
+            incoming,
+            sessions: sessions.clone(),
+        })
+        .await
+        .expect("request should be accepted");
+
+    let events = collect_events(handle.event_rx, 3).await;
+    match &events[1] {
+        AgentWorkerEvent::TurnFinalized(turn) => {
+            assert_eq!(
+                turn.turn.snapshot.system_messages()[0].content,
+                "config system prompt"
+            );
+        }
+        other => panic!("unexpected second event: {other:?}"),
+    }
 }
 
 #[tokio::test]

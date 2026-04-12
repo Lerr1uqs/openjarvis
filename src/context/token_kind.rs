@@ -58,6 +58,7 @@ impl ContextTokenKind {
             ChatMessageRole::System => Self::System,
             ChatMessageRole::User
             | ChatMessageRole::Assistant
+            | ChatMessageRole::Reasoning
             | ChatMessageRole::Toolcall
             | ChatMessageRole::ToolResult => Self::Chat,
         }

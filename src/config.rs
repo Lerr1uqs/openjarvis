@@ -47,10 +47,14 @@ pub fn install_global_config(config: AppConfig) -> Result<&'static AppConfig> {
     let installed = GLOBAL_APP_CONFIG
         .get()
         .expect("global app config should be readable immediately after installation");
+    let resolved_llm = installed
+        .llm_config()
+        .resolve_active_provider()
+        .context("global config should expose one resolved active llm provider")?;
     info!(
-        llm_protocol = installed.llm_config().effective_protocol(),
-        llm_provider = %installed.llm_config().provider,
-        llm_model = %installed.llm_config().model,
+        llm_protocol = resolved_llm.effective_protocol(),
+        llm_provider = %resolved_llm.name,
+        llm_model = %resolved_llm.model,
         builtin_mcp_enabled = installed
             .agent_config()
             .tool_config()
@@ -1507,12 +1511,187 @@ fn default_llm_tokenizer() -> String {
     "chars_div4".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct LLMConfig {
+fn default_llm_system_prompt() -> String {
+    DEFAULT_ASSISTANT_SYSTEM_PROMPT.to_string()
+}
+
+fn default_llm_headers() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[derive(Debug, Default, Clone)]
+struct RawLLMProviderDefaults {
+    protocol: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    api_key_path: Option<PathBuf>,
+    mock_response: Option<String>,
+    context_window_tokens: Option<usize>,
+    max_output_tokens: Option<usize>,
+    tokenizer: Option<String>,
+}
+
+impl RawLLMProviderDefaults {
+    fn from_raw_llm_config(raw: &RawLLMConfig) -> Self {
+        Self {
+            protocol: raw.protocol.clone(),
+            model: raw.model.clone(),
+            base_url: raw.base_url.clone(),
+            api_key: raw.api_key.clone(),
+            api_key_path: raw.api_key_path.clone(),
+            mock_response: raw.mock_response.clone(),
+            context_window_tokens: raw.context_window_tokens,
+            max_output_tokens: raw.max_output_tokens,
+            tokenizer: raw.tokenizer.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLLMProviderProfileConfig {
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_path: Option<PathBuf>,
+    #[serde(default)]
+    mock_response: Option<String>,
+    #[serde(default)]
+    context_window_tokens: Option<usize>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    tokenizer: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+}
+
+impl RawLLMProviderProfileConfig {
+    fn into_profile(self, defaults: &RawLLMProviderDefaults) -> LLMProviderProfileConfig {
+        LLMProviderProfileConfig {
+            protocol: self
+                .protocol
+                .or_else(|| defaults.protocol.clone())
+                .unwrap_or_else(default_deserialized_llm_protocol),
+            model: self
+                .model
+                .or_else(|| defaults.model.clone())
+                .unwrap_or_else(default_llm_model),
+            base_url: self
+                .base_url
+                .or_else(|| defaults.base_url.clone())
+                .unwrap_or_else(default_llm_base_url),
+            api_key: self
+                .api_key
+                .or_else(|| defaults.api_key.clone())
+                .unwrap_or_else(default_llm_api_key),
+            api_key_path: self
+                .api_key_path
+                .or_else(|| defaults.api_key_path.clone())
+                .unwrap_or_else(default_llm_api_key_path),
+            mock_response: self
+                .mock_response
+                .or_else(|| defaults.mock_response.clone())
+                .unwrap_or_else(default_llm_mock_response),
+            context_window_tokens: self
+                .context_window_tokens
+                .or(defaults.context_window_tokens),
+            max_output_tokens: self.max_output_tokens.or(defaults.max_output_tokens),
+            tokenizer: self
+                .tokenizer
+                .or_else(|| defaults.tokenizer.clone())
+                .unwrap_or_else(default_llm_tokenizer),
+            headers: self.headers,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawNamedLLMProviderProfileConfig {
+    name: String,
+    #[serde(flatten)]
+    profile: RawLLMProviderProfileConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawLLMProviders {
+    Map(HashMap<String, RawLLMProviderProfileConfig>),
+    List(Vec<RawNamedLLMProviderProfileConfig>),
+}
+
+impl Default for RawLLMProviders {
+    fn default() -> Self {
+        Self::Map(HashMap::new())
+    }
+}
+
+impl RawLLMProviders {
+    fn into_profiles(
+        self,
+        defaults: &RawLLMProviderDefaults,
+    ) -> std::result::Result<(HashMap<String, LLMProviderProfileConfig>, bool), String> {
+        match self {
+            Self::Map(profiles) => Ok((
+                profiles
+                    .into_iter()
+                    .map(|(name, profile)| (name, profile.into_profile(defaults)))
+                    .collect(),
+                false,
+            )),
+            Self::List(entries) => {
+                let mut profiles = HashMap::with_capacity(entries.len());
+                for entry in entries {
+                    let name = entry.name.trim();
+                    if name.is_empty() {
+                        return Err("llm.providers[].name must not be blank".to_string());
+                    }
+                    if profiles
+                        .insert(name.to_string(), entry.profile.into_profile(defaults))
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "llm.providers contains duplicated provider `{name}`"
+                        ));
+                    }
+                }
+                Ok((profiles, true))
+            }
+        }
+    }
+}
+
+/// One named LLM provider profile declared under `llm.providers`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::LLMProviderProfileConfig;
+///
+/// let profile: LLMProviderProfileConfig = serde_yaml::from_str(
+///     r#"
+/// protocol: "openai_responses"
+/// model: "gpt-5-mini"
+/// base_url: "https://api.openai.com/v1"
+/// api_key: "test-key"
+/// headers:
+///   X-Trace-Id: "demo"
+/// "#,
+/// )
+/// .expect("profile should parse");
+///
+/// assert_eq!(profile.effective_protocol(), "openai_responses");
+/// assert_eq!(profile.headers["X-Trace-Id"], "demo");
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LLMProviderProfileConfig {
     #[serde(default = "default_deserialized_llm_protocol")]
     pub protocol: String,
-    #[serde(default = "default_llm_provider")]
-    pub provider: String,
     #[serde(default = "default_llm_model")]
     pub model: String,
     #[serde(default = "default_llm_base_url")]
@@ -1529,6 +1708,157 @@ pub struct LLMConfig {
     pub max_output_tokens: Option<usize>,
     #[serde(default = "default_llm_tokenizer")]
     pub tokenizer: String,
+    #[serde(default = "default_llm_headers")]
+    pub headers: HashMap<String, String>,
+}
+
+impl Default for LLMProviderProfileConfig {
+    fn default() -> Self {
+        Self {
+            protocol: default_runtime_llm_protocol(),
+            model: default_llm_model(),
+            base_url: default_llm_base_url(),
+            api_key: default_llm_api_key(),
+            api_key_path: default_llm_api_key_path(),
+            mock_response: default_llm_mock_response(),
+            context_window_tokens: default_llm_context_window_tokens(),
+            max_output_tokens: default_llm_max_output_tokens(),
+            tokenizer: default_llm_tokenizer(),
+            headers: default_llm_headers(),
+        }
+    }
+}
+
+impl LLMProviderProfileConfig {
+    /// Return the normalized protocol used to choose the concrete LLM transport implementation.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::LLMProviderProfileConfig;
+    ///
+    /// let profile = LLMProviderProfileConfig {
+    ///     protocol: "openai_chat_completions".to_string(),
+    ///     ..LLMProviderProfileConfig::default()
+    /// };
+    ///
+    /// assert_eq!(profile.effective_protocol(), "openai_compatible");
+    /// ```
+    pub fn effective_protocol(&self) -> &'static str {
+        normalize_llm_protocol(&self.protocol)
+    }
+
+    /// Return the effective context window tokens for the configured profile.
+    pub fn context_window_tokens(&self) -> usize {
+        effective_context_window_tokens(&self.model, self.context_window_tokens)
+    }
+
+    /// Return the effective max output tokens for the configured profile.
+    pub fn max_output_tokens(&self) -> usize {
+        effective_max_output_tokens(&self.model, self.max_output_tokens)
+    }
+
+    fn validate(&self, field_prefix: &str) -> Result<()> {
+        validate_llm_profile(
+            &self.protocol,
+            &self.model,
+            self.context_window_tokens,
+            self.max_output_tokens,
+            &self.tokenizer,
+            &self.headers,
+            field_prefix,
+        )
+    }
+}
+
+/// Resolved active LLM provider view used by runtime assembly and logging.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::{LLMProviderProfileConfig, ResolvedLLMProviderConfig};
+///
+/// let resolved = ResolvedLLMProviderConfig::from_profile(
+///     "demo",
+///     &LLMProviderProfileConfig {
+///         protocol: "openai_responses".to_string(),
+///         model: "gpt-5-mini".to_string(),
+///         ..LLMProviderProfileConfig::default()
+///     },
+/// );
+///
+/// assert_eq!(resolved.name, "demo");
+/// assert_eq!(resolved.effective_protocol(), "openai_responses");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLLMProviderConfig {
+    pub name: String,
+    pub protocol: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub api_key_path: PathBuf,
+    pub mock_response: String,
+    pub context_window_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
+    pub tokenizer: String,
+    pub headers: HashMap<String, String>,
+}
+
+impl ResolvedLLMProviderConfig {
+    /// Build one runtime provider view from a named provider profile.
+    pub fn from_profile(name: impl Into<String>, profile: &LLMProviderProfileConfig) -> Self {
+        Self {
+            name: name.into(),
+            protocol: profile.protocol.clone(),
+            model: profile.model.clone(),
+            base_url: profile.base_url.clone(),
+            api_key: profile.api_key.clone(),
+            api_key_path: profile.api_key_path.clone(),
+            mock_response: profile.mock_response.clone(),
+            context_window_tokens: profile.context_window_tokens,
+            max_output_tokens: profile.max_output_tokens,
+            tokenizer: profile.tokenizer.clone(),
+            headers: profile.headers.clone(),
+        }
+    }
+
+    /// Return the normalized protocol used to choose the concrete LLM transport implementation.
+    pub fn effective_protocol(&self) -> &'static str {
+        normalize_llm_protocol(&self.protocol)
+    }
+
+    /// Return the effective context window tokens for the resolved provider.
+    pub fn context_window_tokens(&self) -> usize {
+        effective_context_window_tokens(&self.model, self.context_window_tokens)
+    }
+
+    /// Return the effective max output tokens for the resolved provider.
+    pub fn max_output_tokens(&self) -> usize {
+        effective_max_output_tokens(&self.model, self.max_output_tokens)
+    }
+
+    /// Return whether the resolved provider adds static request headers.
+    pub fn has_headers(&self) -> bool {
+        !self.headers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LLMConfig {
+    pub protocol: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub api_key_path: PathBuf,
+    pub mock_response: String,
+    pub context_window_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
+    pub tokenizer: String,
+    pub system_prompt: String,
+    pub active_provider: Option<String>,
+    pub providers: HashMap<String, LLMProviderProfileConfig>,
+    #[doc(hidden)]
+    pub legacy_fields_explicit: bool,
 }
 
 impl Default for LLMConfig {
@@ -1544,7 +1874,151 @@ impl Default for LLMConfig {
             context_window_tokens: default_llm_context_window_tokens(),
             max_output_tokens: default_llm_max_output_tokens(),
             tokenizer: default_llm_tokenizer(),
+            system_prompt: default_llm_system_prompt(),
+            active_provider: None,
+            providers: HashMap::new(),
+            legacy_fields_explicit: false,
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLLMConfig {
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_path: Option<PathBuf>,
+    #[serde(default)]
+    mock_response: Option<String>,
+    #[serde(default)]
+    context_window_tokens: Option<usize>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    tokenizer: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    active_provider: Option<String>,
+    #[serde(default)]
+    providers: RawLLMProviders,
+}
+
+impl<'de> Deserialize<'de> for LLMConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawLLMConfig::deserialize(deserializer)?;
+        let provider_defaults = RawLLMProviderDefaults::from_raw_llm_config(&raw);
+        let (providers, providers_from_list) = raw
+            .providers
+            .into_profiles(&provider_defaults)
+            .map_err(serde::de::Error::custom)?;
+        let active_provider = if providers_from_list {
+            match (
+                raw.active_provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                raw.provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            ) {
+                (Some(active), Some(provider)) if active != provider => {
+                    return Err(serde::de::Error::custom(format!(
+                        "llm.active_provider `{active}` conflicts with llm.provider `{provider}`"
+                    )));
+                }
+                (Some(active), _) => Some(active.to_string()),
+                (None, Some(provider)) => Some(provider.to_string()),
+                (None, None) => None,
+            }
+        } else {
+            raw.active_provider.clone()
+        };
+
+        let legacy_fields_explicit = if providers_from_list {
+            false
+        } else {
+            raw.protocol.is_some()
+                || raw.provider.is_some()
+                || raw.model.is_some()
+                || raw.base_url.is_some()
+                || raw.api_key.is_some()
+                || raw.api_key_path.is_some()
+                || raw.mock_response.is_some()
+                || raw.context_window_tokens.is_some()
+                || raw.max_output_tokens.is_some()
+                || raw.tokenizer.is_some()
+        };
+
+        Ok(Self {
+            protocol: if providers_from_list {
+                default_deserialized_llm_protocol()
+            } else {
+                raw.protocol
+                    .unwrap_or_else(default_deserialized_llm_protocol)
+            },
+            provider: if providers_from_list {
+                default_llm_provider()
+            } else {
+                raw.provider.unwrap_or_else(default_llm_provider)
+            },
+            model: if providers_from_list {
+                default_llm_model()
+            } else {
+                raw.model.unwrap_or_else(default_llm_model)
+            },
+            base_url: if providers_from_list {
+                default_llm_base_url()
+            } else {
+                raw.base_url.unwrap_or_else(default_llm_base_url)
+            },
+            api_key: if providers_from_list {
+                default_llm_api_key()
+            } else {
+                raw.api_key.unwrap_or_else(default_llm_api_key)
+            },
+            api_key_path: if providers_from_list {
+                default_llm_api_key_path()
+            } else {
+                raw.api_key_path.unwrap_or_else(default_llm_api_key_path)
+            },
+            mock_response: if providers_from_list {
+                default_llm_mock_response()
+            } else {
+                raw.mock_response.unwrap_or_else(default_llm_mock_response)
+            },
+            context_window_tokens: if providers_from_list {
+                default_llm_context_window_tokens()
+            } else {
+                raw.context_window_tokens
+            },
+            max_output_tokens: if providers_from_list {
+                default_llm_max_output_tokens()
+            } else {
+                raw.max_output_tokens
+            },
+            tokenizer: if providers_from_list {
+                default_llm_tokenizer()
+            } else {
+                raw.tokenizer.unwrap_or_else(default_llm_tokenizer)
+            },
+            system_prompt: raw.system_prompt.unwrap_or_else(default_llm_system_prompt),
+            active_provider,
+            providers,
+            legacy_fields_explicit,
+        })
     }
 }
 
@@ -1566,87 +2040,294 @@ impl LLMConfig {
     /// assert_eq!(config.effective_protocol(), "openai_compatible");
     /// ```
     pub fn effective_protocol(&self) -> &'static str {
-        let normalized_protocol = self.protocol.trim().to_ascii_lowercase();
-        match normalized_protocol.as_str() {
-            "mock" | "mock_llm" => "mock",
-            "openai" | "openai_compatible" => "openai_compatible",
-            "anthropic" | "claude" => "anthropic",
-            _ => "unknown",
-        }
+        self.resolve_active_provider()
+            .map(|provider| provider.effective_protocol())
+            .unwrap_or_else(|_| normalize_llm_protocol(&self.protocol))
     }
 
     /// Return the effective context window tokens for the configured model.
     ///
     /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
     pub fn context_window_tokens(&self) -> usize {
-        self.context_window_tokens
-            .or_else(|| {
-                self.known_model_token_limits()
-                    .map(|limits| limits.context_window_tokens)
+        self.resolve_active_provider()
+            .map(|provider| provider.context_window_tokens())
+            .unwrap_or_else(|_| {
+                effective_context_window_tokens(&self.model, self.context_window_tokens)
             })
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
     }
 
     /// Return the effective max output tokens for the configured model.
     ///
     /// 显式配置优先；如果用户未填写，则尝试按已知模型规格兜底；仍无法识别时回落到通用默认值。
     pub fn max_output_tokens(&self) -> usize {
-        self.max_output_tokens
-            .or_else(|| {
-                self.known_model_token_limits()
-                    .map(|limits| limits.max_output_tokens)
-            })
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+        self.resolve_active_provider()
+            .map(|provider| provider.max_output_tokens())
+            .unwrap_or_else(|_| effective_max_output_tokens(&self.model, self.max_output_tokens))
+    }
+
+    /// Return the tokenizer configured for the active provider view.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::LLMConfig;
+    ///
+    /// let config = LLMConfig::default();
+    ///
+    /// assert_eq!(config.effective_tokenizer(), "chars_div4".to_string());
+    /// ```
+    pub fn effective_tokenizer(&self) -> String {
+        if let Ok(provider) = self.resolve_active_provider()
+            && !provider.tokenizer.is_empty()
+        {
+            return provider.tokenizer;
+        }
+
+        self.tokenizer.clone()
+    }
+
+    /// Return the effective assistant system prompt configured for worker initialization.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::LLMConfig;
+    ///
+    /// let config = LLMConfig::default();
+    ///
+    /// assert!(!config.effective_system_prompt().trim().is_empty());
+    /// ```
+    pub fn effective_system_prompt(&self) -> &str {
+        let prompt = self.system_prompt.trim();
+        if prompt.is_empty() {
+            DEFAULT_ASSISTANT_SYSTEM_PROMPT
+        } else {
+            prompt
+        }
+    }
+
+    /// Resolve the active provider into one stable runtime view.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::LLMConfig;
+    ///
+    /// let config = LLMConfig::default();
+    /// let resolved = config
+    ///     .resolve_active_provider()
+    ///     .expect("default config should resolve");
+    ///
+    /// assert_eq!(resolved.name, "unknown");
+    /// assert_eq!(resolved.effective_protocol(), "mock");
+    /// ```
+    pub fn resolve_active_provider(&self) -> Result<ResolvedLLMProviderConfig> {
+        if self.uses_provider_profiles() {
+            let active_provider = self
+                .active_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .context("llm.active_provider is required when llm.providers is configured")?;
+            let profile = self.providers.get(active_provider).with_context(|| {
+                format!("llm.active_provider `{active_provider}` does not exist in llm.providers")
+            })?;
+            return Ok(ResolvedLLMProviderConfig::from_profile(
+                active_provider,
+                profile,
+            ));
+        }
+
+        Ok(ResolvedLLMProviderConfig {
+            name: self.provider.clone(),
+            protocol: self.protocol.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            api_key_path: self.api_key_path.clone(),
+            mock_response: self.mock_response.clone(),
+            context_window_tokens: self.context_window_tokens,
+            max_output_tokens: self.max_output_tokens,
+            tokenizer: self.tokenizer.clone(),
+            headers: HashMap::new(),
+        })
+    }
+
+    /// Resolve every declared provider profile into a stable map keyed by provider name.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::LLMConfig;
+    ///
+    /// let config = LLMConfig::default();
+    /// let providers = config
+    ///     .resolve_all_providers()
+    ///     .expect("default config should resolve");
+    ///
+    /// assert_eq!(providers["unknown"].effective_protocol(), "mock");
+    /// ```
+    pub fn resolve_all_providers(&self) -> Result<HashMap<String, ResolvedLLMProviderConfig>> {
+        if self.uses_provider_profiles() {
+            let mut resolved = HashMap::with_capacity(self.providers.len());
+            for (name, profile) in &self.providers {
+                resolved.insert(
+                    name.clone(),
+                    ResolvedLLMProviderConfig::from_profile(name, profile),
+                );
+            }
+            return Ok(resolved);
+        }
+
+        Ok(HashMap::from([(
+            self.provider.clone(),
+            self.resolve_active_provider()?,
+        )]))
     }
 
     fn validate(&self) -> Result<()> {
-        if self.protocol.trim().is_empty() {
-            bail!("llm.protocol is required");
-        }
-        if matches!(self.effective_protocol(), "unknown") {
-            bail!("llm.protocol `{}` is not supported", self.protocol.trim());
-        }
-        if self
-            .context_window_tokens
-            .is_some_and(|context_window_tokens| context_window_tokens == 0)
-        {
-            bail!("llm.context_window_tokens must be greater than 0");
-        }
-        if self
-            .max_output_tokens
-            .is_some_and(|max_output_tokens| max_output_tokens == 0)
-        {
-            bail!("llm.max_output_tokens must be greater than 0");
-        }
-        if self.max_output_tokens() > self.context_window_tokens() {
-            bail!("llm.max_output_tokens must be less than or equal to llm.context_window_tokens");
-        }
-        if self.tokenizer.trim().is_empty() {
-            bail!("llm.tokenizer must not be blank");
-        }
-        if !matches!(self.tokenizer.trim(), "chars_div4") {
-            bail!(
-                "llm.tokenizer `{}` is not supported yet; expected `chars_div4`",
-                self.tokenizer
-            );
+        if self.uses_provider_profiles() {
+            if self.providers.is_empty() {
+                bail!("llm.providers must not be empty when llm.active_provider is configured");
+            }
+            if self.has_legacy_fields_for_multi_provider_mode() {
+                bail!(
+                    "llm legacy single-provider fields and llm.active_provider/llm.providers cannot be configured together"
+                );
+            }
+            let active_provider = self
+                .active_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .context("llm.active_provider is required when llm.providers is configured")?;
+            let Some(profile) = self.providers.get(active_provider) else {
+                bail!("llm.active_provider `{active_provider}` does not exist in llm.providers");
+            };
+            for (name, profile) in &self.providers {
+                profile.validate(&format!("llm.providers.{name}"))?;
+            }
+            profile.validate(&format!("llm.providers.{active_provider}"))?;
+            return Ok(());
         }
 
-        Ok(())
+        validate_llm_profile(
+            &self.protocol,
+            &self.model,
+            self.context_window_tokens,
+            self.max_output_tokens,
+            &self.tokenizer,
+            &HashMap::new(),
+            "llm",
+        )
     }
 
-    fn known_model_token_limits(&self) -> Option<ModelTokenLimits> {
-        let normalized_model = self.model.trim().to_ascii_lowercase();
-        match normalized_model.as_str() {
-            "kimi-k2.5"
-            | "kimi-k2-0905-preview"
-            | "kimi-k2-turbo-preview"
-            | "kimi-k2-thinking"
-            | "kimi-k2-thinking-turbo" => Some(ModelTokenLimits {
-                context_window_tokens: KIMI_K2_5_CONTEXT_WINDOW_TOKENS,
-                max_output_tokens: KIMI_K2_5_MAX_OUTPUT_TOKENS,
-            }),
-            _ => None,
+    fn uses_provider_profiles(&self) -> bool {
+        self.active_provider.is_some() || !self.providers.is_empty()
+    }
+
+    fn has_legacy_fields_for_multi_provider_mode(&self) -> bool {
+        self.legacy_fields_explicit || !self.matches_runtime_legacy_defaults()
+    }
+
+    fn matches_runtime_legacy_defaults(&self) -> bool {
+        (self.protocol.is_empty() || self.protocol == default_runtime_llm_protocol())
+            && self.provider == default_llm_provider()
+            && self.model == default_llm_model()
+            && self.base_url == default_llm_base_url()
+            && self.api_key == default_llm_api_key()
+            && self.api_key_path == default_llm_api_key_path()
+            && self.mock_response == default_llm_mock_response()
+            && self.context_window_tokens == default_llm_context_window_tokens()
+            && self.max_output_tokens == default_llm_max_output_tokens()
+            && self.tokenizer == default_llm_tokenizer()
+    }
+}
+
+fn normalize_llm_protocol(protocol: &str) -> &'static str {
+    let normalized_protocol = protocol.trim().to_ascii_lowercase();
+    match normalized_protocol.as_str() {
+        "mock" | "mock_llm" => "mock",
+        "openai" | "openai_compatible" | "openai_chat_completion" | "openai_chat_completions" => {
+            "openai_compatible"
         }
+        "openai-compatible" => "openai_compatible",
+        "openai_response" | "openai_responses" | "responses" => "openai_responses",
+        "openai-response" | "openai-responses" => "openai_responses",
+        "anthropic" | "claude" => "anthropic",
+        _ => "unknown",
+    }
+}
+
+fn effective_context_window_tokens(model: &str, configured: Option<usize>) -> usize {
+    configured
+        .or_else(|| known_model_token_limits(model).map(|limits| limits.context_window_tokens))
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
+
+fn effective_max_output_tokens(model: &str, configured: Option<usize>) -> usize {
+    configured
+        .or_else(|| known_model_token_limits(model).map(|limits| limits.max_output_tokens))
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+}
+
+fn validate_llm_profile(
+    protocol: &str,
+    model: &str,
+    context_window_tokens: Option<usize>,
+    max_output_tokens: Option<usize>,
+    tokenizer: &str,
+    headers: &HashMap<String, String>,
+    field_prefix: &str,
+) -> Result<()> {
+    if protocol.trim().is_empty() {
+        bail!("{field_prefix}.protocol is required");
+    }
+    if matches!(normalize_llm_protocol(protocol), "unknown") {
+        bail!(
+            "{field_prefix}.protocol `{}` is not supported",
+            protocol.trim()
+        );
+    }
+    if context_window_tokens.is_some_and(|value| value == 0) {
+        bail!("{field_prefix}.context_window_tokens must be greater than 0");
+    }
+    if max_output_tokens.is_some_and(|value| value == 0) {
+        bail!("{field_prefix}.max_output_tokens must be greater than 0");
+    }
+    if effective_max_output_tokens(model, max_output_tokens)
+        > effective_context_window_tokens(model, context_window_tokens)
+    {
+        bail!(
+            "{field_prefix}.max_output_tokens must be less than or equal to {field_prefix}.context_window_tokens"
+        );
+    }
+    if tokenizer.trim().is_empty() {
+        bail!("{field_prefix}.tokenizer must not be blank");
+    }
+    if !matches!(tokenizer.trim(), "chars_div4") {
+        bail!(
+            "{field_prefix}.tokenizer `{}` is not supported yet; expected `chars_div4`",
+            tokenizer
+        );
+    }
+    for header_name in headers.keys() {
+        if header_name.trim().is_empty() {
+            bail!("{field_prefix}.headers contains a blank header name");
+        }
+    }
+
+    Ok(())
+}
+
+fn known_model_token_limits(model: &str) -> Option<ModelTokenLimits> {
+    let normalized_model = model.trim().to_ascii_lowercase();
+    match normalized_model.as_str() {
+        "kimi-k2.5"
+        | "kimi-k2-0905-preview"
+        | "kimi-k2-turbo-preview"
+        | "kimi-k2-thinking"
+        | "kimi-k2-thinking-turbo" => Some(ModelTokenLimits {
+            context_window_tokens: KIMI_K2_5_CONTEXT_WINDOW_TOKENS,
+            max_output_tokens: KIMI_K2_5_MAX_OUTPUT_TOKENS,
+        }),
+        _ => None,
     }
 }
 

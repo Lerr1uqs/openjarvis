@@ -589,11 +589,12 @@ fn expected_context_detail_report(thread_context: &Thread, requested_count: usiz
     lines.join("\n")
 }
 
-fn ordered_chat_message_roles() -> [ChatMessageRole; 5] {
+fn ordered_chat_message_roles() -> [ChatMessageRole; 6] {
     [
         ChatMessageRole::System,
         ChatMessageRole::User,
         ChatMessageRole::Assistant,
+        ChatMessageRole::Reasoning,
         ChatMessageRole::Toolcall,
         ChatMessageRole::ToolResult,
     ]

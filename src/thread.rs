@@ -1248,7 +1248,10 @@ impl Thread {
         if self.thread.created_at > current_turn.started_at {
             self.thread.created_at = current_turn.started_at;
         }
-        self.state.tools.tool_events.extend(current_turn.tool_events);
+        self.state
+            .tools
+            .tool_events
+            .extend(current_turn.tool_events);
         Ok(ThreadFinalizedTurn {
             external_message_id: current_turn.external_message_id,
             started_at: current_turn.started_at,
@@ -1351,7 +1354,10 @@ impl Thread {
             self.thread.created_at = current_turn.started_at;
         }
 
-        self.state.tools.tool_events.extend(current_turn.tool_events);
+        self.state
+            .tools
+            .tool_events
+            .extend(current_turn.tool_events);
         info!(
             thread_id = %self.locator.thread_id,
             external_thread_id = %self.locator.external_thread_id,

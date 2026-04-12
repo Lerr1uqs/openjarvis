@@ -20,6 +20,7 @@ fn render_chat_history_keeps_tool_annotations() {
             id: "call_1".to_string(),
             name: "read".to_string(),
             arguments: json!({ "path": "config.yaml" }),
+            provider_item_id: None,
         }]),
         ChatMessage::new(ChatMessageRole::ToolResult, "ok", now).with_tool_call_id("call_1"),
         ChatMessage::new(ChatMessageRole::User, "task", now),

@@ -19,6 +19,10 @@ fn context_token_kind_maps_chat_roles_to_budget_buckets() {
         ContextTokenKind::for_chat_message_role(&ChatMessageRole::ToolResult),
         ContextTokenKind::Chat
     );
+    assert_eq!(
+        ContextTokenKind::for_chat_message_role(&ChatMessageRole::Reasoning),
+        ContextTokenKind::Chat
+    );
 }
 
 #[test]

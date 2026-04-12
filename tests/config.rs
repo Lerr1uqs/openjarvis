@@ -169,6 +169,137 @@ llm:
 }
 
 #[test]
+fn llm_multi_provider_config_resolves_active_profile_and_headers() {
+    let config = AppConfig::from_yaml_str(
+        r#"
+llm:
+  active_provider: "dashscope-responses"
+  providers:
+    dashscope-responses:
+      protocol: "openai_responses"
+      model: "qwen3-plus"
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      api_key: "responses-key"
+      headers:
+        X-CHJ-GWToken: "gw-token"
+    anthropic-prod:
+      protocol: "anthropic"
+      model: "claude-sonnet-4-5"
+      base_url: "https://api.anthropic.com"
+      api_key: "anthropic-key"
+"#,
+    )
+    .expect("multi provider config should parse");
+
+    let resolved = config
+        .llm_config()
+        .resolve_active_provider()
+        .expect("active provider should resolve");
+    let providers = config
+        .llm_config()
+        .resolve_all_providers()
+        .expect("all providers should resolve");
+
+    assert_eq!(config.llm_config().effective_protocol(), "openai_responses");
+    assert_eq!(resolved.name, "dashscope-responses");
+    assert_eq!(resolved.model, "qwen3-plus");
+    assert_eq!(resolved.headers["X-CHJ-GWToken"], "gw-token");
+    assert_eq!(providers.len(), 2);
+    assert_eq!(
+        providers["anthropic-prod"].effective_protocol(),
+        "anthropic"
+    );
+}
+
+#[test]
+fn llm_provider_list_format_converts_into_resolved_profiles() {
+    let config = AppConfig::from_yaml_str(
+        r#"
+llm:
+  provider: "dashscope"
+  providers:
+    - name: "zai"
+      protocol: "openai-compatible"
+      model: "glm-5"
+      base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+      api_key_path: "~/.zai.apikey"
+    - name: "dashscope"
+      protocol: "openai-response"
+      model: "qwen3.6-plus"
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/responses"
+      api_key_path: "~/.qwen.apikey"
+  system_prompt: "custom system prompt"
+  context_window_tokens: 262144
+  max_output_tokens: 32768
+  tokenizer: "chars_div4"
+"#,
+    )
+    .expect("provider list config should parse");
+
+    let resolved = config
+        .llm_config()
+        .resolve_active_provider()
+        .expect("active provider should resolve");
+    let providers = config
+        .llm_config()
+        .resolve_all_providers()
+        .expect("all providers should resolve");
+
+    assert_eq!(resolved.name, "dashscope");
+    assert_eq!(resolved.effective_protocol(), "openai_responses");
+    assert_eq!(resolved.context_window_tokens(), 262144);
+    assert_eq!(resolved.max_output_tokens(), 32768);
+    assert_eq!(
+        config.llm_config().effective_system_prompt(),
+        "custom system prompt"
+    );
+    assert_eq!(providers["zai"].effective_protocol(), "openai_compatible");
+}
+
+#[test]
+fn llm_legacy_single_provider_config_normalizes_to_resolved_active_provider() {
+    let config = AppConfig::from_yaml_str(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "mock_llm"
+  mock_response: "normalized"
+"#,
+    )
+    .expect("legacy provider config should parse");
+
+    let resolved = config
+        .llm_config()
+        .resolve_active_provider()
+        .expect("legacy provider should resolve");
+
+    assert_eq!(resolved.name, "mock_llm");
+    assert_eq!(resolved.effective_protocol(), "mock");
+    assert_eq!(resolved.mock_response, "normalized");
+}
+
+#[test]
+fn llm_mixed_legacy_and_multi_provider_config_is_rejected() {
+    let error = AppConfig::from_yaml_str(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "legacy"
+  active_provider: "responses"
+  providers:
+    responses:
+      protocol: "openai_responses"
+      model: "gpt-5-mini"
+      base_url: "https://api.openai.com/v1"
+      api_key: "test-key"
+"#,
+    )
+    .expect_err("mixed llm config should be rejected");
+
+    assert!(format!("{error:#}").contains("cannot be configured together"));
+}
+
+#[test]
 fn builder_for_test_builds_minimal_validated_config() {
     let config = AppConfig::builder_for_test()
         .llm(LLMConfig {

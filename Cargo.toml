@@ -6,7 +6,7 @@ default-run = "openjarvis"
 
 [dependencies]
 anyhow = "1.0.100"
-async-openai = { version = "0.33.1", default-features = false, features = ["chat-completion", "chat-completion-types", "rustls"] }
+async-openai = { version = "0.33.1", default-features = false, features = ["chat-completion", "chat-completion-types", "response-types", "rustls"] }
 async-trait = "0.1.89"
 axum = { version = "0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
@@ -35,6 +35,10 @@ path = "scripts/llm_test.rs"
 [[bin]]
 name = "llm_provider_ping"
 path = "scripts/llm_provider_ping.rs"
+
+[[bin]]
+name = "openai_responses_ping"
+path = "scripts/openai_responses_ping.rs"
 
 [[bin]]
 name = "browser_bilibili_search_dump"

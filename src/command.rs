@@ -733,11 +733,12 @@ fn format_context_detail_report(
     lines.join("\n")
 }
 
-fn ordered_chat_message_roles() -> [ChatMessageRole; 5] {
+fn ordered_chat_message_roles() -> [ChatMessageRole; 6] {
     [
         ChatMessageRole::System,
         ChatMessageRole::User,
         ChatMessageRole::Assistant,
+        ChatMessageRole::Reasoning,
         ChatMessageRole::Toolcall,
         ChatMessageRole::ToolResult,
     ]

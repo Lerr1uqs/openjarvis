@@ -39,12 +39,17 @@ async fn main() -> Result<()> {
     if config.channel_config().feishu_config().dry_run {
         warn!("feishu.dry_run=true, outgoing messages will be logged instead of delivered");
     }
+    let resolved_llm = config
+        .llm_config()
+        .resolve_active_provider()
+        .expect("validated app config should expose one resolved active llm provider");
     info!(
-        llm_protocol = config.llm_config().effective_protocol(),
-        llm_provider = %config.llm_config().provider,
-        llm_model = %config.llm_config().model,
-        context_window_tokens = config.llm_config().context_window_tokens(),
-        max_output_tokens = config.llm_config().max_output_tokens(),
+        llm_protocol = resolved_llm.effective_protocol(),
+        llm_provider = %resolved_llm.name,
+        llm_model = %resolved_llm.model,
+        context_window_tokens = resolved_llm.context_window_tokens(),
+        max_output_tokens = resolved_llm.max_output_tokens(),
+        header_count = resolved_llm.headers.len(),
         "resolved llm token limits"
     );
     let config = install_global_config(config)?;
