@@ -17,11 +17,13 @@
 - 代码中的TODO如果用户没有要求就不要做 或者做之前要询问
 - model/**.md 里面的文档是当前项目组件概念、职责和核心边界
 - 关键action必须添加调试日志，初始化数据库，查询memory，网络请求调用llm等等 主要是方便调试
+- 如果一个函数是为了ut的helper 需要用 `#[cfg(test)]` 来标注
 
 # 分支规范
 - `dev` 是默认开发基线，新的 feature branch 必须从 `dev` 拉出
 - 后续开发默认在 `dev` 分出的 feature branch 上进行，不直接在 `master` 上开发
 - 是否将 `dev` 或 feature branch 合入 `master`，由用户最终决定
+- spec需要开一个对应的{xx/$spec} 分支来做 比如 `feature/
 
 # 测试规范
 - 每一个src文件都要在对应的test/目录下以相同的文件映射方式进行ut 要求考虑边界情况 特殊情况

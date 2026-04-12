@@ -75,15 +75,10 @@ async fn builtin_context_command_returns_thread_context_summary() {
         "system prompt",
         now,
     )]);
-    thread_context.commit_test_turn(
-        Some("msg_context_summary".to_string()),
-        vec![
-            ChatMessage::new(ChatMessageRole::User, "hello summary", now),
-            ChatMessage::new(ChatMessageRole::Assistant, "assistant summary", now),
-        ],
-        now,
-        now,
-    );
+    thread_context.append_persisted_messages_for_test(vec![
+        ChatMessage::new(ChatMessageRole::User, "hello summary", now),
+        ChatMessage::new(ChatMessageRole::Assistant, "assistant summary", now),
+    ]);
 
     let reply = registry
         .try_execute_with_thread_context(&incoming, &mut thread_context)
@@ -112,19 +107,14 @@ async fn builtin_context_role_command_returns_aggregated_role_breakdown() {
         "system prompt",
         now,
     )]);
-    thread_context.commit_test_turn(
-        Some("msg_context_role".to_string()),
-        vec![
-            ChatMessage::new(
-                ChatMessageRole::User,
-                "first line\nsecond line with enough content to trigger preview truncation output",
-                now,
-            ),
-            ChatMessage::new(ChatMessageRole::Assistant, "assistant role payload", now),
-        ],
-        now,
-        now,
-    );
+    thread_context.append_persisted_messages_for_test(vec![
+        ChatMessage::new(
+            ChatMessageRole::User,
+            "first line\nsecond line with enough content to trigger preview truncation output",
+            now,
+        ),
+        ChatMessage::new(ChatMessageRole::Assistant, "assistant role payload", now),
+    ]);
 
     let reply = registry
         .try_execute_with_thread_context(&incoming, &mut thread_context)
@@ -153,16 +143,11 @@ async fn builtin_context_detail_command_lists_recent_persisted_messages() {
         "system prompt",
         now,
     )]);
-    thread_context.commit_test_turn(
-        Some("msg_context_detail".to_string()),
-        vec![
-            ChatMessage::new(ChatMessageRole::User, "detail user 1", now),
-            ChatMessage::new(ChatMessageRole::Assistant, "detail assistant 2", now),
-            ChatMessage::new(ChatMessageRole::ToolResult, "detail tool result 3", now),
-        ],
-        now,
-        now,
-    );
+    thread_context.append_persisted_messages_for_test(vec![
+        ChatMessage::new(ChatMessageRole::User, "detail user 1", now),
+        ChatMessage::new(ChatMessageRole::Assistant, "detail assistant 2", now),
+        ChatMessage::new(ChatMessageRole::ToolResult, "detail tool result 3", now),
+    ]);
 
     let reply = registry
         .try_execute_with_thread_context(&incoming, &mut thread_context)
@@ -215,15 +200,12 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
         now,
     )]);
     thread_context.enable_auto_compact();
-    thread_context.commit_test_turn_with_state(
-        Some("msg_context_readonly".to_string()),
+    thread_context.append_persisted_messages_with_state_for_test(
         vec![ChatMessage::new(
             ChatMessageRole::User,
             "readonly payload",
             now,
         )],
-        now,
-        now,
         vec!["demo".to_string()],
         vec![load_event],
     );
@@ -310,15 +292,12 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
         event
     };
     thread_context.enable_auto_compact();
-    thread_context.commit_test_turn_with_state(
-        Some("msg_history".to_string()),
+    thread_context.append_persisted_messages_with_state_for_test(
         vec![openjarvis::context::ChatMessage::new(
             openjarvis::context::ChatMessageRole::User,
             "需要被清空的历史",
             now,
         )],
-        now,
-        now,
         vec!["demo".to_string()],
         vec![event],
     );

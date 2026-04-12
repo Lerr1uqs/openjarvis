@@ -11,8 +11,8 @@ use crate::command::{CommandRegistry, CommandReply};
 use crate::config::ChannelConfig;
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
-use crate::thread::Thread;
 use anyhow::{Result, bail};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, pending};
 use std::sync::Arc;
@@ -28,8 +28,7 @@ pub struct ChannelRouter {
     channels: HashMap<String, mpsc::Sender<OutgoingMessage>>,
     sessions: SessionManager,
     commands: CommandRegistry,
-    message_dedup_enabled: bool,
-    seen_messages: Mutex<HashSet<String>>,
+    feishu_deduper: FeishuMemoryDeduper,
     pending_threads: Mutex<HashSet<ThreadLocator>>,
     queued_messages: Mutex<HashMap<ThreadLocator, VecDeque<IncomingMessage>>>,
 }
@@ -57,7 +56,6 @@ pub struct ChannelRouterBuilder {
     agent_handle: Option<AgentWorkerHandle>,
     sessions: SessionManager,
     commands: CommandRegistry,
-    message_dedup_enabled: bool,
 }
 
 impl Default for ChannelRouterBuilder {
@@ -66,7 +64,6 @@ impl Default for ChannelRouterBuilder {
             agent_handle: None,
             sessions: SessionManager::new(),
             commands: CommandRegistry::default(),
-            message_dedup_enabled: false,
         }
     }
 }
@@ -79,6 +76,7 @@ impl ChannelRouterBuilder {
 
     /// Attach one long-lived agent worker and spawn its runtime handle.
     pub fn agent(mut self, agent: AgentWorker) -> Self {
+        self.sessions.install_thread_runtime(agent.thread_runtime());
         self.agent_handle = Some(agent.spawn());
         self
     }
@@ -102,8 +100,8 @@ impl ChannelRouterBuilder {
     }
 
     /// Enable or disable router-level message deduplication.
-    pub fn message_dedup_enabled(mut self, enabled: bool) -> Self {
-        self.message_dedup_enabled = enabled;
+    pub fn message_dedup_enabled(self, enabled: bool) -> Self {
+        let _ = enabled;
         self
     }
 
@@ -120,8 +118,7 @@ impl ChannelRouterBuilder {
             channels: HashMap::new(),
             sessions: self.sessions,
             commands: self.commands,
-            message_dedup_enabled: self.message_dedup_enabled,
-            seen_messages: Mutex::new(HashSet::new()),
+            feishu_deduper: FeishuMemoryDeduper::default(),
             pending_threads: Mutex::new(HashSet::new()),
             queued_messages: Mutex::new(HashMap::new()),
         })
@@ -254,8 +251,8 @@ impl ChannelRouter {
     ///     .build()
     ///     .expect("router should build");
     /// ```
-    pub fn with_message_dedup_enabled(mut self, enabled: bool) -> Self {
-        self.message_dedup_enabled = enabled;
+    pub fn with_message_dedup_enabled(self, enabled: bool) -> Self {
+        let _ = enabled;
         self
     }
 
@@ -389,15 +386,7 @@ impl ChannelRouter {
     }
 
     async fn handle_incoming(&self, message: IncomingMessage) -> Result<()> {
-        if self.message_dedup_enabled
-            && !self
-                .mark_message_seen(message.external_message_id.as_deref())
-                .await
-        {
-            info!(
-                external_message_id = ?message.external_message_id,
-                "duplicate incoming message ignored"
-            );
+        if !self.try_begin_channel_dedup(&message).await {
             return Ok(());
         }
 
@@ -408,19 +397,6 @@ impl ChannelRouter {
         );
 
         let locator = self.sessions.load_or_create_thread(&message).await?;
-        if let Some(external_message_id) = message.external_message_id.as_deref()
-            && self
-                .sessions
-                .is_external_message_processed(&locator, external_message_id)
-                .await?
-        {
-            info!(
-                thread_id = %locator.thread_id,
-                external_message_id,
-                "duplicate incoming message ignored by persisted dedup record"
-            );
-            return Ok(());
-        }
 
         if self.commands.is_command(&message)? {
             if self.is_thread_pending(&locator).await {
@@ -431,47 +407,30 @@ impl ChannelRouter {
                         "rejected idle-only command because thread is still running"
                     );
                     self.dispatch_command_reply(&message, reply).await?;
-                    if let Some(external_message_id) = message.external_message_id.as_deref() {
-                        self.sessions
-                            .mark_external_message_processed(
-                                &locator,
-                                external_message_id,
-                                message.received_at,
-                            )
-                            .await?;
-                    }
+                    self.complete_channel_dedup(&message, true).await;
                     return Ok(());
                 }
             }
             let mut thread_context = self
                 .sessions
-                .load_thread_context(&locator)
-                .await?
-                .unwrap_or_else(|| Thread::new((&locator).into(), message.received_at));
+                .lock_thread_context(&locator, message.received_at)
+                .await?;
             if let Some(reply) = self
                 .commands
                 .try_execute_with_thread_context(&message, &mut thread_context)
                 .await?
             {
-                self.sessions
-                    .store_thread_context(&locator, thread_context, message.received_at)
-                    .await?;
                 self.dispatch_command_reply(&message, reply).await?;
-                if let Some(external_message_id) = message.external_message_id.as_deref() {
-                    self.sessions
-                        .mark_external_message_processed(
-                            &locator,
-                            external_message_id,
-                            message.received_at,
-                        )
-                        .await?;
-                }
+                self.complete_channel_dedup(&message, true).await;
                 return Ok(());
             }
         }
 
         if self.try_mark_thread_pending(&locator).await {
-            self.dispatch_to_agent(locator, message).await?;
+            if let Err(error) = self.dispatch_to_agent(locator, message.clone()).await {
+                self.complete_channel_dedup(&message, false).await;
+                return Err(error);
+            }
         } else {
             self.enqueue_message(locator, message).await;
         }
@@ -483,15 +442,12 @@ impl ChannelRouter {
             AgentWorkerEvent::DispatchItemCommitted(item) => {
                 self.dispatch_committed_item(item).await
             }
-            AgentWorkerEvent::TurnFinalized(turn) => {
-                info!(
-                    thread_id = %turn.locator.thread_id,
-                    external_message_id = ?turn.turn.external_message_id,
-                    "router observed finalized thread-owned turn"
-                );
-                Ok(())
-            }
             AgentWorkerEvent::RequestCompleted(request) => {
+                self.complete_feishu_dedup_by_message_id(
+                    request.external_message_id.as_deref(),
+                    request.succeeded,
+                )
+                .await;
                 self.release_or_dispatch_next(&request.locator).await
             }
         }
@@ -577,13 +533,40 @@ impl ChannelRouter {
             .await
     }
 
-    async fn mark_message_seen(&self, external_message_id: Option<&str>) -> bool {
-        let Some(external_message_id) = external_message_id else {
+    async fn try_begin_channel_dedup(&self, message: &IncomingMessage) -> bool {
+        if message.channel != "feishu" {
+            return true;
+        }
+
+        let Some(external_message_id) = message.external_message_id.as_deref() else {
             return true;
         };
+        self.feishu_deduper.try_start(external_message_id).await
+    }
 
-        let mut seen_messages = self.seen_messages.lock().await;
-        seen_messages.insert(external_message_id.to_string())
+    async fn complete_channel_dedup(&self, message: &IncomingMessage, succeeded: bool) {
+        if message.channel != "feishu" {
+            return;
+        }
+        self.complete_feishu_dedup_by_message_id(message.external_message_id.as_deref(), succeeded)
+            .await;
+    }
+
+    async fn complete_feishu_dedup_by_message_id(
+        &self,
+        external_message_id: Option<&str>,
+        succeeded: bool,
+    ) {
+        let Some(external_message_id) = external_message_id else {
+            return;
+        };
+        if succeeded {
+            self.feishu_deduper
+                .mark_completed(external_message_id)
+                .await;
+        } else {
+            self.feishu_deduper.clear_failed(external_message_id).await;
+        }
     }
 
     async fn try_mark_thread_pending(&self, locator: &ThreadLocator) -> bool {
@@ -646,5 +629,184 @@ impl ChannelRouter {
 
         self.pending_threads.lock().await.remove(locator);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeishuDedupStatus {
+    Processing,
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+struct FeishuDedupEntry {
+    status: FeishuDedupStatus,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct FeishuDedupState {
+    entries: HashMap<String, FeishuDedupEntry>,
+    last_cleanup_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct FeishuMemoryDeduper {
+    state: Mutex<FeishuDedupState>,
+    ttl: Duration,
+    cleanup_interval: Duration,
+}
+
+impl Default for FeishuMemoryDeduper {
+    fn default() -> Self {
+        Self::new(Duration::minutes(10), Duration::minutes(1))
+    }
+}
+
+impl FeishuMemoryDeduper {
+    fn new(ttl: Duration, cleanup_interval: Duration) -> Self {
+        let now = Utc::now();
+        Self {
+            state: Mutex::new(FeishuDedupState {
+                entries: HashMap::new(),
+                last_cleanup_at: now,
+            }),
+            ttl,
+            cleanup_interval,
+        }
+    }
+
+    async fn try_start(&self, external_message_id: &str) -> bool {
+        let now = Utc::now();
+        let mut state = self.state.lock().await;
+        self.cleanup_if_due(&mut state, now);
+        match state.entries.get(external_message_id) {
+            Some(entry) if entry.expires_at > now => {
+                info!(
+                    external_message_id,
+                    status = ?entry.status,
+                    expires_at = %entry.expires_at,
+                    "feishu dedup hit existing entry"
+                );
+                false
+            }
+            _ => {
+                state.entries.insert(
+                    external_message_id.to_string(),
+                    FeishuDedupEntry {
+                        status: FeishuDedupStatus::Processing,
+                        expires_at: now + self.ttl,
+                    },
+                );
+                info!(
+                    external_message_id,
+                    expires_at = %(now + self.ttl),
+                    "feishu dedup registered processing entry"
+                );
+                true
+            }
+        }
+    }
+
+    async fn mark_completed(&self, external_message_id: &str) {
+        let now = Utc::now();
+        let mut state = self.state.lock().await;
+        self.cleanup_if_due(&mut state, now);
+        state.entries.insert(
+            external_message_id.to_string(),
+            FeishuDedupEntry {
+                status: FeishuDedupStatus::Completed,
+                expires_at: now + self.ttl,
+            },
+        );
+        info!(
+            external_message_id,
+            expires_at = %(now + self.ttl),
+            "feishu dedup marked completed"
+        );
+    }
+
+    async fn clear_failed(&self, external_message_id: &str) {
+        let now = Utc::now();
+        let mut state = self.state.lock().await;
+        self.cleanup_if_due(&mut state, now);
+        if state.entries.remove(external_message_id).is_some() {
+            info!(
+                external_message_id,
+                "feishu dedup cleared failed processing entry"
+            );
+        }
+    }
+
+    fn cleanup_if_due(&self, state: &mut FeishuDedupState, now: DateTime<Utc>) {
+        if now - state.last_cleanup_at < self.cleanup_interval {
+            return;
+        }
+        let before = state.entries.len();
+        state.entries.retain(|external_message_id, entry| {
+            let keep = entry.expires_at > now;
+            if !keep {
+                info!(
+                    external_message_id,
+                    status = ?entry.status,
+                    expired_at = %entry.expires_at,
+                    "feishu dedup expired entry"
+                );
+            }
+            keep
+        });
+        let removed = before.saturating_sub(state.entries.len());
+        state.last_cleanup_at = now;
+        if removed > 0 {
+            info!(
+                removed_entry_count = removed,
+                remaining_entry_count = state.entries.len(),
+                "feishu dedup cleanup removed expired entries"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FeishuMemoryDeduper;
+    use chrono::Duration;
+
+    #[tokio::test]
+    async fn feishu_deduper_clears_failed_processing_entry_for_retry() {
+        // 测试场景: Processing 请求失败后应删除 dedup 记录，允许平台重试重新进入主链路。
+        let deduper = FeishuMemoryDeduper::default();
+
+        assert!(deduper.try_start("msg_retry").await);
+        assert!(!deduper.try_start("msg_retry").await);
+
+        deduper.clear_failed("msg_retry").await;
+
+        assert!(deduper.try_start("msg_retry").await);
+    }
+
+    #[tokio::test]
+    async fn feishu_deduper_expires_completed_entry_after_ttl_cleanup() {
+        // 测试场景: Completed 记录在 TTL 过期并清理后，应允许同一 external_message_id 再次进入。
+        let deduper = FeishuMemoryDeduper::new(Duration::milliseconds(10), Duration::zero());
+
+        assert!(deduper.try_start("msg_ttl").await);
+        deduper.mark_completed("msg_ttl").await;
+        assert!(!deduper.try_start("msg_ttl").await);
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert!(deduper.try_start("msg_ttl").await);
+    }
+
+    #[tokio::test]
+    async fn feishu_deduper_is_process_local_best_effort_only() {
+        // 测试场景: 进程重启后新的 deduper 实例不会继承旧记录，同一消息可能再次触发副作用。
+        let first_process = FeishuMemoryDeduper::default();
+        assert!(first_process.try_start("msg_restart").await);
+        first_process.mark_completed("msg_restart").await;
+
+        let restarted_process = FeishuMemoryDeduper::default();
+        assert!(restarted_process.try_start("msg_restart").await);
     }
 }

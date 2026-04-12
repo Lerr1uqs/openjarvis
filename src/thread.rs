@@ -1,4 +1,4 @@
-//! Thread aggregate and persisted thread state model.
+//! Thread-first aggregate model and atomic thread-owned persistence helpers.
 
 use crate::agent::{
     FeaturePromptRebuilder, MemoryRepository, ToolCallRequest, ToolCallResult, ToolDefinition,
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const OPENJARVIS_THREAD_ID_NAMESPACE: Uuid =
@@ -108,42 +108,6 @@ impl ThreadToolEvent {
     }
 }
 
-/// Finalized status for one thread-owned turn result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ThreadFinalizedTurnStatus {
-    Succeeded,
-    Failed { error: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct ThreadCurrentTurn {
-    external_message_id: Option<String>,
-    started_at: DateTime<Utc>,
-    tool_events: Vec<ThreadToolEvent>,
-}
-
-impl ThreadCurrentTurn {
-    fn new(external_message_id: Option<String>, started_at: DateTime<Utc>) -> Self {
-        Self {
-            external_message_id,
-            started_at,
-            tool_events: Vec::new(),
-        }
-    }
-}
-
-/// One finalized thread-owned turn that binds the persisted snapshot edge.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ThreadFinalizedTurn {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_message_id: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: DateTime<Utc>,
-    pub reply: String,
-    pub status: ThreadFinalizedTurnStatus,
-    pub snapshot: Thread,
-}
-
 /// Stable runtime locator shared by session, command, and agent execution on one thread.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadContextLocator {
@@ -214,6 +178,13 @@ impl ThreadContextLocator {
     }
 }
 
+/// Thread lifecycle state that belongs to persisted thread state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadLifecycleState {
+    #[serde(default)]
+    pub initialized: bool,
+}
+
 /// Thread feature flags and runtime feature overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadFeatureState {
@@ -263,6 +234,8 @@ pub struct ThreadApprovalState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ThreadState {
     #[serde(default)]
+    pub lifecycle: ThreadLifecycleState,
+    #[serde(default)]
     pub features: ThreadFeatureState,
     #[serde(default)]
     pub tools: ThreadToolState,
@@ -275,8 +248,6 @@ pub struct ThreadState {
 pub struct ThreadContext {
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_context_initialized_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -286,7 +257,6 @@ impl ThreadContext {
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
             messages: Vec::new(),
-            request_context_initialized_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -298,34 +268,68 @@ impl ThreadContext {
     }
 }
 
-/// Runtime attachment bundle injected into one live thread before request handling starts.
+/// Persisted thread snapshot written by thread-owned CAS mutations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedThreadSnapshot {
+    pub thread: ThreadContext,
+    #[serde(default)]
+    pub state: ThreadState,
+}
+
+impl PersistedThreadSnapshot {
+    /// Create one empty persisted snapshot at the provided timestamp.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::thread::PersistedThreadSnapshot;
+    ///
+    /// let snapshot = PersistedThreadSnapshot::new(Utc::now());
+    /// assert!(snapshot.thread.messages.is_empty());
+    /// ```
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            thread: ThreadContext::new(now),
+            state: ThreadState::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveRequestState {
+    external_message_id: Option<String>,
+    started_at: DateTime<Utc>,
+}
+
+/// Persistence boundary used by live `Thread` handles.
+#[async_trait]
+pub trait ThreadSnapshotStore: Send + Sync + fmt::Debug {
+    /// Persist one thread snapshot using compare-and-swap revision semantics.
+    async fn save_thread_snapshot(
+        &self,
+        locator: &ThreadContextLocator,
+        snapshot: &PersistedThreadSnapshot,
+        expected_revision: u64,
+    ) -> Result<u64>;
+}
+
+/// Dedicated runtime container for thread initialization and runtime service access.
 #[derive(Clone)]
-pub struct ThreadRuntimeAttachment {
+pub struct ThreadRuntime {
     tool_registry: Arc<ToolRegistry>,
     memory_repository: Arc<MemoryRepository>,
     feature_prompt_rebuilder: Arc<FeaturePromptRebuilder>,
     default_auto_compact_enabled: bool,
-    message_persistence: Option<Arc<dyn ThreadMessagePersistence>>,
 }
 
-/// Persistence capability attached to one live thread for message-level commit writes.
-#[async_trait]
-pub trait ThreadMessagePersistence: Send + Sync + fmt::Debug {
-    async fn persist_thread_snapshot(
-        &self,
-        thread: Thread,
-        updated_at: DateTime<Utc>,
-    ) -> Result<Thread>;
-}
-
-impl ThreadRuntimeAttachment {
-    /// Build one thread runtime attachment from shared runtime services.
+impl ThreadRuntime {
+    /// Build one thread runtime from shared runtime services.
     ///
     /// # 示例
     /// ```rust,no_run
     /// use openjarvis::{
     ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
-    ///     thread::ThreadRuntimeAttachment,
+    ///     thread::ThreadRuntime,
     /// };
     /// use std::sync::Arc;
     ///
@@ -337,44 +341,138 @@ impl ThreadRuntimeAttachment {
     ///     "",
     /// ));
     ///
-    /// let attachment = ThreadRuntimeAttachment::new(
+    /// let runtime = ThreadRuntime::new(
     ///     tool_registry,
     ///     memory_repository,
     ///     feature_prompt_rebuilder,
     ///     false,
-    ///     None,
     /// );
-    /// assert!(!attachment.default_auto_compact_enabled());
+    /// assert!(!runtime.default_auto_compact_enabled());
     /// ```
     pub fn new(
         tool_registry: Arc<ToolRegistry>,
         memory_repository: Arc<MemoryRepository>,
         feature_prompt_rebuilder: Arc<FeaturePromptRebuilder>,
         default_auto_compact_enabled: bool,
-        message_persistence: Option<Arc<dyn ThreadMessagePersistence>>,
     ) -> Self {
         Self {
             tool_registry,
             memory_repository,
             feature_prompt_rebuilder,
             default_auto_compact_enabled,
-            message_persistence,
         }
     }
 
-    /// Return whether auto-compact should be enabled by default for attached threads.
+    /// Return the shared tool registry.
+    pub fn tool_registry(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.tool_registry)
+    }
+
+    /// Return the shared memory repository.
+    pub fn memory_repository(&self) -> Arc<MemoryRepository> {
+        Arc::clone(&self.memory_repository)
+    }
+
+    /// Return whether auto-compact should be enabled by default for initialized threads.
     pub fn default_auto_compact_enabled(&self) -> bool {
         self.default_auto_compact_enabled
     }
 
-    async fn ensure_tool_registry_ready(&self) -> Result<()> {
+    /// Ensure built-in tools are ready before the thread is served.
+    pub async fn ensure_tool_registry_ready(&self) -> Result<()> {
         self.tool_registry.register_builtin_tools().await
+    }
+
+    /// Persist one initialized thread prefix before the thread enters normal request handling.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     thread::{Thread, ThreadContextLocator, ThreadRuntime},
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let tool_registry = Arc::new(ToolRegistry::new());
+    /// let memory_repository = Arc::new(MemoryRepository::new("."));
+    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
+    ///     Arc::clone(&tool_registry),
+    ///     Default::default(),
+    ///     "system",
+    /// ));
+    /// let runtime = ThreadRuntime::new(
+    ///     tool_registry,
+    ///     memory_repository,
+    ///     feature_prompt_rebuilder,
+    ///     false,
+    /// );
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    ///
+    /// runtime.initialize_thread(&mut thread).await?;
+    /// assert!(thread.is_initialized());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn initialize_thread(&self, thread_context: &mut Thread) -> Result<bool> {
+        self.ensure_tool_registry_ready().await?;
+
+        if thread_context.is_initialized() {
+            return Ok(false);
+        }
+
+        let existing_system_prefix_at = thread_context
+            .thread
+            .messages
+            .iter()
+            .find(|message| message.role == ChatMessageRole::System)
+            .map(|message| message.created_at);
+        if let Some(initialized_at) = existing_system_prefix_at {
+            thread_context.mark_initialized(initialized_at).await?;
+            info!(
+                thread_id = %thread_context.locator.thread_id,
+                external_thread_id = %thread_context.locator.external_thread_id,
+                initialized_at = %initialized_at,
+                "marked existing thread as initialized from persisted system prefix"
+            );
+            return Ok(true);
+        }
+
+        let auto_compact_enabled =
+            thread_context.auto_compact_enabled(self.default_auto_compact_enabled);
+        let initialized_messages = self
+            .feature_prompt_rebuilder
+            .build_messages(thread_context, auto_compact_enabled)
+            .await?;
+        let initialized_at = initialized_messages
+            .first()
+            .map(|message| message.created_at)
+            .unwrap_or_else(Utc::now);
+        thread_context
+            .initialize_with_messages(initialized_messages, initialized_at)
+            .await?;
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            external_thread_id = %thread_context.locator.external_thread_id,
+            initialized_message_count = thread_context
+                .thread
+                .messages
+                .iter()
+                .filter(|message| message.role == ChatMessageRole::System)
+                .count(),
+            "persisted thread initialization prefix"
+        );
+        Ok(true)
     }
 }
 
-impl fmt::Debug for ThreadRuntimeAttachment {
+impl fmt::Debug for ThreadRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ThreadRuntimeAttachment")
+        f.debug_struct("ThreadRuntime")
             .field(
                 "default_auto_compact_enabled",
                 &self.default_auto_compact_enabled,
@@ -382,34 +480,23 @@ impl fmt::Debug for ThreadRuntimeAttachment {
             .field("tool_registry", &"Arc<ToolRegistry>")
             .field("memory_repository", &"Arc<MemoryRepository>")
             .field("feature_prompt_rebuilder", &"Arc<FeaturePromptRebuilder>")
-            .field(
-                "message_persistence",
-                &self
-                    .message_persistence
-                    .as_ref()
-                    .map(|_| "Arc<dyn ThreadMessagePersistence>"),
-            )
             .finish()
     }
 }
 
-/// Unified persisted thread aggregate shared by session, command, and agent execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Live thread handle. Persisted state is separated from live request-only state.
+#[derive(Clone)]
 pub struct Thread {
     pub locator: ThreadContextLocator,
     pub thread: ThreadContext,
-    #[serde(default)]
     pub state: ThreadState,
-    #[serde(default, skip_serializing, skip_deserializing)]
     revision: u64,
-    #[serde(default, skip_serializing, skip_deserializing)]
-    current_turn: Option<ThreadCurrentTurn>,
-    #[serde(default, skip_serializing, skip_deserializing)]
-    runtime_attachment: Option<ThreadRuntimeAttachment>,
+    active_request: Option<ActiveRequestState>,
+    store: Option<Arc<dyn ThreadSnapshotStore>>,
 }
 
 impl Thread {
-    /// Create one empty thread aggregate.
+    /// Create one empty live thread handle.
     ///
     /// # 示例
     /// ```rust
@@ -434,8 +521,43 @@ impl Thread {
             thread: ThreadContext::new(now),
             state: ThreadState::default(),
             revision: 0,
-            current_turn: None,
-            runtime_attachment: None,
+            active_request: None,
+            store: None,
+        }
+    }
+
+    /// Rebuild one live thread handle from one persisted snapshot and revision.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{PersistedThreadSnapshot, Thread, ThreadContextLocator};
+    ///
+    /// let locator =
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal");
+    /// let thread = Thread::from_persisted(locator.clone(), PersistedThreadSnapshot::new(Utc::now()), 7);
+    /// assert_eq!(thread.locator, locator);
+    /// ```
+    pub fn from_persisted(
+        locator: ThreadContextLocator,
+        snapshot: PersistedThreadSnapshot,
+        revision: u64,
+    ) -> Self {
+        Self {
+            locator,
+            thread: snapshot.thread,
+            state: snapshot.state,
+            revision,
+            active_request: None,
+            store: None,
+        }
+    }
+
+    /// Return the persisted snapshot currently owned by this live handle.
+    pub fn persisted_snapshot(&self) -> PersistedThreadSnapshot {
+        PersistedThreadSnapshot {
+            thread: self.thread.clone(),
+            state: self.state.clone(),
         }
     }
 
@@ -444,246 +566,24 @@ impl Thread {
         self.locator = locator;
     }
 
-    /// Attach the shared runtime services required by this thread during live request handling.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
-    ///     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
-    /// };
-    /// use std::sync::Arc;
-    ///
-    /// let tool_registry = Arc::new(ToolRegistry::new());
-    /// let memory_repository = Arc::new(MemoryRepository::new("."));
-    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
-    ///     Arc::clone(&tool_registry),
-    ///     Default::default(),
-    ///     "",
-    /// ));
-    /// let attachment = ThreadRuntimeAttachment::new(
-    ///     tool_registry,
-    ///     memory_repository,
-    ///     feature_prompt_rebuilder,
-    ///     false,
-    ///     None,
-    /// );
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    ///
-    /// thread.attach_runtime(attachment);
-    /// assert!(thread.has_runtime());
-    /// ```
-    pub fn attach_runtime(&mut self, attachment: ThreadRuntimeAttachment) {
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            "attached runtime services to thread"
-        );
-        self.runtime_attachment = Some(attachment);
-    }
-
-    /// Return whether the current thread already has a live runtime attachment.
-    pub fn has_runtime(&self) -> bool {
-        self.runtime_attachment.is_some()
-    }
-
-    pub(crate) fn detach_runtime(&mut self) {
-        self.runtime_attachment = None;
-    }
-
-    fn runtime_attachment(&self) -> Result<&ThreadRuntimeAttachment> {
-        self.runtime_attachment.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "thread `{}` does not have attached runtime services",
-                self.locator.thread_id
-            )
-        })
-    }
-
-    fn backfill_initialized_at_from_system_prefix(&mut self) -> Option<DateTime<Utc>> {
-        let initialized_at = self
-            .thread
-            .messages
-            .iter()
-            .find(|message| message.role == ChatMessageRole::System)
-            .map(|message| message.created_at)?;
-        self.thread.request_context_initialized_at = Some(initialized_at);
-        Some(initialized_at)
-    }
-
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    pub(crate) fn set_revision(&mut self, revision: u64) {
-        self.revision = revision;
+    /// Bind one thread snapshot store to the live handle.
+    pub fn bind_store(&mut self, store: Arc<dyn ThreadSnapshotStore>) {
+        self.store = Some(store);
     }
 
     /// Export the thread-owned formal message sequence.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// thread
-    ///     .begin_turn(Some("msg_1".to_string()), now)
-    ///     .expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .await?;
-    ///
-    /// assert_eq!(thread.messages()[0].role, ChatMessageRole::User);
-    /// assert_eq!(thread.messages()[0].content, "hello");
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn messages(&self) -> Vec<ChatMessage> {
         self.thread.messages()
     }
 
     /// Export the compact source message sequence used by runtime compaction.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// thread.begin_turn(Some("msg_1".to_string()), now).expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .await?;
-    ///
-    /// assert_eq!(thread.compact_source_messages().len(), 1);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn compact_source_messages(&self) -> Vec<ChatMessage> {
         self.thread.messages()
     }
 
-    /// Return whether this thread already owns a stable initialized request-context snapshot.
+    /// Return whether this thread already owns a persisted initialized prefix.
     pub fn is_initialized(&self) -> bool {
-        self.thread.request_context_initialized_at.is_some()
-    }
-
-    /// Ensure the current thread has finished stable request-context initialization.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
-    ///     thread::{Thread, ThreadContextLocator, ThreadRuntimeAttachment},
-    /// };
-    /// use std::sync::Arc;
-    ///
-    /// let tool_registry = Arc::new(ToolRegistry::new());
-    /// let memory_repository = Arc::new(MemoryRepository::new("."));
-    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
-    ///     Arc::clone(&tool_registry),
-    ///     Default::default(),
-    ///     "system",
-    /// ));
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    /// thread.attach_runtime(ThreadRuntimeAttachment::new(
-    ///     tool_registry,
-    ///     memory_repository,
-    ///     feature_prompt_rebuilder,
-    ///     false,
-    ///     None,
-    /// ));
-    ///
-    /// let _ = thread.ensure_initialized().await?;
-    /// assert!(thread.is_initialized());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn ensure_initialized(&mut self) -> Result<bool> {
-        let runtime_attachment = self.runtime_attachment()?.clone();
-        runtime_attachment.ensure_tool_registry_ready().await?;
-
-        if self.is_initialized() {
-            return Ok(false);
-        }
-
-        if let Some(initialized_at) = self.backfill_initialized_at_from_system_prefix() {
-            info!(
-                thread_id = %self.locator.thread_id,
-                external_thread_id = %self.locator.external_thread_id,
-                initialized_at = %initialized_at,
-                "backfilled thread initialization marker from existing system prefix"
-            );
-            return Ok(true);
-        }
-
-        let auto_compact_enabled =
-            self.auto_compact_enabled(runtime_attachment.default_auto_compact_enabled());
-        let initialized_messages = runtime_attachment
-            .feature_prompt_rebuilder
-            .build_messages(self, auto_compact_enabled)
-            .await?;
-        let initialized_at = initialized_messages
-            .first()
-            .map(|message| message.created_at)
-            .unwrap_or_else(Utc::now);
-        if !initialized_messages.is_empty() {
-            self.replace_messages(initialized_messages, initialized_at);
-        }
-        self.thread.request_context_initialized_at = Some(initialized_at);
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            initialized_message_count = self
-                .thread
-                .messages
-                .iter()
-                .filter(|message| message.role == ChatMessageRole::System)
-                .count(),
-            "thread ensured initialized request-context snapshot"
-        );
-        Ok(true)
-    }
-
-    /// Return the memory repository attached to the current live thread runtime.
-    pub fn memory_repository(&self) -> Result<Arc<MemoryRepository>> {
-        Ok(Arc::clone(&self.runtime_attachment()?.memory_repository))
-    }
-
-    /// Replace the current persisted message sequence.
-    pub(crate) fn replace_messages(
-        &mut self,
-        replacement: Vec<ChatMessage>,
-        updated_at: DateTime<Utc>,
-    ) {
-        self.thread.messages = replacement;
-        self.thread.updated_at = updated_at;
+        self.state.lifecycle.initialized
     }
 
     /// Return the persisted loaded toolsets for the thread.
@@ -696,50 +596,147 @@ impl Thread {
         self.state.tools.tool_events.clone()
     }
 
-    /// Record one thread-scoped tool event on the current runtime context.
-    pub fn record_tool_event(&mut self, event: ThreadToolEvent) -> Result<()> {
-        let current_turn = self.current_turn.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "thread `{}` cannot record tool event without one active turn",
-                self.locator.thread_id
-            )
-        })?;
-        current_turn.tool_events.push(event);
-        Ok(())
+    /// Return whether the thread currently owns one active request-local state.
+    pub fn has_active_request(&self) -> bool {
+        self.active_request.is_some()
     }
 
-    pub(crate) fn clone_for_persistence(&self) -> Thread {
-        let mut snapshot = self.clone();
-        snapshot.current_turn = None;
-        snapshot.runtime_attachment = None;
-        snapshot
-    }
-
-    pub(crate) fn restore_live_runtime_from(&mut self, live_thread: &Thread) {
-        self.current_turn = live_thread.current_turn.clone();
-        self.runtime_attachment = live_thread.runtime_attachment.clone();
-    }
-
-    async fn persist_after_message_commit(&mut self, updated_at: DateTime<Utc>) -> Result<()> {
-        let Some(persistence) = self
-            .runtime_attachment
+    /// Return the current active request external message id.
+    pub fn current_request_external_message_id(&self) -> Option<String> {
+        self.active_request
             .as_ref()
-            .and_then(|attachment| attachment.message_persistence.clone())
-        else {
-            return Ok(());
-        };
-        let live_current_turn = self.current_turn.clone();
-        let live_runtime_attachment = self.runtime_attachment.clone();
-        let persisted = persistence
-            .persist_thread_snapshot(self.clone_for_persistence(), updated_at)
-            .await?;
-        *self = persisted;
-        self.current_turn = live_current_turn;
-        self.runtime_attachment = live_runtime_attachment;
+            .and_then(|request| request.external_message_id.clone())
+    }
+
+    /// Start one request-local live state without creating any persisted turn structure.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{Thread, ThreadContextLocator};
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// thread
+    ///     .begin_request(Some("msg_1".to_string()), now)
+    ///     .expect("request should start");
+    /// assert!(thread.has_active_request());
+    /// ```
+    pub fn begin_request(
+        &mut self,
+        external_message_id: Option<String>,
+        started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if self.active_request.is_some() {
+            bail!(
+                "thread `{}` already owns one unfinished request",
+                self.locator.thread_id
+            );
+        }
+
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            external_message_id = ?external_message_id,
+            started_at = %started_at,
+            "started thread-owned active request"
+        );
+        self.active_request = Some(ActiveRequestState {
+            external_message_id,
+            started_at,
+        });
         Ok(())
     }
 
-    /// Start one thread-owned turn from the incoming external message id and user message.
+    /// Finish the current request-local live state.
+    pub fn finish_request(&mut self, completed_at: DateTime<Utc>, succeeded: bool) -> Result<()> {
+        let Some(active_request) = self.active_request.take() else {
+            bail!(
+                "thread `{}` does not own one active request",
+                self.locator.thread_id
+            );
+        };
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            external_message_id = ?active_request.external_message_id,
+            request_started_at = %active_request.started_at,
+            completed_at = %completed_at,
+            succeeded,
+            "finished thread-owned active request"
+        );
+        Ok(())
+    }
+
+    async fn apply_persisted_mutation<F, R>(
+        &mut self,
+        mutation_name: &'static str,
+        mutate: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut PersistedThreadSnapshot) -> Result<R>,
+    {
+        let mut next = self.persisted_snapshot();
+        let result = mutate(&mut next)?;
+        let updated_at = next.thread.updated_at;
+        let expected_revision = self.revision;
+
+        if let Some(store) = self.store.as_ref() {
+            let new_revision = store
+                .save_thread_snapshot(&self.locator, &next, expected_revision)
+                .await?;
+            self.revision = new_revision;
+        }
+
+        self.thread = next.thread;
+        self.state = next.state;
+        debug!(
+            thread_id = %self.locator.thread_id,
+            revision = self.revision,
+            updated_at = %updated_at,
+            mutation = mutation_name,
+            "applied thread-owned persisted mutation"
+        );
+        Ok(result)
+    }
+
+    pub(crate) async fn mark_initialized(&mut self, initialized_at: DateTime<Utc>) -> Result<()> {
+        self.apply_persisted_mutation("mark_initialized", |snapshot| {
+            snapshot.state.lifecycle.initialized = true;
+            if snapshot.thread.created_at > initialized_at {
+                snapshot.thread.created_at = initialized_at;
+            }
+            if snapshot.thread.updated_at < initialized_at {
+                snapshot.thread.updated_at = initialized_at;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn initialize_with_messages(
+        &mut self,
+        initialized_messages: Vec<ChatMessage>,
+        initialized_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.apply_persisted_mutation("initialize_thread", |snapshot| {
+            if !initialized_messages.is_empty() {
+                snapshot.thread.messages = initialized_messages;
+                snapshot.thread.created_at = initialized_at;
+                snapshot.thread.updated_at = initialized_at;
+            }
+            snapshot.state.lifecycle.initialized = true;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Push one formal message into the thread-owned persisted message sequence.
+    ///
+    /// 调用成功返回时，这条消息已经通过 thread-owned CAS 语义完成落盘。
     ///
     /// # 示例
     /// ```rust,no_run
@@ -756,35 +753,251 @@ impl Thread {
     ///     now,
     /// );
     /// thread
-    ///     .begin_turn(Some("msg_1".to_string()), now)
-    ///     .expect("turn should start");
-    /// thread
     ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
     ///     .await?;
     ///
-    /// assert!(thread.has_active_turn());
+    /// assert_eq!(thread.messages()[0].content, "hello");
     /// # Ok(())
     /// # }
     /// ```
-    pub fn begin_turn(
-        &mut self,
-        external_message_id: Option<String>,
-        started_at: DateTime<Utc>,
-    ) -> Result<()> {
-        self.open_turn(external_message_id, started_at)?;
+    pub async fn push_message(&mut self, message: ChatMessage) -> Result<()> {
+        let external_message_id = self.current_request_external_message_id();
+        self.apply_persisted_mutation("push_message", |snapshot| {
+            if snapshot.thread.created_at > message.created_at {
+                snapshot.thread.created_at = message.created_at;
+            }
+            snapshot.thread.updated_at = message.created_at;
+            snapshot.thread.messages.push(message.clone());
+            Ok(())
+        })
+        .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            external_message_id = ?external_message_id,
+            role = message.role.as_label(),
+            tool_call_count = message.tool_calls.len(),
+            has_tool_call_id = message.tool_call_id.is_some(),
+            "persisted formal thread message"
+        );
         Ok(())
     }
 
-    /// Return whether the thread still carries one unfinished active turn snapshot.
-    pub fn has_active_turn(&self) -> bool {
-        self.current_turn.is_some()
+    /// Replace the persisted non-system history after one compact rewrite.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     context::{ChatMessage, ChatMessageRole},
+    ///     thread::{Thread, ThreadContextLocator},
+    /// };
+    ///
+    /// let now = Utc::now();
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     now,
+    /// );
+    /// thread
+    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+    ///     .await?;
+    /// thread
+    ///     .replace_messages_after_compaction(vec![
+    ///         ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
+    ///         ChatMessage::new(ChatMessageRole::User, "继续", now),
+    ///     ])
+    ///     .await?;
+    ///
+    /// assert_eq!(thread.messages()[0].content, "这是压缩后的上下文");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn replace_messages_after_compaction(
+        &mut self,
+        compacted_messages: Vec<ChatMessage>,
+    ) -> Result<()> {
+        let external_message_id = self.current_request_external_message_id();
+        self.apply_persisted_mutation("replace_messages_after_compaction", |snapshot| {
+            let mut persisted_messages = snapshot
+                .thread
+                .messages
+                .iter()
+                .filter(|message| message.role == ChatMessageRole::System)
+                .cloned()
+                .collect::<Vec<_>>();
+            let updated_at = compacted_messages
+                .last()
+                .map(|message| message.created_at)
+                .unwrap_or_else(Utc::now);
+            persisted_messages.extend(compacted_messages.clone());
+            snapshot.thread.messages = persisted_messages;
+            if snapshot.thread.created_at > updated_at {
+                snapshot.thread.created_at = updated_at;
+            }
+            snapshot.thread.updated_at = updated_at;
+            Ok(())
+        })
+        .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            external_message_id = ?external_message_id,
+            compacted_message_count = self
+                .thread
+                .messages
+                .iter()
+                .filter(|message| message.role != ChatMessageRole::System)
+                .count(),
+            "rewrote persisted thread non-system history after compaction"
+        );
+        Ok(())
     }
 
-    /// Return the active turn's bound external message id.
-    pub fn current_turn_external_message_id(&self) -> Option<String> {
-        self.current_turn
-            .as_ref()
-            .and_then(|turn| turn.external_message_id.clone())
+    /// Append one persisted thread tool event immediately.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind};
+    ///
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// thread
+    ///     .append_tool_event(ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, Utc::now()))
+    ///     .await?;
+    /// assert_eq!(thread.load_tool_events().len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn append_tool_event(&mut self, event: ThreadToolEvent) -> Result<()> {
+        let event_kind = event.kind.clone();
+        let recorded_at = event.recorded_at;
+        self.apply_persisted_mutation("append_tool_event", |snapshot| {
+            snapshot.state.tools.tool_events.push(event);
+            if snapshot.thread.updated_at < recorded_at {
+                snapshot.thread.updated_at = recorded_at;
+            }
+            Ok(())
+        })
+        .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            event_kind = ?event_kind,
+            "persisted thread tool audit event"
+        );
+        Ok(())
+    }
+
+    /// Replace the thread's loaded toolset state with a normalized snapshot in memory only.
+    pub fn replace_loaded_toolsets(&mut self, loaded_toolsets: Vec<String>) {
+        self.state.tools.loaded_toolsets = normalize_loaded_toolsets(loaded_toolsets);
+    }
+
+    /// Persist one thread-scoped auto-compact override immediately.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::thread::{Thread, ThreadContextLocator};
+    ///
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// thread.persist_auto_compact_override(Some(true)).await?;
+    /// assert!(thread.auto_compact_enabled(false));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn persist_auto_compact_override(&mut self, enabled: Option<bool>) -> Result<()> {
+        let updated_at = Utc::now();
+        self.apply_persisted_mutation("persist_auto_compact_override", |snapshot| {
+            snapshot.state.features.auto_compact_override = enabled;
+            snapshot.thread.updated_at = updated_at;
+            Ok(())
+        })
+        .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            auto_compact_override = ?enabled,
+            "persisted thread auto-compact override"
+        );
+        Ok(())
+    }
+
+    /// Mark one toolset as loaded for the current thread and persist the change atomically.
+    pub async fn load_toolset(&mut self, toolset_name: &str) -> Result<bool> {
+        let toolset_name = toolset_name.trim().to_string();
+        if toolset_name.is_empty() {
+            return Ok(false);
+        }
+
+        let inserted = self
+            .apply_persisted_mutation("load_toolset", |snapshot| {
+                let already_loaded = snapshot
+                    .state
+                    .tools
+                    .loaded_toolsets
+                    .binary_search_by(|candidate| candidate.as_str().cmp(&toolset_name))
+                    .is_ok();
+                if !already_loaded {
+                    snapshot
+                        .state
+                        .tools
+                        .loaded_toolsets
+                        .push(toolset_name.clone());
+                    snapshot.state.tools.loaded_toolsets.sort();
+                    snapshot.state.tools.loaded_toolsets.dedup();
+                    snapshot.thread.updated_at = Utc::now();
+                }
+                Ok(!already_loaded)
+            })
+            .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            toolset_name = %toolset_name,
+            inserted,
+            "updated persisted thread loaded toolsets"
+        );
+        Ok(inserted)
+    }
+
+    /// Mark one toolset as unloaded for the current thread and persist the change atomically.
+    pub async fn unload_toolset(&mut self, toolset_name: &str) -> Result<bool> {
+        let toolset_name = toolset_name.trim().to_string();
+        if toolset_name.is_empty() {
+            return Ok(false);
+        }
+
+        let removed = self
+            .apply_persisted_mutation("unload_toolset", |snapshot| {
+                let original_len = snapshot.state.tools.loaded_toolsets.len();
+                snapshot
+                    .state
+                    .tools
+                    .loaded_toolsets
+                    .retain(|candidate| candidate != &toolset_name);
+                let removed = original_len != snapshot.state.tools.loaded_toolsets.len();
+                if removed {
+                    snapshot.thread.updated_at = Utc::now();
+                }
+                Ok(removed)
+            })
+            .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            toolset_name = %toolset_name,
+            removed,
+            "updated persisted thread loaded toolsets"
+        );
+        Ok(removed)
     }
 
     pub(crate) async fn toolset_catalog_prompt_with_registry(
@@ -817,14 +1030,6 @@ impl Thread {
         Ok(definitions)
     }
 
-    /// Return the current thread-scoped visible tools by delegating to the attached runtime.
-    pub async fn visible_tools(&self, compact_visible: bool) -> Result<Vec<ToolDefinition>> {
-        let runtime_attachment = self.runtime_attachment()?.clone();
-        runtime_attachment.ensure_tool_registry_ready().await?;
-        self.visible_tools_with_registry(&runtime_attachment.tool_registry, compact_visible)
-            .await
-    }
-
     async fn load_toolset_via_registry(
         &mut self,
         tool_registry: &ToolRegistry,
@@ -836,7 +1041,7 @@ impl Thread {
         }
 
         tool_registry.toolset_definitions(toolset_name).await?;
-        Ok(self.load_toolset(toolset_name))
+        self.load_toolset(toolset_name).await
     }
 
     async fn unload_toolset_via_registry(
@@ -858,7 +1063,7 @@ impl Thread {
             runtime.on_unload(&thread_id).await?;
         }
 
-        Ok(self.unload_toolset(toolset_name))
+        self.unload_toolset(toolset_name).await
     }
 
     pub(crate) async fn call_tool_with_registry(
@@ -1008,388 +1213,7 @@ impl Thread {
         result
     }
 
-    /// Execute one thread-scoped tool call through the attached global tool registry.
-    pub async fn call_tool(&mut self, request: ToolCallRequest) -> Result<ToolCallResult> {
-        let runtime_attachment = self.runtime_attachment()?.clone();
-        runtime_attachment.ensure_tool_registry_ready().await?;
-        self.call_tool_with_registry(&runtime_attachment.tool_registry, request)
-            .await
-    }
-
-    /// Push one formal message into the thread-owned message sequence.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// thread
-    ///     .begin_turn(Some("msg_1".to_string()), now)
-    ///     .expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .await?;
-    ///
-    /// assert_eq!(thread.messages()[0].content, "hello");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn push_message(&mut self, message: ChatMessage) -> Result<()> {
-        self.current_turn_mut()?;
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            external_message_id = ?self.current_turn_external_message_id(),
-            role = message.role.as_label(),
-            tool_call_count = message.tool_calls.len(),
-            has_tool_call_id = message.tool_call_id.is_some(),
-            "appended formal thread message"
-        );
-        if self.thread.created_at > message.created_at {
-            self.thread.created_at = message.created_at;
-        }
-        self.thread.updated_at = message.created_at;
-        self.thread.messages.push(message);
-        self.persist_after_message_commit(self.thread.updated_at)
-            .await?;
-        Ok(())
-    }
-
-    /// Replace the persisted non-system history after one compact rewrite.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// thread.begin_turn(Some("msg_1".to_string()), now).expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .await?;
-    /// thread
-    ///     .replace_messages_after_compaction(vec![
-    ///         ChatMessage::new(ChatMessageRole::Assistant, "这是压缩后的上下文", now),
-    ///         ChatMessage::new(ChatMessageRole::User, "继续", now),
-    ///     ])
-    ///     .expect("compaction should rewrite history");
-    ///
-    /// assert_eq!(thread.messages()[0].content, "这是压缩后的上下文");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn replace_messages_after_compaction(
-        &mut self,
-        compacted_messages: Vec<ChatMessage>,
-    ) -> Result<()> {
-        self.current_turn_mut()?;
-        let mut persisted_messages = self
-            .thread
-            .messages
-            .iter()
-            .filter(|message| message.role == ChatMessageRole::System)
-            .cloned()
-            .collect::<Vec<_>>();
-        let updated_at = compacted_messages
-            .last()
-            .map(|message| message.created_at)
-            .unwrap_or_else(Utc::now);
-        persisted_messages.extend(compacted_messages);
-        self.replace_messages(persisted_messages, updated_at);
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            external_message_id = ?self.current_turn_external_message_id(),
-            compacted_message_count = self
-                .thread
-                .messages
-                .iter()
-                .filter(|message| message.role != ChatMessageRole::System)
-                .count(),
-            "rewrote thread non-system history after compaction"
-        );
-        Ok(())
-    }
-
-    /// Finalize the current turn as one successful thread snapshot.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator, ThreadFinalizedTurnStatus},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// thread
-    ///     .begin_turn(Some("msg_1".to_string()), now)
-    ///     .expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
-    ///     .await?;
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::Assistant, "world", now))
-    ///     .await?;
-    ///
-    /// let finalized = thread
-    ///     .finalize_turn_success("world", now)
-    ///     .expect("turn should finalize");
-    ///
-    /// assert!(matches!(finalized.status, ThreadFinalizedTurnStatus::Succeeded));
-    /// assert_eq!(finalized.snapshot.messages().len(), 2);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn finalize_turn_success(
-        &mut self,
-        reply: impl Into<String>,
-        completed_at: DateTime<Utc>,
-    ) -> Result<ThreadFinalizedTurn> {
-        self.finalize_turn(
-            ThreadFinalizedTurnStatus::Succeeded,
-            reply.into(),
-            completed_at,
-        )
-    }
-
-    /// Finalize the current turn as one failed thread snapshot.
-    ///
-    /// 异常失败不会回滚已经提交的正式消息，也不会在 finalize 内部自动追加 failure
-    /// message。
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     context::{ChatMessage, ChatMessageRole},
-    ///     thread::{Thread, ThreadContextLocator, ThreadFinalizedTurnStatus},
-    /// };
-    ///
-    /// let now = Utc::now();
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     now,
-    /// );
-    /// thread.begin_turn(Some("msg_0".to_string()), now).expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::Assistant, "persisted", now))
-    ///     .await?;
-    /// thread
-    ///     .finalize_turn_success("persisted", now)
-    ///     .expect("seed turn should finalize");
-    /// thread
-    ///     .begin_turn(Some("msg_1".to_string()), now)
-    ///     .expect("turn should start");
-    /// thread
-    ///     .push_message(ChatMessage::new(ChatMessageRole::Assistant, "partial reply", now))
-    ///     .await?;
-    ///
-    /// let finalized = thread
-    ///     .finalize_turn_failure("network error", now)
-    ///     .expect("failed turn should finalize");
-    ///
-    /// assert!(matches!(
-    ///     finalized.status,
-    ///     ThreadFinalizedTurnStatus::Failed { .. }
-    /// ));
-    /// assert_eq!(finalized.snapshot.messages().len(), 2);
-    /// assert_eq!(finalized.snapshot.messages()[1].content, "partial reply");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn finalize_turn_failure(
-        &mut self,
-        error: impl Into<String>,
-        completed_at: DateTime<Utc>,
-    ) -> Result<ThreadFinalizedTurn> {
-        let error = error.into();
-        let Some(current_turn) = self.current_turn.take() else {
-            bail!(
-                "thread `{}` does not own one active turn to finalize",
-                self.locator.thread_id
-            );
-        };
-        let failure_reply = format!("[openjarvis][agent_error] {error}");
-        error!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            external_message_id = ?current_turn.external_message_id,
-            dropped_tool_event_count = current_turn.tool_events.len(),
-            error = %error,
-            message_count = self.messages().len(),
-            "thread-owned turn failed without rolling back committed messages"
-        );
-
-        self.thread.updated_at = completed_at;
-        if self.thread.created_at > current_turn.started_at {
-            self.thread.created_at = current_turn.started_at;
-        }
-        self.state
-            .tools
-            .tool_events
-            .extend(current_turn.tool_events);
-        Ok(ThreadFinalizedTurn {
-            external_message_id: current_turn.external_message_id,
-            started_at: current_turn.started_at,
-            completed_at,
-            reply: failure_reply.clone(),
-            status: ThreadFinalizedTurnStatus::Failed { error },
-            snapshot: self.clone(),
-        })
-    }
-
-    /// Replace the thread's loaded toolset state with a normalized snapshot.
-    pub fn replace_loaded_toolsets(&mut self, loaded_toolsets: Vec<String>) {
-        self.state.tools.loaded_toolsets = normalize_loaded_toolsets(loaded_toolsets);
-    }
-
-    /// Mark one toolset as loaded for the current thread.
-    pub fn load_toolset(&mut self, toolset_name: &str) -> bool {
-        let toolset_name = toolset_name.trim();
-        if toolset_name.is_empty() {
-            return false;
-        }
-
-        let inserted = self
-            .state
-            .tools
-            .loaded_toolsets
-            .binary_search_by(|candidate| candidate.as_str().cmp(toolset_name))
-            .is_err();
-        if inserted {
-            self.state
-                .tools
-                .loaded_toolsets
-                .push(toolset_name.to_string());
-            self.state.tools.loaded_toolsets.sort();
-            self.state.tools.loaded_toolsets.dedup();
-        }
-        inserted
-    }
-
-    /// Mark one toolset as unloaded for the current thread.
-    pub fn unload_toolset(&mut self, toolset_name: &str) -> bool {
-        let original_len = self.state.tools.loaded_toolsets.len();
-        self.state
-            .tools
-            .loaded_toolsets
-            .retain(|candidate| candidate != toolset_name);
-        original_len != self.state.tools.loaded_toolsets.len()
-    }
-
-    fn open_turn(
-        &mut self,
-        external_message_id: Option<String>,
-        started_at: DateTime<Utc>,
-    ) -> Result<&mut ThreadCurrentTurn> {
-        if self.current_turn.is_some() {
-            bail!(
-                "thread `{}` already owns one unfinished turn",
-                self.locator.thread_id
-            );
-        }
-
-        let current_turn = ThreadCurrentTurn::new(external_message_id, started_at);
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            external_message_id = ?current_turn.external_message_id,
-            "started thread-owned turn"
-        );
-        self.current_turn = Some(current_turn);
-        Ok(self
-            .current_turn
-            .as_mut()
-            .expect("current turn should exist immediately after open_turn"))
-    }
-
-    fn current_turn_mut(&mut self) -> Result<&mut ThreadCurrentTurn> {
-        self.current_turn.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "thread `{}` does not own one active turn",
-                self.locator.thread_id
-            )
-        })
-    }
-
-    fn finalize_turn(
-        &mut self,
-        status: ThreadFinalizedTurnStatus,
-        reply: String,
-        completed_at: DateTime<Utc>,
-    ) -> Result<ThreadFinalizedTurn> {
-        let Some(current_turn) = self.current_turn.take() else {
-            bail!(
-                "thread `{}` does not own one active turn to finalize",
-                self.locator.thread_id
-            );
-        };
-
-        self.thread.updated_at = completed_at;
-        if self.thread.created_at > current_turn.started_at {
-            self.thread.created_at = current_turn.started_at;
-        }
-
-        self.state
-            .tools
-            .tool_events
-            .extend(current_turn.tool_events);
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            external_message_id = ?current_turn.external_message_id,
-            is_error = matches!(status, ThreadFinalizedTurnStatus::Failed { .. }),
-            "finalized thread-owned turn"
-        );
-
-        Ok(ThreadFinalizedTurn {
-            external_message_id: current_turn.external_message_id,
-            started_at: current_turn.started_at,
-            completed_at,
-            reply,
-            status,
-            snapshot: self.clone(),
-        })
-    }
-
-    /// Replace the active thread snapshot while keeping the current locator.
-    ///
-    /// 这个 helper 当前保留给集成测试和测试夹具使用，用来快速替换线程的正式消息历史和状态。
-    /// 它不是 thread runtime 的正式持久化边界，生产代码不应依赖它来搬运 active turn 生命周期。
-    #[doc(hidden)]
-    pub fn overwrite_active_history(&mut self, replacement: &Thread) {
-        self.thread = replacement.thread.clone();
-        self.state = replacement.state.clone();
-        // Test-only helper: keep mirroring the provided active turn so existing UT fixtures can
-        // model live-thread replacement without going through persistence.
-        self.current_turn = replacement.current_turn.clone();
-    }
-
-    /// Clear the current thread back to one empty initial state.
+    /// Clear the current thread back to one empty initial state in memory only.
     pub fn clear_to_initial_state(&mut self, now: DateTime<Utc>) {
         info!(
             thread_id = %self.locator.thread_id,
@@ -1398,7 +1222,26 @@ impl Thread {
         );
         self.thread = ThreadContext::new(now);
         self.state = ThreadState::default();
-        self.current_turn = None;
+        self.active_request = None;
+    }
+
+    /// Persist one reset that clears the thread back to one empty initial state.
+    pub async fn reset_to_initial_state(&mut self, now: DateTime<Utc>) -> Result<()> {
+        self.apply_persisted_mutation("reset_to_initial_state", |snapshot| {
+            snapshot.thread = ThreadContext::new(now);
+            snapshot.state = ThreadState::default();
+            Ok(())
+        })
+        .await?;
+        self.active_request = None;
+        Ok(())
+    }
+
+    /// Replace the active thread snapshot while keeping the current locator.
+    #[doc(hidden)]
+    pub fn overwrite_active_history(&mut self, replacement: &Thread) {
+        self.thread = replacement.thread.clone();
+        self.state = replacement.state.clone();
     }
 
     /// Return the effective auto-compact state for this thread.
@@ -1409,7 +1252,7 @@ impl Thread {
             .unwrap_or(default_enabled)
     }
 
-    /// Update the auto-compact override for the current thread.
+    /// Update the auto-compact override for the current thread in memory only.
     pub fn set_auto_compact_override(&mut self, enabled: Option<bool>) {
         self.state.features.auto_compact_override = enabled;
     }
@@ -1439,12 +1282,24 @@ impl DerefMut for Thread {
     }
 }
 
+impl fmt::Debug for Thread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Thread")
+            .field("locator", &self.locator)
+            .field("thread", &self.thread)
+            .field("state", &self.state)
+            .field("revision", &self.revision)
+            .field("active_request", &self.active_request)
+            .finish()
+    }
+}
+
 impl PartialEq for Thread {
     fn eq(&self, other: &Self) -> bool {
         self.locator == other.locator
             && self.thread == other.thread
             && self.state == other.state
             && self.revision == other.revision
-            && self.current_turn == other.current_turn
+            && self.active_request == other.active_request
     }
 }

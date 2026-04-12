@@ -1,5 +1,5 @@
-//! ReAct-style agent loop that keeps one thread-owned turn per incoming request and emits
-//! committed messages from the thread-owned message sequence.
+//! ReAct-style agent loop that keeps one live thread request per incoming message and emits
+//! committed messages from the persisted thread-owned message sequence.
 
 use super::{
     feature::AutoCompactor,
@@ -16,9 +16,9 @@ use crate::{
     config::{AgentCompactConfig, LLMConfig},
     llm::{LLMProvider, LLMRequest},
     model::{IncomingMessage, ReplyTarget},
-    thread::{Thread, ThreadFinalizedTurn, ThreadToolEvent, ThreadToolEventKind},
+    thread::{Thread, ThreadToolEvent, ThreadToolEventKind},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -166,12 +166,7 @@ impl AgentEventSender {
 pub struct AgentLoopOutput {
     pub reply: String,
     pub metadata: Value,
-    pub turns: Vec<CompletedAgentTurn>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompletedAgentTurn {
-    pub turn: ThreadFinalizedTurn,
+    pub succeeded: bool,
 }
 
 #[async_trait]
@@ -513,7 +508,7 @@ impl AgentLoop {
         let mut last_budget_report = None;
         let mut loop_iteration = 0usize;
         let mut reply_to_source = true;
-        thread_context.begin_turn(external_message_id, initial_message.created_at)?;
+        thread_context.begin_request(external_message_id, initial_message.created_at)?;
         commit_message(
             &event_tx,
             &mut thread_context,
@@ -736,11 +731,13 @@ impl AgentLoop {
                                     }
                                 }
                             };
-                        thread_context.record_tool_event(build_thread_tool_event(
+                        thread_context
+                            .append_tool_event(build_thread_tool_event(
                             &tool_call,
                             &provider_tool_call.id,
                             &tool_result,
-                        ))?;
+                        ))
+                        .await?;
                         info!(
                             thread_id = %thread_id,
                             tool_name = %tool_call.name,
@@ -844,21 +841,15 @@ impl AgentLoop {
         };
 
         let completed_at = Utc::now();
-        let turn = if let Some(error_message) = turn_completion.failure_error.clone() {
-            thread_context.finalize_turn_failure(error_message, completed_at)?
-        } else {
-            thread_context.finalize_turn_success(turn_completion.reply.clone(), completed_at)?
-        };
-        let completed_turns = vec![finalize_completed_turn(turn)];
-        let last_turn = completed_turns
-            .last()
-            .context("agent loop did not finalize any turn")?;
+        let succeeded = turn_completion.failure_error.is_none();
+        thread_context.finish_request(completed_at, succeeded)?;
         let metadata = build_loop_output_metadata(
             &self.runtime,
-            &last_turn.turn,
+            &thread_context,
             &used_tool_names,
             &last_visible_tools,
             last_budget_report.clone(),
+            succeeded,
         )
         .await;
         hooks
@@ -874,7 +865,7 @@ impl AgentLoop {
         Ok(AgentLoopOutput {
             reply: turn_completion.reply,
             metadata,
-            turns: completed_turns,
+            succeeded,
         })
     }
 
@@ -884,9 +875,6 @@ impl AgentLoop {
     }
 
     async fn prepare_thread_runtime(&self, thread_context: &mut Thread) -> Result<()> {
-        if thread_context.has_runtime() {
-            return Ok(());
-        }
         info!(
             thread_id = %thread_context.locator.thread_id,
             "preparing thread runtime"
@@ -896,11 +884,7 @@ impl AgentLoop {
     }
 
     async fn prepare_request_state(&self, thread_context: &mut Thread) -> Result<RequestState> {
-        let base_tools = if thread_context.has_runtime() {
-            thread_context.visible_tools(false).await?
-        } else {
-            self.runtime.list_tools(thread_context, false).await?
-        };
+        let base_tools = self.runtime.list_tools(thread_context, false).await?;
         let messages = thread_context.messages();
         let base_budget_report = self.budget_estimator.estimate(&messages, &base_tools);
         let compact_visible = self.auto_compact_enabled_for_thread(thread_context)
@@ -908,11 +892,7 @@ impl AgentLoop {
                 .auto_compactor
                 .compact_tool_visible(&base_budget_report);
         let tools = if compact_visible {
-            if thread_context.has_runtime() {
-                thread_context.visible_tools(true).await?
-            } else {
-                self.runtime.list_tools(thread_context, true).await?
-            }
+            self.runtime.list_tools(thread_context, true).await?
         } else {
             base_tools
         };
@@ -956,13 +936,9 @@ impl AgentLoop {
         thread_context: &mut Thread,
         tool_call: &ToolCallRequest,
     ) -> Result<super::ToolCallResult> {
-        if thread_context.has_runtime() {
-            thread_context.call_tool(tool_call.clone()).await
-        } else {
-            self.runtime
-                .call_tool(thread_context, tool_call.clone())
-                .await
-        }
+        self.runtime
+            .call_tool(thread_context, tool_call.clone())
+            .await
     }
 
     async fn execute_turn_compaction(
@@ -1007,7 +983,9 @@ impl AgentLoop {
         else {
             return Ok(None);
         };
-        thread_context.replace_messages_after_compaction(outcome.compacted_messages.clone())?;
+        thread_context
+            .replace_messages_after_compaction(outcome.compacted_messages.clone())
+            .await?;
         info!(
             thread_id,
             reason,
@@ -1039,22 +1017,24 @@ impl AgentLoop {
                     }),
                 })
                 .await?;
-            thread_context.record_tool_event(build_compact_thread_tool_event(
-                tool_call,
-                tool_call_id,
-                build_compact_event(
-                    "tool_requested",
+            thread_context
+                .append_tool_event(build_compact_thread_tool_event(
+                    tool_call,
+                    tool_call_id,
+                    build_compact_event(
+                        "tool_requested",
+                        true,
+                        true,
+                        budget_report,
+                        None,
+                        Some(tool_call_id),
+                        Some(&error_message),
+                    )
+                    .metadata
+                    .clone(),
                     true,
-                    true,
-                    budget_report,
-                    None,
-                    Some(tool_call_id),
-                    Some(&error_message),
-                )
-                .metadata
-                .clone(),
-                true,
-            ))?;
+                ))
+                .await?;
             let result = super::ToolCallResult {
                 content: error_message.clone(),
                 metadata: json!({
@@ -1110,26 +1090,28 @@ impl AgentLoop {
                         }),
                     })
                     .await?;
-                thread_context.record_tool_event(build_compact_thread_tool_event(
-                    tool_call,
-                    tool_call_id,
-                    outcome
-                        .as_ref()
-                        .map(|value| {
-                            build_compact_event(
-                                "tool_requested",
-                                true,
-                                false,
-                                budget_report,
-                                Some(value),
-                                Some(tool_call_id),
-                                None,
-                            )
-                            .metadata
-                        })
-                        .unwrap_or_else(default_compact_event_metadata),
-                    false,
-                ))?;
+                thread_context
+                    .append_tool_event(build_compact_thread_tool_event(
+                        tool_call,
+                        tool_call_id,
+                        outcome
+                            .as_ref()
+                            .map(|value| {
+                                build_compact_event(
+                                    "tool_requested",
+                                    true,
+                                    false,
+                                    budget_report,
+                                    Some(value),
+                                    Some(tool_call_id),
+                                    None,
+                                )
+                                .metadata
+                            })
+                            .unwrap_or_else(default_compact_event_metadata),
+                        false,
+                    ))
+                    .await?;
                 ut_probe.on_compact(AgentLoopUTCompactSnapshot {
                     iteration: loop_iteration,
                     reason: "tool_requested".to_string(),
@@ -1172,22 +1154,24 @@ impl AgentLoop {
                         }),
                     })
                     .await?;
-                thread_context.record_tool_event(build_compact_thread_tool_event(
-                    tool_call,
-                    tool_call_id,
-                    build_compact_event(
-                        "tool_requested",
+                thread_context
+                    .append_tool_event(build_compact_thread_tool_event(
+                        tool_call,
+                        tool_call_id,
+                        build_compact_event(
+                            "tool_requested",
+                            true,
+                            true,
+                            budget_report,
+                            None,
+                            Some(tool_call_id),
+                            Some(&error_message),
+                        )
+                        .metadata
+                        .clone(),
                         true,
-                        true,
-                        budget_report,
-                        None,
-                        Some(tool_call_id),
-                        Some(&error_message),
-                    )
-                    .metadata
-                    .clone(),
-                    true,
-                ))?;
+                    ))
+                    .await?;
                 ut_probe.on_compact(AgentLoopUTCompactSnapshot {
                     iteration: loop_iteration,
                     reason: "tool_requested".to_string(),
@@ -1270,10 +1254,6 @@ fn build_tool_result_event(
     }
 }
 
-fn finalize_completed_turn(turn: ThreadFinalizedTurn) -> CompletedAgentTurn {
-    CompletedAgentTurn { turn }
-}
-
 fn collect_response_tool_calls(items: &[ChatMessage]) -> Result<Vec<crate::llm::LLMToolCall>> {
     items
         .iter()
@@ -1308,7 +1288,7 @@ async fn commit_message<H>(
 where
     H: AgentCommittedMessageHandler,
 {
-    let source_message_id = thread_context.current_turn_external_message_id();
+    let source_message_id = thread_context.current_request_external_message_id();
     thread_context.push_message(message.clone()).await?;
     let dispatch_events = event
         .into_iter()
@@ -1333,10 +1313,11 @@ where
 
 async fn build_loop_output_metadata(
     runtime: &AgentRuntime,
-    turn: &ThreadFinalizedTurn,
+    thread_context: &Thread,
     used_tool_names: &[String],
     last_visible_tools: &[ToolDefinition],
     last_budget_report: Option<ContextBudgetReport>,
+    succeeded: bool,
 ) -> Value {
     let mcp_server_count = runtime.tools().mcp().list_servers().await.len();
     let hook_handler_count = runtime.hooks().len().await;
@@ -1346,15 +1327,14 @@ async fn build_loop_output_metadata(
         "hook_handler_count": hook_handler_count,
         "used_tool_name": used_tool_names.first().cloned(),
         "used_tool_names": used_tool_names,
-        "loaded_toolsets": turn.snapshot.load_toolsets(),
-        "message_count": turn
-            .snapshot
+        "loaded_toolsets": thread_context.load_toolsets(),
+        "message_count": thread_context
             .messages()
             .iter()
             .filter(|message| message.role != ChatMessageRole::System)
             .count(),
         "context_budget": last_budget_report,
-        "turn_status": turn.status,
+        "request_status": if succeeded { "succeeded" } else { "failed" },
     })
 }
 

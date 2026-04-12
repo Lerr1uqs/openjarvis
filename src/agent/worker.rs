@@ -16,8 +16,8 @@ use crate::config::{
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
-use crate::session::{SessionManager, SessionThreadPersistence, ThreadLocator};
-use crate::thread::{Thread, ThreadFinalizedTurn, ThreadRuntimeAttachment};
+use crate::session::{SessionManager, ThreadLocator};
+use crate::thread::{Thread, ThreadRuntime};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -33,12 +33,6 @@ pub struct AgentRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct FinalizedAgentTurn {
-    pub locator: ThreadLocator,
-    pub turn: ThreadFinalizedTurn,
-}
-
-#[derive(Debug, Clone)]
 pub struct CommittedAgentDispatchItem {
     pub locator: ThreadLocator,
     pub dispatch_event: AgentDispatchEvent,
@@ -49,12 +43,13 @@ pub struct CommittedAgentDispatchItem {
 pub struct CompletedAgentRequest {
     pub locator: ThreadLocator,
     pub completed_at: DateTime<Utc>,
+    pub external_message_id: Option<String>,
+    pub succeeded: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum AgentWorkerEvent {
     DispatchItemCommitted(CommittedAgentDispatchItem),
-    TurnFinalized(FinalizedAgentTurn),
     RequestCompleted(CompletedAgentRequest),
 }
 
@@ -65,8 +60,7 @@ pub struct AgentWorkerHandle {
 
 pub struct AgentWorker {
     agent_loop: AgentLoop,
-    thread_initializer: Arc<FeaturePromptRebuilder>,
-    compact_config: AgentCompactConfig,
+    thread_runtime: Arc<ThreadRuntime>,
     sandbox: DummySandboxContainer,
 }
 
@@ -198,6 +192,13 @@ impl AgentWorkerBuilder {
             compact_config.clone(),
             system_prompt.clone(),
         ));
+        let tool_registry = runtime.tools();
+        let thread_runtime = Arc::new(ThreadRuntime::new(
+            Arc::clone(&tool_registry),
+            tool_registry.memory_repository(),
+            Arc::clone(&thread_initializer),
+            compact_config.enabled() && compact_config.auto_compact(),
+        ));
         let agent_loop = match compact_provider {
             Some(compact_provider) => AgentLoop::with_compact_provider(
                 llm,
@@ -213,35 +214,13 @@ impl AgentWorkerBuilder {
 
         Ok(AgentWorker {
             agent_loop,
-            thread_initializer,
-            compact_config,
+            thread_runtime,
             sandbox: DummySandboxContainer::new(),
         })
     }
 }
 
 impl AgentWorker {
-    fn build_thread_runtime_attachment(&self, sessions: SessionManager) -> ThreadRuntimeAttachment {
-        let tool_registry = self.agent_loop.runtime().tools();
-        let memory_repository = tool_registry.memory_repository();
-        ThreadRuntimeAttachment::new(
-            tool_registry,
-            memory_repository,
-            Arc::clone(&self.thread_initializer),
-            self.compact_config.enabled() && self.compact_config.auto_compact(),
-            Some(Arc::new(SessionThreadPersistence::new(sessions))),
-        )
-    }
-
-    async fn initialize_thread(
-        &self,
-        thread_context: &mut Thread,
-        sessions: SessionManager,
-    ) -> Result<bool> {
-        thread_context.attach_runtime(self.build_thread_runtime_attachment(sessions));
-        thread_context.ensure_initialized().await
-    }
-
     /// Create one worker builder.
     pub fn builder() -> AgentWorkerBuilder {
         AgentWorkerBuilder::new()
@@ -356,6 +335,11 @@ impl AgentWorker {
         self.agent_loop.runtime()
     }
 
+    /// Return the thread runtime used to initialize and hydrate threads.
+    pub fn thread_runtime(&self) -> Arc<ThreadRuntime> {
+        Arc::clone(&self.thread_runtime)
+    }
+
     /// Return the sandbox container currently owned by this worker.
     ///
     /// # 示例
@@ -425,16 +409,7 @@ impl AgentWorker {
     ) -> Result<AgentLoopOutput> {
         let mut thread_context = request
             .sessions
-            .load_thread_context(&request.locator)
-            .await?
-            .unwrap_or_else(|| {
-                Thread::new(
-                    crate::thread::ThreadContextLocator::from(&request.locator),
-                    request.incoming.received_at,
-                )
-            });
-        let _ = self
-            .initialize_thread(&mut thread_context, request.sessions.clone())
+            .lock_thread_context(&request.locator, request.incoming.received_at)
             .await?;
 
         let mut committed_message_handler = WorkerCommittedMessageHandler {
@@ -456,25 +431,12 @@ impl AgentWorker {
 
         match loop_output {
             Ok(loop_output) => {
-                for completed_turn in &loop_output.turns {
-                    request
-                        .sessions
-                        .commit_finalized_turn(&request.locator, &completed_turn.turn)
-                        .await?;
-                    event_tx
-                        .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {
-                            locator: request.locator.clone(),
-                            turn: completed_turn.turn.clone(),
-                        }))
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("failed to report finalized turn: {error}")
-                        })?;
-                }
                 event_tx
                     .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
                         locator: request.locator.clone(),
                         completed_at: Utc::now(),
+                        external_message_id: request.incoming.external_message_id.clone(),
+                        succeeded: loop_output.succeeded,
                     }))
                     .await
                     .map_err(|error| {
@@ -486,12 +448,14 @@ impl AgentWorker {
                 warn!(
                     error = %format!("{error:#}"),
                     thread_id = %request.locator.thread_id,
-                    "agent loop returned one hard failure, attempting turn-aligned fallback"
+                    "agent loop returned one hard failure, attempting thread-owned fallback"
                 );
-                thread_context.begin_turn(
-                    request.incoming.external_message_id.clone(),
-                    request.incoming.received_at,
-                )?;
+                if !thread_context.has_active_request() {
+                    thread_context.begin_request(
+                        request.incoming.external_message_id.clone(),
+                        request.incoming.received_at,
+                    )?;
+                }
                 let committed_at = Utc::now();
                 let failure_reply = format!("[openjarvis][agent_error] {error:#}");
                 let failure_message = ChatMessage::new(
@@ -530,25 +494,13 @@ impl AgentWorker {
                             "failed to report fallback committed dispatch item: {send_error}"
                         )
                     })?;
-                let finalized_turn =
-                    thread_context.finalize_turn_failure(format!("{error:#}"), Utc::now())?;
-                request
-                    .sessions
-                    .commit_finalized_turn(&request.locator, &finalized_turn)
-                    .await?;
-                event_tx
-                    .send(AgentWorkerEvent::TurnFinalized(FinalizedAgentTurn {
-                        locator: request.locator.clone(),
-                        turn: finalized_turn,
-                    }))
-                    .await
-                    .map_err(|send_error| {
-                        anyhow::anyhow!("failed to report fallback finalized turn: {send_error}")
-                    })?;
+                thread_context.finish_request(Utc::now(), false)?;
                 event_tx
                     .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
                         locator: request.locator.clone(),
                         completed_at: Utc::now(),
+                        external_message_id: request.incoming.external_message_id.clone(),
+                        succeeded: false,
                     }))
                     .await
                     .map_err(|send_error| {

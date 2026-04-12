@@ -588,7 +588,9 @@ impl CommandHandler for ClearCommand {
             external_thread_id = %thread_context.locator.external_thread_id,
             "clearing thread history and runtime state by command"
         );
-        thread_context.clear_to_initial_state(incoming.received_at);
+        thread_context
+            .reset_to_initial_state(incoming.received_at)
+            .await?;
         Ok(CommandReply::success(
             invocation.name(),
             format!(

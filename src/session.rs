@@ -1,29 +1,31 @@
-//! Session cache and persistent thread-context storage orchestration.
+//! Session cache and thread-first storage orchestration.
 //!
-//! `SessionManager` owns the hot in-process cache for active sessions and delegates durable
-//! persistence to a pluggable `SessionStore` backend. The cache keeps one thread-level mutex for
-//! each live `Thread`, while the store still persists detached snapshots so thread
-//! recovery, tool state restoration, and external-message deduplication stay consistent across
-//! restarts.
+//! `SessionManager` now only resolves stable thread identities, owns the hot in-process thread
+//! handle cache, and recovers thread snapshots from a pluggable store backend.
 
 pub mod store;
 
 use crate::model::IncomingMessage;
 use crate::thread::{
-    Thread, ThreadContextLocator, ThreadFinalizedTurn, ThreadMessagePersistence,
-    derive_internal_thread_id,
+    Thread, ThreadContextLocator, ThreadRuntime, ThreadSnapshotStore, derive_internal_thread_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::info;
 use uuid::Uuid;
 
 pub use store::{
-    ExternalMessageDedupRecord, MemorySessionStore, SessionRevisionConflict, SessionStore,
-    SessionStoreError, SessionStoreResult, SqliteSessionStore, StoredSessionRecord,
+    MemorySessionStore, SessionRevisionConflict, SessionStore, SessionStoreError,
+    SessionStoreResult, SqliteSessionStore, StoredThreadRecord,
 };
+
+const OPENJARVIS_SESSION_ID_NAMESPACE: Uuid =
+    Uuid::from_u128(0x2c427c19_1ec5_4637_8fb6_930f5d84ec48);
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SessionKey {
@@ -57,6 +59,23 @@ impl SessionKey {
     /// ```
     pub fn thread_key(&self, external_thread_id: &str) -> String {
         format!("{}:{}:{}", self.user_id, self.channel, external_thread_id)
+    }
+
+    /// Derive one stable runtime-only session id from the normalized session key.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::session::SessionKey;
+    ///
+    /// let key = SessionKey {
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    /// };
+    /// assert_eq!(key.derive_session_id(), key.derive_session_id());
+    /// ```
+    pub fn derive_session_id(&self) -> Uuid {
+        let raw = format!("{}:{}", self.channel, self.user_id);
+        Uuid::new_v5(&OPENJARVIS_SESSION_ID_NAMESPACE, raw.as_bytes())
     }
 
     /// Derive the stable internal thread id for one external thread inside this session.
@@ -115,7 +134,7 @@ impl ThreadLocator {
     ///     },
     /// };
     ///
-    /// let session_id = Uuid::new_v4();
+    /// let session_id = SessionKey::from_incoming(&incoming).derive_session_id();
     /// let thread_id = SessionKey::from_incoming(&incoming).derive_thread_id("default");
     /// let locator = ThreadLocator::new(session_id, &incoming, "default", thread_id);
     /// assert_eq!(locator.external_thread_id, "default");
@@ -191,84 +210,6 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
 }
 
-impl Session {
-    /// Create an empty session snapshot.
-    pub fn new(key: SessionKey, now: DateTime<Utc>) -> Self {
-        Self::with_id(Uuid::new_v4(), key, now)
-    }
-
-    fn with_id(id: Uuid, key: SessionKey, now: DateTime<Utc>) -> Self {
-        Self {
-            id,
-            key,
-            threads: HashMap::new(),
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    /// Resolve one normalized external thread id into an internal thread context.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::{session::{Session, SessionKey}, thread::ThreadContextLocator};
-    ///
-    /// let now = Utc::now();
-    /// let session_key = SessionKey {
-    ///     channel: "feishu".to_string(),
-    ///     user_id: "ou_xxx".to_string(),
-    /// };
-    /// let mut session = Session::new(session_key.clone(), now);
-    /// let thread_id = session_key.derive_thread_id("default");
-    /// let thread = session.load_or_create_thread(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
-    ///     now,
-    /// );
-    ///
-    /// assert_eq!(thread.locator.thread_id, thread_id.to_string());
-    /// assert_eq!(thread.locator.external_thread_id, "default");
-    /// assert_eq!(thread.locator.thread_key(), "ou_xxx:feishu:default");
-    /// ```
-    pub fn load_or_create_thread(
-        &mut self,
-        locator: ThreadContextLocator,
-        now: DateTime<Utc>,
-    ) -> &mut Thread {
-        let thread_id = Uuid::parse_str(&locator.thread_id)
-            .expect("thread context locator should carry a UUID thread_id");
-        self.threads
-            .entry(thread_id)
-            .or_insert_with(|| Thread::new(locator, now))
-    }
-
-    /// Return the internal thread id currently bound to one normalized external thread id.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::{session::{Session, SessionKey}, thread::ThreadContextLocator};
-    ///
-    /// let now = Utc::now();
-    /// let session_key = SessionKey {
-    ///     channel: "feishu".to_string(),
-    ///     user_id: "ou_xxx".to_string(),
-    /// };
-    /// let mut session = Session::new(session_key.clone(), now);
-    /// let thread_id = session_key.derive_thread_id("default");
-    /// session.load_or_create_thread(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "default", thread_id.to_string()),
-    ///     now,
-    /// );
-    ///
-    /// assert_eq!(session.thread_id_for_external("default"), Some(thread_id));
-    /// ```
-    pub fn thread_id_for_external(&self, external_thread_id: &str) -> Option<Uuid> {
-        let thread_id = self.key.derive_thread_id(external_thread_id);
-        self.threads.contains_key(&thread_id).then_some(thread_id)
-    }
-}
-
 type SharedThreadContext = Arc<Mutex<Thread>>;
 
 #[derive(Debug, Clone)]
@@ -280,21 +221,36 @@ struct CachedSession {
     updated_at: DateTime<Utc>,
 }
 
-impl CachedSession {
-    fn from_record(record: StoredSessionRecord) -> Self {
-        Self {
-            id: record.id,
-            key: record.key,
-            threads: HashMap::new(),
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-        }
+#[derive(Clone)]
+struct BoundThreadStore {
+    store: Arc<dyn SessionStore>,
+}
+
+impl std::fmt::Debug for BoundThreadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundThreadStore").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ThreadSnapshotStore for BoundThreadStore {
+    async fn save_thread_snapshot(
+        &self,
+        locator: &ThreadContextLocator,
+        snapshot: &crate::thread::PersistedThreadSnapshot,
+        expected_revision: u64,
+    ) -> anyhow::Result<u64> {
+        self.store
+            .save_thread_snapshot(locator, snapshot, expected_revision)
+            .await
     }
 }
 
 struct SessionManagerInner {
     sessions: Mutex<HashMap<SessionKey, CachedSession>>,
     store: Arc<dyn SessionStore>,
+    bound_store: Arc<dyn ThreadSnapshotStore>,
+    thread_runtime: RwLock<Option<Arc<ThreadRuntime>>>,
 }
 
 #[derive(Clone)]
@@ -305,39 +261,6 @@ pub struct SessionManager {
 impl std::fmt::Debug for SessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionManager").finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone)]
-pub struct SessionThreadPersistence {
-    sessions: SessionManager,
-}
-
-impl std::fmt::Debug for SessionThreadPersistence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionThreadPersistence")
-            .finish_non_exhaustive()
-    }
-}
-
-impl SessionThreadPersistence {
-    pub fn new(sessions: SessionManager) -> Self {
-        Self { sessions }
-    }
-}
-
-#[async_trait]
-impl ThreadMessagePersistence for SessionThreadPersistence {
-    async fn persist_thread_snapshot(
-        &self,
-        thread: Thread,
-        updated_at: DateTime<Utc>,
-    ) -> anyhow::Result<Thread> {
-        let locator = ThreadLocator::try_from(&thread.locator)?;
-        Ok(self
-            .sessions
-            .persist_thread_snapshot(&locator, thread, updated_at)
-            .await?)
     }
 }
 
@@ -352,10 +275,16 @@ impl SessionManager {
     /// let _ = manager;
     /// ```
     pub fn new() -> Self {
+        let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+        let bound_store: Arc<dyn ThreadSnapshotStore> = Arc::new(BoundThreadStore {
+            store: Arc::clone(&store),
+        });
         Self {
             inner: Arc::new(SessionManagerInner {
                 sessions: Mutex::new(HashMap::new()),
-                store: Arc::new(MemorySessionStore::new()),
+                store,
+                bound_store,
+                thread_runtime: RwLock::new(None),
             }),
         }
     }
@@ -363,16 +292,31 @@ impl SessionManager {
     /// Create a session manager backed by the provided persistent store.
     pub async fn with_store(store: Arc<dyn SessionStore>) -> SessionStoreResult<Self> {
         store.initialize_schema().await?;
+        let bound_store: Arc<dyn ThreadSnapshotStore> = Arc::new(BoundThreadStore {
+            store: Arc::clone(&store),
+        });
         Ok(Self {
             inner: Arc::new(SessionManagerInner {
                 sessions: Mutex::new(HashMap::new()),
                 store,
+                bound_store,
+                thread_runtime: RwLock::new(None),
             }),
         })
     }
 
-    /// Resolve the external thread id on one incoming message and create the session/thread on
-    /// first sight.
+    /// Install the thread runtime used to initialize freshly resolved thread handles.
+    pub fn install_thread_runtime(&self, thread_runtime: Arc<ThreadRuntime>) {
+        let mut runtime = self
+            .inner
+            .thread_runtime
+            .write()
+            .expect("thread runtime lock should not be poisoned");
+        *runtime = Some(thread_runtime);
+    }
+
+    /// Resolve the external thread id on one incoming message and create the thread on first
+    /// sight.
     ///
     /// # 示例
     /// ```rust
@@ -409,15 +353,9 @@ impl SessionManager {
         let session_key = SessionKey::from_incoming(incoming);
         let external_thread_id = incoming.resolved_external_thread_id();
         let thread_key = session_key.thread_key(&external_thread_id);
+        let session_id = session_key.derive_session_id();
         let thread_id = session_key.derive_thread_id(&external_thread_id);
-        let now = incoming.received_at;
-        let session_record = self
-            .inner
-            .store
-            .resolve_or_create_session(&session_key, now)
-            .await?;
-        let locator =
-            ThreadLocator::new(session_record.id, incoming, external_thread_id, thread_id);
+        let locator = ThreadLocator::new(session_id, incoming, external_thread_id, thread_id);
 
         info!(
             session_id = %locator.session_id,
@@ -430,13 +368,19 @@ impl SessionManager {
         );
 
         let _ = self
-            .ensure_thread_handle(&locator, Some(session_record.clone()), now)
+            .ensure_thread_handle(&locator, incoming.received_at)
             .await?;
         let mut sessions = self.inner.sessions.lock().await;
         let session = sessions
             .entry(session_key.clone())
-            .or_insert_with(|| CachedSession::from_record(session_record.clone()));
-        session.updated_at = now;
+            .or_insert_with(|| CachedSession {
+                id: session_id,
+                key: session_key,
+                threads: HashMap::new(),
+                created_at: incoming.received_at,
+                updated_at: incoming.received_at,
+            });
+        session.updated_at = incoming.received_at;
 
         Ok(locator)
     }
@@ -446,286 +390,20 @@ impl SessionManager {
         &self,
         locator: &ThreadLocator,
     ) -> SessionStoreResult<Option<Thread>> {
-        if let Some(handle) = self.cached_thread_handle(locator).await {
-            return Ok(Some(handle.lock().await.clone()));
-        }
-
-        let Some((session_record, stored_thread)) =
-            self.fetch_thread_context_from_store(locator).await?
-        else {
-            return Ok(None);
-        };
-        let cached = self
-            .cache_thread_handle_if_absent(
-                &locator.session_key(),
-                session_record,
-                locator.thread_id,
-                Arc::new(Mutex::new(stored_thread)),
-                Utc::now(),
-            )
-            .await;
-        Ok(Some(cached.lock().await.clone()))
+        let handle = self.ensure_thread_handle(locator, Utc::now()).await?;
+        Ok(Some(handle.lock().await.clone()))
     }
 
     /// Lock one live thread context for in-process mutation.
     ///
     /// Cache miss 会先从 store 恢复；store miss 会创建一个新的空线程上下文。
-    /// 调用方拿到 guard 后可以直接修改线程；如果需要持久化，应在释放 guard 后调用
-    /// `persist_thread_context(...)`，或者直接使用 `mutate_thread_context(...)`。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use chrono::Utc;
-    /// use openjarvis::{
-    ///     model::{IncomingMessage, ReplyTarget},
-    ///     session::SessionManager,
-    /// };
-    /// use serde_json::json;
-    /// use uuid::Uuid;
-    ///
-    /// # async fn demo() -> openjarvis::session::SessionStoreResult<()> {
-    /// let manager = SessionManager::new();
-    /// let incoming = IncomingMessage {
-    ///     id: Uuid::new_v4(),
-    ///     external_message_id: Some("msg_1".to_string()),
-    ///     channel: "feishu".to_string(),
-    ///     user_id: "ou_xxx".to_string(),
-    ///     user_name: None,
-    ///     content: "hello".to_string(),
-    ///     external_thread_id: None,
-    ///     received_at: Utc::now(),
-    ///     metadata: json!({}),
-    ///     attachments: Vec::new(),
-    ///     reply_target: ReplyTarget {
-    ///         receive_id: "oc_xxx".to_string(),
-    ///         receive_id_type: "chat_id".to_string(),
-    ///     },
-    /// };
-    ///
-    /// let locator = manager.load_or_create_thread(&incoming).await?;
-    /// let mut thread_context = manager.lock_thread_context(&locator, incoming.received_at).await?;
-    /// thread_context.enable_auto_compact();
-    ///
-    /// assert!(thread_context.auto_compact_enabled(false));
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn lock_thread_context(
         &self,
         locator: &ThreadLocator,
         now: DateTime<Utc>,
     ) -> SessionStoreResult<OwnedMutexGuard<Thread>> {
-        let handle = self.ensure_thread_handle(locator, None, now).await?;
+        let handle = self.ensure_thread_handle(locator, now).await?;
         Ok(handle.lock_owned().await)
-    }
-
-    /// Persist the current cached thread context without appending a new turn.
-    ///
-    /// 这个入口适合配合 `lock_thread_context(...)` 使用: 调用方先拿到 guard 修改内存态，
-    /// 释放 guard 后再调用这里把当前缓存里的最新线程快照写回 store。
-    pub async fn persist_thread_context(
-        &self,
-        locator: &ThreadLocator,
-        updated_at: DateTime<Utc>,
-    ) -> SessionStoreResult<()> {
-        let handle = self.ensure_thread_handle(locator, None, updated_at).await?;
-        let snapshot = handle.lock().await.clone();
-        let persisted = self
-            .persist_thread_context_snapshot(locator, snapshot, updated_at)
-            .await?;
-        self.sync_thread_context_to_cache(&locator.session_key(), locator, &persisted, updated_at)
-            .await;
-        Ok(())
-    }
-
-    /// Mutate and persist one thread context in a single manager-owned critical section.
-    ///
-    /// 这个入口是对外推荐的修改方式: 它持有目标 thread 的锁，执行调用方的变更逻辑，
-    /// 然后把同一份线程快照写回 store 并更新 revision，避免“改完忘记持久化”。
-    pub async fn mutate_thread_context<R, F>(
-        &self,
-        locator: &ThreadLocator,
-        updated_at: DateTime<Utc>,
-        mutate: F,
-    ) -> SessionStoreResult<R>
-    where
-        F: FnOnce(&mut Thread) -> SessionStoreResult<R>,
-    {
-        let mut thread_context = self.lock_thread_context(locator, updated_at).await?;
-        let result = mutate(&mut thread_context)?;
-        let persisted = self
-            .persist_thread_context_snapshot(locator, thread_context.clone(), updated_at)
-            .await?;
-        *thread_context = persisted;
-        info!(
-            thread_id = %locator.thread_id,
-            updated_at = %updated_at,
-            "mutated and persisted thread context through session manager"
-        );
-        Ok(result)
-    }
-
-    /// Persist one already locked live thread context and refresh the guard revision in place.
-    pub async fn persist_locked_thread_context(
-        &self,
-        locator: &ThreadLocator,
-        thread_context: &mut Thread,
-        updated_at: DateTime<Utc>,
-    ) -> SessionStoreResult<()> {
-        let persisted = self
-            .persist_thread_context_snapshot(locator, thread_context.clone(), updated_at)
-            .await?;
-        *thread_context = persisted;
-        self.touch_cached_session(&locator.session_key(), locator, updated_at)
-            .await;
-        Ok(())
-    }
-
-    /// Return whether one external message was already fully processed for the target thread.
-    pub async fn is_external_message_processed(
-        &self,
-        locator: &ThreadLocator,
-        external_message_id: &str,
-    ) -> SessionStoreResult<bool> {
-        Ok(self
-            .inner
-            .store
-            .load_external_message_record(locator, external_message_id)
-            .await?
-            .is_some())
-    }
-
-    /// Persist one completed external-message deduplication record without appending a new turn.
-    pub async fn mark_external_message_processed(
-        &self,
-        locator: &ThreadLocator,
-        external_message_id: &str,
-        completed_at: DateTime<Utc>,
-    ) -> SessionStoreResult<()> {
-        let record = ExternalMessageDedupRecord {
-            thread_id: locator.thread_id,
-            external_message_id: external_message_id.to_string(),
-            completed_at,
-        };
-        self.inner
-            .store
-            .save_external_message_record(locator, &record)
-            .await
-    }
-
-    /// Persist one finalized thread-owned turn snapshot and bind dedup to the same store write.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo(
-    /// #     manager: openjarvis::session::SessionManager,
-    /// #     locator: openjarvis::session::ThreadLocator,
-    /// #     finalized_turn: openjarvis::thread::ThreadFinalizedTurn,
-    /// # ) -> openjarvis::session::SessionStoreResult<()> {
-    /// manager.commit_finalized_turn(&locator, &finalized_turn).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn commit_finalized_turn(
-        &self,
-        locator: &ThreadLocator,
-        finalized_turn: &ThreadFinalizedTurn,
-    ) -> SessionStoreResult<()> {
-        let session_key = locator.session_key();
-        let dedup_record = finalized_turn
-            .external_message_id
-            .as_ref()
-            .map(|external_message_id| ExternalMessageDedupRecord {
-                thread_id: locator.thread_id,
-                external_message_id: external_message_id.clone(),
-                completed_at: finalized_turn.completed_at,
-            });
-        let persisted = self
-            .save_thread_snapshot(
-                locator,
-                finalized_turn.snapshot.clone(),
-                finalized_turn.completed_at,
-                dedup_record.as_ref(),
-            )
-            .await?;
-        self.sync_thread_context_to_cache(
-            &session_key,
-            locator,
-            &persisted,
-            finalized_turn.completed_at,
-        )
-        .await;
-        info!(
-            thread_id = %locator.thread_id,
-            has_dedup_record = dedup_record.is_some(),
-            "committed finalized thread-owned turn"
-        );
-        Ok(())
-    }
-
-    /// Persist one finalized turn while the caller owns the live thread lock.
-    pub async fn commit_finalized_turn_locked(
-        &self,
-        locator: &ThreadLocator,
-        thread_context: &mut Thread,
-        finalized_turn: &ThreadFinalizedTurn,
-    ) -> SessionStoreResult<()> {
-        let dedup_record = finalized_turn
-            .external_message_id
-            .as_ref()
-            .map(|external_message_id| ExternalMessageDedupRecord {
-                thread_id: locator.thread_id,
-                external_message_id: external_message_id.clone(),
-                completed_at: finalized_turn.completed_at,
-            });
-        let persisted = self
-            .save_thread_snapshot(
-                locator,
-                finalized_turn.snapshot.clone(),
-                finalized_turn.completed_at,
-                dedup_record.as_ref(),
-            )
-            .await?;
-        *thread_context = persisted;
-        self.touch_cached_session(&locator.session_key(), locator, finalized_turn.completed_at)
-            .await;
-        info!(
-            thread_id = %locator.thread_id,
-            has_dedup_record = dedup_record.is_some(),
-            "committed finalized thread-owned turn from locked thread context"
-        );
-        Ok(())
-    }
-
-    /// Persist one updated thread context without appending a new turn.
-    pub async fn store_thread_context(
-        &self,
-        locator: &ThreadLocator,
-        thread_context: Thread,
-        updated_at: DateTime<Utc>,
-    ) -> SessionStoreResult<()> {
-        let session_key = locator.session_key();
-        let persisted = self
-            .persist_thread_context_snapshot(locator, thread_context, updated_at)
-            .await?;
-        self.sync_thread_context_to_cache(&session_key, locator, &persisted, updated_at)
-            .await;
-        Ok(())
-    }
-
-    /// Persist one updated thread snapshot and return the refreshed revision-bearing snapshot.
-    pub async fn persist_thread_snapshot(
-        &self,
-        locator: &ThreadLocator,
-        thread_context: Thread,
-        updated_at: DateTime<Utc>,
-    ) -> SessionStoreResult<Thread> {
-        let persisted = self
-            .persist_thread_context_snapshot(locator, thread_context, updated_at)
-            .await?;
-        self.sync_thread_context_to_cache(&locator.session_key(), locator, &persisted, updated_at)
-            .await;
-        Ok(persisted)
     }
 
     /// Return a cloned session snapshot for debugging or tests.
@@ -758,36 +436,26 @@ impl SessionManager {
     async fn ensure_thread_handle(
         &self,
         locator: &ThreadLocator,
-        session_record: Option<StoredSessionRecord>,
         now: DateTime<Utc>,
     ) -> SessionStoreResult<SharedThreadContext> {
         if let Some(handle) = self.cached_thread_handle(locator).await {
+            self.initialize_thread_handle_if_needed(&handle).await?;
             return Ok(handle);
         }
 
-        let session_key = locator.session_key();
-        let session_record = match session_record {
-            Some(record) => record,
-            None => {
-                self.inner
-                    .store
-                    .resolve_or_create_session(&session_key, now)
-                    .await?
-            }
+        let restored = self.inner.store.load_thread_context(locator).await?;
+        let restored_from_store = restored.is_some();
+        let mut thread_context = if let Some(record) = restored {
+            Thread::from_persisted(record.locator, record.snapshot, record.revision)
+        } else {
+            Thread::new(ThreadContextLocator::from(locator), now)
         };
-        let persisted_thread = self.fetch_thread_context_from_store_only(locator).await?;
-        let restored_from_store = persisted_thread.is_some();
-        let thread_context = persisted_thread
-            .unwrap_or_else(|| Thread::new(ThreadContextLocator::from(locator), now));
+        thread_context.rebind_locator(ThreadContextLocator::from(locator));
+        thread_context.bind_store(Arc::clone(&self.inner.bound_store));
         let handle = self
-            .cache_thread_handle_if_absent(
-                &session_key,
-                session_record,
-                locator.thread_id,
-                Arc::new(Mutex::new(thread_context)),
-                now,
-            )
+            .cache_thread_handle_if_absent(locator, Arc::new(Mutex::new(thread_context)), now)
             .await;
+        self.initialize_thread_handle_if_needed(&handle).await?;
         info!(
             session_id = %locator.session_id,
             thread_id = %locator.thread_id,
@@ -799,147 +467,50 @@ impl SessionManager {
 
     async fn cache_thread_handle_if_absent(
         &self,
-        session_key: &SessionKey,
-        session_record: StoredSessionRecord,
-        thread_id: Uuid,
+        locator: &ThreadLocator,
         thread_context: SharedThreadContext,
         updated_at: DateTime<Utc>,
     ) -> SharedThreadContext {
+        let session_key = locator.session_key();
         let mut sessions = self.inner.sessions.lock().await;
         let session = sessions
             .entry(session_key.clone())
-            .or_insert_with(|| CachedSession::from_record(session_record));
+            .or_insert_with(|| CachedSession {
+                id: locator.session_id,
+                key: session_key,
+                threads: HashMap::new(),
+                created_at: updated_at,
+                updated_at,
+            });
         session.updated_at = updated_at;
         Arc::clone(
             session
                 .threads
-                .entry(thread_id)
+                .entry(locator.thread_id)
                 .or_insert_with(|| thread_context),
         )
     }
 
-    async fn sync_thread_context_to_cache(
+    async fn initialize_thread_handle_if_needed(
         &self,
-        session_key: &SessionKey,
-        locator: &ThreadLocator,
-        thread_context: &Thread,
-        updated_at: DateTime<Utc>,
-    ) {
-        let existing_handle = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let session = sessions
-                .entry(session_key.clone())
-                .or_insert_with(|| CachedSession {
-                    id: locator.session_id,
-                    key: session_key.clone(),
-                    threads: HashMap::new(),
-                    created_at: updated_at,
-                    updated_at,
-                });
-            session.updated_at = updated_at;
-            session.threads.get(&locator.thread_id).cloned()
+        handle: &SharedThreadContext,
+    ) -> SessionStoreResult<()> {
+        let thread_runtime = self
+            .inner
+            .thread_runtime
+            .read()
+            .expect("thread runtime lock should not be poisoned")
+            .clone();
+        let Some(thread_runtime) = thread_runtime else {
+            return Ok(());
         };
 
-        if let Some(handle) = existing_handle {
-            let mut cached_thread = handle.lock().await;
-            *cached_thread = thread_context.clone();
-            return;
+        let mut thread_context = handle.lock().await;
+        if !thread_context.is_initialized() {
+            thread_runtime
+                .initialize_thread(&mut thread_context)
+                .await?;
         }
-
-        let mut sessions = self.inner.sessions.lock().await;
-        let session = sessions
-            .entry(session_key.clone())
-            .or_insert_with(|| CachedSession {
-                id: locator.session_id,
-                key: session_key.clone(),
-                threads: HashMap::new(),
-                created_at: updated_at,
-                updated_at,
-            });
-        session.updated_at = updated_at;
-        session
-            .threads
-            .entry(locator.thread_id)
-            .or_insert_with(|| Arc::new(Mutex::new(thread_context.clone())));
-    }
-
-    async fn fetch_thread_context_from_store(
-        &self,
-        locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<(StoredSessionRecord, Thread)>> {
-        let session_key = locator.session_key();
-        let Some(session_record) = self.inner.store.load_session(&session_key).await? else {
-            return Ok(None);
-        };
-        let Some(thread_context) = self.fetch_thread_context_from_store_only(locator).await? else {
-            return Ok(None);
-        };
-        Ok(Some((session_record, thread_context)))
-    }
-
-    async fn fetch_thread_context_from_store_only(
-        &self,
-        locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<Thread>> {
-        let Some(mut thread_context) = self.inner.store.load_thread_context(locator).await? else {
-            return Ok(None);
-        };
-        thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        Ok(Some(thread_context))
-    }
-
-    async fn persist_thread_context_snapshot(
-        &self,
-        locator: &ThreadLocator,
-        thread_context: Thread,
-        updated_at: DateTime<Utc>,
-    ) -> SessionStoreResult<Thread> {
-        self.save_thread_snapshot(locator, thread_context, updated_at, None)
-            .await
-    }
-
-    async fn save_thread_snapshot(
-        &self,
-        locator: &ThreadLocator,
-        mut thread_context: Thread,
-        updated_at: DateTime<Utc>,
-        dedup_record: Option<&ExternalMessageDedupRecord>,
-    ) -> SessionStoreResult<Thread> {
-        let session_key = locator.session_key();
-        let _ = self
-            .inner
-            .store
-            .resolve_or_create_session(&session_key, updated_at)
-            .await?;
-        let live_thread = thread_context.clone();
-        thread_context.rebind_locator(ThreadContextLocator::from(locator));
-        thread_context = thread_context.clone_for_persistence();
-        let new_revision = self
-            .inner
-            .store
-            .save_thread_context(&thread_context, updated_at, dedup_record)
-            .await?;
-        thread_context.set_revision(new_revision);
-        thread_context.restore_live_runtime_from(&live_thread);
-        Ok(thread_context)
-    }
-
-    async fn touch_cached_session(
-        &self,
-        session_key: &SessionKey,
-        locator: &ThreadLocator,
-        updated_at: DateTime<Utc>,
-    ) {
-        let mut sessions = self.inner.sessions.lock().await;
-        let session = sessions
-            .entry(session_key.clone())
-            .or_insert_with(|| CachedSession {
-                id: locator.session_id,
-                key: session_key.clone(),
-                threads: HashMap::new(),
-                created_at: updated_at,
-                updated_at,
-            });
-        session.updated_at = updated_at;
+        Ok(())
     }
 }
