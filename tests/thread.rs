@@ -3,7 +3,7 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     session::{MemorySessionStore, SessionStore, ThreadLocator},
     thread::{
-        Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
+        Feature, Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
     },
 };
@@ -173,7 +173,7 @@ async fn feature_override_persists_without_request_finalization() {
     let mut thread = Thread::new(ThreadContextLocator::from(&locator), incoming.received_at);
     thread.bind_store(store.clone());
     thread
-        .persist_auto_compact_override(Some(true))
+        .persist_feature_enabled(Feature::AutoCompact, true)
         .await
         .expect("feature override should persist");
 
@@ -182,11 +182,38 @@ async fn feature_override_persists_without_request_finalization() {
         .await
         .expect("stored thread should load")
         .expect("stored thread should exist");
-    assert_eq!(
-        stored.snapshot.state.features.auto_compact_override,
-        Some(true)
+    assert!(
+        stored
+            .snapshot
+            .state
+            .features
+            .enabled_features
+            .contains(Feature::AutoCompact)
     );
     assert!(thread.auto_compact_enabled(false));
+}
+
+#[tokio::test]
+async fn compact_source_messages_exclude_stable_system_prefix() {
+    // 测试场景: runtime compact 只能消费非 system 正式消息，稳定前缀不能进入 compact source。
+    let now = Utc::now();
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(None, "feishu", "ou_thread", "thread_compact", "thread_compact"),
+        now,
+    );
+    thread
+        .push_message(ChatMessage::new(ChatMessageRole::System, "system prompt", now))
+        .await
+        .expect("system prompt should persist");
+    thread
+        .push_message(ChatMessage::new(ChatMessageRole::User, "hello", now))
+        .await
+        .expect("user message should persist");
+
+    let compact_source = thread.compact_source_messages();
+    assert_eq!(compact_source.len(), 1);
+    assert_eq!(compact_source[0].role, ChatMessageRole::User);
+    assert_eq!(compact_source[0].content, "hello");
 }
 
 #[test]

@@ -1,15 +1,18 @@
 //! Thread-first aggregate model and atomic thread-owned persistence helpers.
 
 use crate::agent::{
-    FeaturePromptRebuilder, MemoryRepository, ToolCallRequest, ToolCallResult, ToolDefinition,
-    ToolRegistry,
+    FeatureResolver, MemoryRepository, ShellEnv, ToolCallRequest,
+    ToolCallResult, ToolDefinition, ToolRegistry,
+    feature,
 };
+use crate::config::{AgentCompactConfig, try_global_config};
 use crate::context::{ChatMessage, ChatMessageRole};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use uuid::Uuid;
 
 const OPENJARVIS_THREAD_ID_NAMESPACE: Uuid =
     Uuid::from_u128(0x7f4b2e8d_5d33_4f51_9c27_9c5d7d76c1a1);
+const TOOL_USE_MODE_PROMPT: &str = "You are running in OpenJarvis tool-use mode. Use the provided tools when needed. You may also provide a short user-visible reply before calling a tool.";
 
 /// Derive the stable internal thread id from one normalized thread key.
 ///
@@ -53,6 +57,144 @@ where
     names.sort();
     names.dedup();
     names
+}
+
+fn build_default_feature_resolver(compact_config: &AgentCompactConfig) -> FeatureResolver {
+    let mut available_features = Features::from_iter([Feature::Memory, Feature::Skill]);
+    if feature::init::auto_compact::is_available(compact_config) {
+        available_features.insert(Feature::AutoCompact);
+    }
+
+    if let Some(config) = try_global_config() {
+        info!("building thread feature resolver from installed global config");
+        FeatureResolver::from_app_config(config, available_features)
+    } else {
+        info!(
+            enabled_features = ?available_features.names(),
+            "building thread feature resolver without installed global config"
+        );
+        FeatureResolver::development_default(available_features)
+    }
+}
+
+/// One thread feature that can inject stable prompts or runtime capability during initialization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Feature {
+    Memory,
+    Skill,
+    AutoCompact,
+}
+
+impl Feature {
+    /// Return the stable feature label used by logs and config parsing.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::thread::Feature;
+    ///
+    /// assert_eq!(Feature::Memory.as_str(), "memory");
+    /// ```
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Skill => "skill",
+            Self::AutoCompact => "auto_compact",
+        }
+    }
+
+}
+
+/// Stable ordered thread feature set persisted as thread state truth.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Features {
+    enabled: BTreeSet<Feature>,
+}
+
+impl Features {
+    /// Return all currently defined thread features in stable order.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::thread::{Feature, Features};
+    ///
+    /// let features = Features::all();
+    /// assert!(features.contains(Feature::Memory));
+    /// assert!(features.contains(Feature::Skill));
+    /// assert!(features.contains(Feature::AutoCompact));
+    /// ```
+    pub fn all() -> Self {
+        Self::from_iter([
+            Feature::Memory,
+            Feature::Skill,
+            Feature::AutoCompact,
+        ])
+    }
+
+    /// Return whether the target feature is enabled in this set.
+    pub fn contains(&self, feature: Feature) -> bool {
+        self.enabled.contains(&feature)
+    }
+
+    /// Insert one feature into the set.
+    pub fn insert(&mut self, feature: Feature) -> bool {
+        self.enabled.insert(feature)
+    }
+
+    /// Remove one feature from the set.
+    pub fn remove(&mut self, feature: Feature) -> bool {
+        self.enabled.remove(&feature)
+    }
+
+    /// Return whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_empty()
+    }
+
+    /// Return the stable ordered feature names for logs and assertions.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.enabled.iter().copied().map(Feature::as_str).collect()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Feature> + '_ {
+        self.enabled.iter().copied()
+    }
+
+    pub(crate) fn intersect(&self, allowed: &Features) -> Features {
+        Self::from_iter(
+            self.enabled
+                .iter()
+                .filter(|feature| allowed.contains(**feature))
+                .copied(),
+        )
+    }
+}
+
+impl FromIterator<Feature> for Features {
+    fn from_iter<T: IntoIterator<Item = Feature>>(iter: T) -> Self {
+        Self {
+            enabled: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl IntoIterator for Features {
+    type Item = Feature;
+    type IntoIter = std::collections::btree_set::IntoIter<Feature>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.enabled.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Features {
+    type Item = Feature;
+    type IntoIter = std::iter::Copied<std::collections::btree_set::Iter<'a, Feature>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.enabled.iter().copied()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,11 +327,11 @@ pub struct ThreadLifecycleState {
     pub initialized: bool,
 }
 
-/// Thread feature flags and runtime feature overrides.
+/// Thread feature flags persisted as thread-owned runtime truth.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadFeatureState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_compact_override: Option<bool>,
+    #[serde(default)]
+    pub enabled_features: Features,
 }
 
 /// Thread-scoped tool runtime state owned by `Thread`.
@@ -318,8 +460,9 @@ pub trait ThreadSnapshotStore: Send + Sync + fmt::Debug {
 pub struct ThreadRuntime {
     tool_registry: Arc<ToolRegistry>,
     memory_repository: Arc<MemoryRepository>,
-    feature_prompt_rebuilder: Arc<FeaturePromptRebuilder>,
-    default_auto_compact_enabled: bool,
+    system_prompt: String,
+    compact_config: AgentCompactConfig,
+    feature_resolver: FeatureResolver,
 }
 
 impl ThreadRuntime {
@@ -328,38 +471,47 @@ impl ThreadRuntime {
     /// # 示例
     /// ```rust,no_run
     /// use openjarvis::{
-    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     agent::{MemoryRepository, ToolRegistry},
+    ///     config::AgentCompactConfig,
     ///     thread::ThreadRuntime,
     /// };
     /// use std::sync::Arc;
     ///
     /// let tool_registry = Arc::new(ToolRegistry::new());
     /// let memory_repository = Arc::new(MemoryRepository::new("."));
-    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
-    ///     Arc::clone(&tool_registry),
-    ///     Default::default(),
-    ///     "",
-    /// ));
-    ///
-    /// let runtime = ThreadRuntime::new(
-    ///     tool_registry,
-    ///     memory_repository,
-    ///     feature_prompt_rebuilder,
-    ///     false,
-    /// );
-    /// assert!(!runtime.default_auto_compact_enabled());
+    /// let _runtime =
+    ///     ThreadRuntime::new(tool_registry, memory_repository, "", AgentCompactConfig::default());
     /// ```
     pub fn new(
         tool_registry: Arc<ToolRegistry>,
         memory_repository: Arc<MemoryRepository>,
-        feature_prompt_rebuilder: Arc<FeaturePromptRebuilder>,
-        default_auto_compact_enabled: bool,
+        system_prompt: impl Into<String>,
+        compact_config: AgentCompactConfig,
+    ) -> Self {
+        let feature_resolver = build_default_feature_resolver(&compact_config);
+        Self::with_feature_resolver(
+            tool_registry,
+            memory_repository,
+            system_prompt,
+            compact_config,
+            feature_resolver,
+        )
+    }
+
+    /// Build one thread runtime with one explicit feature resolver.
+    pub fn with_feature_resolver(
+        tool_registry: Arc<ToolRegistry>,
+        memory_repository: Arc<MemoryRepository>,
+        system_prompt: impl Into<String>,
+        compact_config: AgentCompactConfig,
+        feature_resolver: FeatureResolver,
     ) -> Self {
         Self {
             tool_registry,
             memory_repository,
-            feature_prompt_rebuilder,
-            default_auto_compact_enabled,
+            system_prompt: system_prompt.into(),
+            compact_config,
+            feature_resolver,
         }
     }
 
@@ -373,14 +525,75 @@ impl ThreadRuntime {
         Arc::clone(&self.memory_repository)
     }
 
-    /// Return whether auto-compact should be enabled by default for initialized threads.
-    pub fn default_auto_compact_enabled(&self) -> bool {
-        self.default_auto_compact_enabled
-    }
-
     /// Ensure built-in tools are ready before the thread is served.
     pub async fn ensure_tool_registry_ready(&self) -> Result<()> {
         self.tool_registry.register_builtin_tools().await
+    }
+
+    fn resolve_enabled_features(&self, thread_context: &Thread) -> Features {
+        let persisted_features = thread_context.enabled_features();
+        if !persisted_features.is_empty() {
+            info!(
+                thread_id = %thread_context.locator.thread_id,
+                enabled_features = ?persisted_features.names(),
+                "using persisted thread feature snapshot"
+            );
+            return persisted_features;
+        }
+
+        let resolved = self.feature_resolver.resolve_for_locator(&thread_context.locator);
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            enabled_features = ?resolved.names(),
+            "resolved thread feature snapshot for initialization"
+        );
+        resolved
+    }
+
+    fn preloaded_toolsets(&self, features: &Features) -> Vec<String> {
+        let mut toolsets = Vec::new();
+        for feature in features.iter() {
+            match feature {
+                Feature::Memory => toolsets.extend(feature::init::memory::toolsets()),
+                Feature::Skill | Feature::AutoCompact => {}
+            }
+        }
+        toolsets.sort();
+        toolsets.dedup();
+        toolsets
+    }
+
+    async fn build_predefined_role_messages(
+        &self,
+        preloaded_toolsets: &[String],
+        initialized_at: DateTime<Utc>,
+    ) -> Result<Vec<ChatMessage>> {
+        let mut messages = Vec::new();
+        let system_prompt = self.system_prompt.trim();
+        if !system_prompt.is_empty() {
+            messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                system_prompt,
+                initialized_at,
+            ));
+        }
+        messages.push(ChatMessage::new(
+            ChatMessageRole::System,
+            TOOL_USE_MODE_PROMPT,
+            initialized_at,
+        ));
+        if let Some(catalog_prompt) = self
+            .tool_registry
+            .render_toolset_catalog_prompt(preloaded_toolsets)
+            .await
+        {
+            messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                catalog_prompt,
+                initialized_at,
+            ));
+        }
+        Ok(messages)
     }
 
     /// Persist one initialized thread prefix before the thread enters normal request handling.
@@ -390,23 +603,19 @@ impl ThreadRuntime {
     /// # async fn demo() -> anyhow::Result<()> {
     /// use chrono::Utc;
     /// use openjarvis::{
-    ///     agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    ///     agent::{MemoryRepository, ToolRegistry},
+    ///     config::AgentCompactConfig,
     ///     thread::{Thread, ThreadContextLocator, ThreadRuntime},
     /// };
     /// use std::sync::Arc;
     ///
     /// let tool_registry = Arc::new(ToolRegistry::new());
     /// let memory_repository = Arc::new(MemoryRepository::new("."));
-    /// let feature_prompt_rebuilder = Arc::new(FeaturePromptRebuilder::new(
-    ///     Arc::clone(&tool_registry),
-    ///     Default::default(),
-    ///     "system",
-    /// ));
     /// let runtime = ThreadRuntime::new(
     ///     tool_registry,
     ///     memory_repository,
-    ///     feature_prompt_rebuilder,
-    ///     false,
+    ///     "system",
+    ///     AgentCompactConfig::default(),
     /// );
     /// let mut thread = Thread::new(
     ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
@@ -421,7 +630,20 @@ impl ThreadRuntime {
     pub async fn initialize_thread(&self, thread_context: &mut Thread) -> Result<bool> {
         self.ensure_tool_registry_ready().await?;
 
+        let resolved_features = self.resolve_enabled_features(thread_context);
+        let preloaded_toolsets = self.preloaded_toolsets(&resolved_features);
+
         if thread_context.is_initialized() {
+            let backfilled = thread_context
+                .reconcile_initialized_feature_state(resolved_features, preloaded_toolsets)
+                .await?;
+            if backfilled {
+                info!(
+                    thread_id = %thread_context.locator.thread_id,
+                    enabled_features = ?thread_context.enabled_features().names(),
+                    "backfilled persisted thread feature state for initialized thread"
+                );
+            }
             return Ok(false);
         }
 
@@ -432,7 +654,13 @@ impl ThreadRuntime {
             .find(|message| message.role == ChatMessageRole::System)
             .map(|message| message.created_at);
         if let Some(initialized_at) = existing_system_prefix_at {
-            thread_context.mark_initialized(initialized_at).await?;
+            thread_context
+                .mark_initialized_with_state(
+                    initialized_at,
+                    resolved_features,
+                    preloaded_toolsets,
+                )
+                .await?;
             info!(
                 thread_id = %thread_context.locator.thread_id,
                 external_thread_id = %thread_context.locator.external_thread_id,
@@ -442,18 +670,74 @@ impl ThreadRuntime {
             return Ok(true);
         }
 
-        let auto_compact_enabled =
-            thread_context.auto_compact_enabled(self.default_auto_compact_enabled);
-        let initialized_messages = self
-            .feature_prompt_rebuilder
-            .build_messages(thread_context, auto_compact_enabled)
+        let initialized_at = Utc::now();
+        let mut initialized_messages = self
+            .build_predefined_role_messages(&preloaded_toolsets, initialized_at)
             .await?;
-        let initialized_at = initialized_messages
-            .first()
-            .map(|message| message.created_at)
-            .unwrap_or_else(Utc::now);
+        initialized_messages.push(ChatMessage::new(
+            ChatMessageRole::System,
+            ShellEnv::detect().render_prompt(),
+            initialized_at,
+        ));
+
+        thread_context.replace_enabled_features(Features::default());
+        for feature in &resolved_features {
+            thread_context.enable_feature(feature);
+        }
+
+        if thread_context.is_enabled(Feature::Memory)
+            && let Some(prompt) =
+                feature::init::memory::usage(
+                    &thread_context.locator.thread_id,
+                    &self.memory_repository,
+                )?
+        {
+            initialized_messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                prompt,
+                initialized_at,
+            ));
+        }
+
+        if thread_context.is_enabled(Feature::Skill)
+            && let Some(prompt) =
+                feature::init::skill::usage(&thread_context.locator.thread_id, &self.tool_registry)
+                    .await
+        {
+            initialized_messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                prompt,
+                initialized_at,
+            ));
+        }
+
+        if thread_context.is_enabled(Feature::AutoCompact)
+            && let Some(prompt) = feature::init::auto_compact::usage(&self.compact_config)
+        {
+            initialized_messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                prompt,
+                initialized_at,
+            ));
+        }
+        if thread_context.is_enabled(Feature::AutoCompact)
+            && let Some(prompt) =
+                feature::init::auto_compact::tool_visibility_prompt(&self.compact_config)
+        {
+            initialized_messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                prompt,
+                initialized_at,
+            ));
+        }
+
         thread_context
-            .initialize_with_messages(initialized_messages, initialized_at)
+            .initialize_with_messages(
+                initialized_messages,
+                initialized_at,
+                resolved_features,
+                preloaded_toolsets,
+            )
             .await?;
         info!(
             thread_id = %thread_context.locator.thread_id,
@@ -464,6 +748,7 @@ impl ThreadRuntime {
                 .iter()
                 .filter(|message| message.role == ChatMessageRole::System)
                 .count(),
+            enabled_features = ?thread_context.enabled_features().names(),
             "persisted thread initialization prefix"
         );
         Ok(true)
@@ -473,13 +758,11 @@ impl ThreadRuntime {
 impl fmt::Debug for ThreadRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ThreadRuntime")
-            .field(
-                "default_auto_compact_enabled",
-                &self.default_auto_compact_enabled,
-            )
             .field("tool_registry", &"Arc<ToolRegistry>")
             .field("memory_repository", &"Arc<MemoryRepository>")
-            .field("feature_prompt_rebuilder", &"Arc<FeaturePromptRebuilder>")
+            .field("system_prompt", &self.system_prompt)
+            .field("compact_config", &self.compact_config)
+            .field("feature_resolver", &self.feature_resolver)
             .finish()
     }
 }
@@ -578,12 +861,26 @@ impl Thread {
 
     /// Export the compact source message sequence used by runtime compaction.
     pub fn compact_source_messages(&self) -> Vec<ChatMessage> {
-        self.thread.messages()
+        self.thread
+            .messages()
+            .into_iter()
+            .filter(|message| message.role != ChatMessageRole::System)
+            .collect()
     }
 
     /// Return whether this thread already owns a persisted initialized prefix.
     pub fn is_initialized(&self) -> bool {
         self.state.lifecycle.initialized
+    }
+
+    /// Return the persisted enabled feature set for the current thread.
+    pub fn enabled_features(&self) -> Features {
+        self.state.features.enabled_features.clone()
+    }
+
+    /// Return whether the target feature is enabled for the current thread.
+    pub fn is_enabled(&self, feature: Feature) -> bool {
+        self.state.features.enabled_features.contains(feature)
     }
 
     /// Return the persisted loaded toolsets for the thread.
@@ -703,9 +1000,18 @@ impl Thread {
         Ok(result)
     }
 
-    pub(crate) async fn mark_initialized(&mut self, initialized_at: DateTime<Utc>) -> Result<()> {
-        self.apply_persisted_mutation("mark_initialized", |snapshot| {
+    pub(crate) async fn mark_initialized_with_state(
+        &mut self,
+        initialized_at: DateTime<Utc>,
+        enabled_features: Features,
+        preloaded_toolsets: Vec<String>,
+    ) -> Result<()> {
+        self.apply_persisted_mutation("mark_initialized_with_state", |snapshot| {
             snapshot.state.lifecycle.initialized = true;
+            snapshot.state.features.enabled_features = enabled_features.clone();
+            let mut merged_toolsets = snapshot.state.tools.loaded_toolsets.clone();
+            merged_toolsets.extend(preloaded_toolsets.clone());
+            snapshot.state.tools.loaded_toolsets = normalize_loaded_toolsets(merged_toolsets);
             if snapshot.thread.created_at > initialized_at {
                 snapshot.thread.created_at = initialized_at;
             }
@@ -721,6 +1027,8 @@ impl Thread {
         &mut self,
         initialized_messages: Vec<ChatMessage>,
         initialized_at: DateTime<Utc>,
+        enabled_features: Features,
+        preloaded_toolsets: Vec<String>,
     ) -> Result<()> {
         self.apply_persisted_mutation("initialize_thread", |snapshot| {
             if !initialized_messages.is_empty() {
@@ -729,7 +1037,38 @@ impl Thread {
                 snapshot.thread.updated_at = initialized_at;
             }
             snapshot.state.lifecycle.initialized = true;
+            snapshot.state.features.enabled_features = enabled_features.clone();
+            snapshot.state.tools.loaded_toolsets = normalize_loaded_toolsets(preloaded_toolsets);
             Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn reconcile_initialized_feature_state(
+        &mut self,
+        enabled_features: Features,
+        preloaded_toolsets: Vec<String>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        self.apply_persisted_mutation("reconcile_initialized_feature_state", |snapshot| {
+            let mut changed = false;
+            if snapshot.state.features.enabled_features != enabled_features {
+                snapshot.state.features.enabled_features = enabled_features.clone();
+                changed = true;
+            }
+
+            let mut merged_toolsets = snapshot.state.tools.loaded_toolsets.clone();
+            merged_toolsets.extend(preloaded_toolsets.clone());
+            let normalized_toolsets = normalize_loaded_toolsets(merged_toolsets);
+            if snapshot.state.tools.loaded_toolsets != normalized_toolsets {
+                snapshot.state.tools.loaded_toolsets = normalized_toolsets;
+                changed = true;
+            }
+
+            if changed {
+                snapshot.thread.updated_at = now;
+            }
+            Ok(changed)
         })
         .await
     }
@@ -898,27 +1237,17 @@ impl Thread {
         self.state.tools.loaded_toolsets = normalize_loaded_toolsets(loaded_toolsets);
     }
 
-    /// Persist one thread-scoped auto-compact override immediately.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::thread::{Thread, ThreadContextLocator};
-    ///
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    /// thread.persist_auto_compact_override(Some(true)).await?;
-    /// assert!(thread.auto_compact_enabled(false));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn persist_auto_compact_override(&mut self, enabled: Option<bool>) -> Result<()> {
+    /// Replace the enabled feature state with one explicit snapshot in memory only.
+    pub fn replace_enabled_features(&mut self, enabled_features: Features) {
+        self.state.features.enabled_features = enabled_features;
+    }
+
+    /// Persist one explicit feature snapshot immediately.
+    pub async fn persist_enabled_features(&mut self, enabled_features: Features) -> Result<()> {
         let updated_at = Utc::now();
-        self.apply_persisted_mutation("persist_auto_compact_override", |snapshot| {
-            snapshot.state.features.auto_compact_override = enabled;
+        let feature_names = enabled_features.names();
+        self.apply_persisted_mutation("persist_enabled_features", |snapshot| {
+            snapshot.state.features.enabled_features = enabled_features.clone();
             snapshot.thread.updated_at = updated_at;
             Ok(())
         })
@@ -926,10 +1255,41 @@ impl Thread {
         info!(
             thread_id = %self.locator.thread_id,
             external_thread_id = %self.locator.external_thread_id,
-            auto_compact_override = ?enabled,
-            "persisted thread auto-compact override"
+            enabled_features = ?feature_names,
+            "persisted thread enabled feature snapshot"
         );
         Ok(())
+    }
+
+    /// Persist one feature flag toggle immediately.
+    pub async fn persist_feature_enabled(
+        &mut self,
+        feature: Feature,
+        enabled: bool,
+    ) -> Result<bool> {
+        let updated_at = Utc::now();
+        let changed = self
+            .apply_persisted_mutation("persist_feature_enabled", |snapshot| {
+                let changed = if enabled {
+                    snapshot.state.features.enabled_features.insert(feature)
+                } else {
+                    snapshot.state.features.enabled_features.remove(feature)
+                };
+                if changed {
+                    snapshot.thread.updated_at = updated_at;
+                }
+                Ok(changed)
+            })
+            .await?;
+        info!(
+            thread_id = %self.locator.thread_id,
+            external_thread_id = %self.locator.external_thread_id,
+            feature = feature.as_str(),
+            enabled,
+            changed,
+            "persisted thread feature toggle"
+        );
+        Ok(changed)
     }
 
     /// Mark one toolset as loaded for the current thread and persist the change atomically.
@@ -1014,7 +1374,12 @@ impl Thread {
         tool_registry: &ToolRegistry,
         compact_visible: bool,
     ) -> Result<Vec<ToolDefinition>> {
-        let mut definitions = tool_registry.always_visible_definitions().await;
+        let mut definitions = tool_registry
+            .always_visible_definitions()
+            .await
+            .into_iter()
+            .filter(|definition| self.tool_allowed_by_feature_state(&definition.name))
+            .collect::<Vec<_>>();
         definitions.push(crate::agent::tool::load_toolset_definition());
         definitions.push(crate::agent::tool::unload_toolset_definition());
 
@@ -1156,6 +1521,13 @@ impl Thread {
             }
             _ => {
                 let context = crate::agent::ToolCallContext::for_thread(thread_id.clone());
+                if !self.tool_allowed_by_feature_state(&request.name) {
+                    bail!(
+                        "tool `{}` is not enabled for thread `{}`",
+                        request.name,
+                        thread_id
+                    );
+                }
                 if let Some(handler) = tool_registry.always_visible_handler(&request.name).await {
                     handler.call_with_context(context, request).await
                 } else {
@@ -1246,25 +1618,27 @@ impl Thread {
 
     /// Return the effective auto-compact state for this thread.
     pub fn auto_compact_enabled(&self, default_enabled: bool) -> bool {
-        self.state
-            .features
-            .auto_compact_override
-            .unwrap_or(default_enabled)
+        let _ = default_enabled;
+        self.is_enabled(Feature::AutoCompact)
     }
 
-    /// Update the auto-compact override for the current thread in memory only.
-    pub fn set_auto_compact_override(&mut self, enabled: Option<bool>) {
-        self.state.features.auto_compact_override = enabled;
+    /// Enable one thread feature in memory only.
+    pub fn enable_feature(&mut self, feature: Feature) {
+        self.state.features.enabled_features.insert(feature);
     }
 
-    /// Enable thread-scoped auto-compact for the current thread.
-    pub fn enable_auto_compact(&mut self) {
-        self.set_auto_compact_override(Some(true));
+    /// Disable one thread feature in memory only.
+    pub fn disable_feature(&mut self, feature: Feature) {
+        self.state.features.enabled_features.remove(feature);
     }
 
-    /// Disable thread-scoped auto-compact and fall back to the static auto-compact default.
-    pub fn disable_auto_compact(&mut self) {
-        self.set_auto_compact_override(Some(false));
+    fn tool_allowed_by_feature_state(&self, tool_name: &str) -> bool {
+        match tool_name {
+            _ if feature::init::skill::owns_always_visible_tool(tool_name) => {
+                self.is_enabled(Feature::Skill)
+            }
+            _ => true,
+        }
     }
 }
 

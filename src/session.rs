@@ -506,11 +506,7 @@ impl SessionManager {
         };
 
         let mut thread_context = handle.lock().await;
-        if !thread_context.is_initialized() {
-            thread_runtime
-                .initialize_thread(&mut thread_context)
-                .await?;
-        }
+        thread_runtime.initialize_thread(&mut thread_context).await?;
         Ok(())
     }
 }

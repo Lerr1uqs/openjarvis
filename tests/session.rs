@@ -1,6 +1,7 @@
 use chrono::Utc;
 use openjarvis::{
-    agent::{FeaturePromptRebuilder, MemoryRepository, ToolRegistry},
+    agent::{MemoryRepository, ToolRegistry},
+    config::AgentCompactConfig,
     model::{IncomingMessage, ReplyTarget},
     session::{MemorySessionStore, SessionManager, SessionStore},
     thread::ThreadRuntime,
@@ -31,16 +32,11 @@ fn build_incoming(content: &str) -> IncomingMessage {
 fn build_thread_runtime(system_prompt: &str) -> Arc<ThreadRuntime> {
     let tool_registry = Arc::new(ToolRegistry::new());
     let memory_repository = Arc::new(MemoryRepository::new("."));
-    let rebuilder = Arc::new(FeaturePromptRebuilder::new(
-        Arc::clone(&tool_registry),
-        Default::default(),
-        system_prompt,
-    ));
     Arc::new(ThreadRuntime::new(
         tool_registry,
         memory_repository,
-        rebuilder,
-        false,
+        system_prompt,
+        AgentCompactConfig::default(),
     ))
 }
 

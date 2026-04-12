@@ -5,8 +5,8 @@
 **Migration**: worker 改为把 live `Thread` handle 与当前 user input 交给 AgentLoop；正式消息与状态只通过 thread-owned mutator 写入并持久化。
 
 ### Requirement: 线程级 request context SHALL 与 conversation history 分层
-**Reason**: 原 requirement 仍以 `ConversationTurn` 作为 conversation history 的持久化载体，与本次“只保留 flat message 序列，不再持久化 turn 结构”的目标冲突。
-**Migration**: 将正式 conversation history 迁移为线程内的 flat persisted message sequence；request context 继续独立存放，但不再与任何 turn 结构组合持久化。
+**Reason**: 原 requirement 仍以 `ConversationTurn` 作为 conversation history 的持久化载体，与本次“只保留 flat message 序列，不再持久化 turn 结构”的目标冲突；同时“独立 request context”表述会误导为额外成员。
+**Migration**: 将正式 conversation history 迁移为线程内的 flat persisted message sequence；稳定前缀直接表现为消息序列开头的 `System` messages，不再引入独立 request context 成员。
 
 ## ADDED Requirements
 
@@ -19,11 +19,11 @@
 - **THEN** `Thread` 本体不会因为这些运行时能力而持有 attachment 字段
 
 ### Requirement: `SessionManager` 派生 Thread 时 SHALL 完成初始化消息持久化
-系统 SHALL 在 `SessionManager` 首次解析并派生某个 `Thread` handle 时，完成 feature/system 初始化消息的生成与持久化。`ThreadRuntime` SHALL 在 thread handle 返回给 worker 或 AgentLoop 之前，把这些初始化消息作为正式消息写入线程，并保证写入成功后线程才进入后续执行。
+系统 SHALL 在 `SessionManager` 首次解析并派生某个 `Thread` handle 时，完成 feature/system 初始化消息的生成与持久化。`ThreadRuntime` SHALL 在 thread handle 返回给 worker 或 AgentLoop 之前，把这些初始化消息作为正式消息写入线程开头前缀，并保证写入成功后线程才进入后续执行。
 
 #### Scenario: SessionManager 返回的 thread 已完成初始化
 - **WHEN** `SessionManager` 为新的用户输入首次解析并派生某个线程
-- **THEN** `ThreadRuntime` 会先基于 feature、tool registry 和稳定 request context 生成初始化消息
+- **THEN** `ThreadRuntime` 会先基于 feature、tool registry 和稳定 `System` 前缀规则生成初始化消息
 - **THEN** 这些初始化消息会在 thread handle 返回前写入线程正式消息序列并完成持久化
 - **THEN** 后续 worker 与 AgentLoop 不需要再补做初始化
 
@@ -45,12 +45,12 @@
 - **THEN** 系统不会检查或回填 `request_context_initialized_at`
 - **THEN** 系统不会调用 `ensure_initialized()` 之类接口为本轮请求补写初始化消息
 
-### Requirement: 线程正式快照 SHALL 以 request context 与 flat message history 分层表达
-系统 SHALL 继续让稳定 request context 与 conversation history 分层，但 conversation history SHALL 改为 flat persisted message sequence，而不是 `ConversationTurn` 或其他 turn 结构。线程恢复后，系统 SHALL 能分别恢复 request context、正式消息序列和线程状态。
+### Requirement: 线程正式快照 SHALL 以稳定 `System` 前缀与 flat message history 分层表达
+系统 SHALL 继续让稳定 `System` 前缀与 conversation history 分层，但 conversation history SHALL 改为 flat persisted message sequence，而不是 `ConversationTurn` 或其他 turn 结构。线程恢复后，系统 SHALL 能分别恢复稳定前缀、正式消息序列和线程状态。
 
-#### Scenario: 恢复结果只包含 request context 与正式消息序列
+#### Scenario: 恢复结果只包含稳定前缀与正式消息序列
 - **WHEN** 某个线程在重启后从持久化层恢复
-- **THEN** 系统可以分别读出稳定 request context、正式消息序列和线程状态
+- **THEN** 系统可以分别读出稳定 `System` 前缀、正式消息序列和线程状态
 - **THEN** 恢复结果中不会出现 conversation turn、finalized turn 或 turn working set
 
 ### Requirement: 当前请求执行期状态 SHALL 仅作为 live-only 内部状态存在

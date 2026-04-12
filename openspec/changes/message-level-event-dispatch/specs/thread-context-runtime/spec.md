@@ -19,15 +19,15 @@
 - **THEN** 外部模块可以先发送这条 tool call item
 - **THEN** 后续 tool result 会在写入 `Thread` 后作为另一条独立 item 单独发送
 
-### Requirement: 线程级 request context SHALL 与 conversation history 分层
-线程级 request context SHALL NOT 作为普通 `ConversationTurn` 消息落盘，也 SHALL NOT 被 `ThreadContext.load_messages()` 视为 chat history 的一部分。线程恢复后，系统 SHALL 可以分别恢复 request context snapshot、conversation history 以及当前 turn 的 in-progress working set / dispatch checkpoint，而不是把这些边界混成一条扁平消息序列。
+### Requirement: 稳定 `System` 前缀、conversation history 与当前 turn working set SHALL 明确分层
+稳定 `System` 前缀 SHALL NOT 作为普通 `ConversationTurn` 消息重复落盘，也 SHALL NOT 被视为普通 chat history 的一部分。线程恢复后，系统 SHALL 可以分别恢复稳定 `System` 前缀、conversation history 以及当前 turn 的 in-progress working set / dispatch checkpoint，而不是把这些边界混成一条扁平消息序列。
 
-#### Scenario: request context 不进入 turn 历史
+#### Scenario: 稳定前缀不进入 turn 历史
 - **WHEN** 某个线程完成一轮普通 user / assistant 对话并被持久化
 - **THEN** 落盘的 `ConversationTurn` 中只包含该轮 conversation messages
-- **THEN** 线程级 request context 不会作为重复前缀被写入每个 turn
+- **THEN** 稳定 `System` 前缀不会作为重复前缀被写入每个 turn
 
 #### Scenario: 恢复时可以区分最终历史与中间发送进度
 - **WHEN** 某个线程在 turn 未结束时已经发送过部分 message / event，随后发生恢复
-- **THEN** 系统可以分别读出稳定 request context、已持久化 conversation history 和当前 turn 的 dispatch checkpoint
+- **THEN** 系统可以分别读出稳定 `System` 前缀、已持久化 conversation history 和当前 turn 的 dispatch checkpoint
 - **THEN** 恢复链路不会把“已发送但未 finalized 的当前 turn 进度”误判为普通历史前缀

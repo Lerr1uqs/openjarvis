@@ -5,7 +5,6 @@ use super::{
         AgentCommittedMessageHandler, AgentDispatchEvent, AgentEventSender, AgentLoop,
         AgentLoopOutput,
     },
-    feature::FeaturePromptRebuilder,
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
 };
@@ -187,17 +186,12 @@ impl AgentWorkerBuilder {
         let Some(llm) = llm else {
             bail!("agent worker builder requires an llm provider");
         };
-        let thread_initializer = Arc::new(FeaturePromptRebuilder::new(
-            runtime.tools(),
-            compact_config.clone(),
-            system_prompt.clone(),
-        ));
         let tool_registry = runtime.tools();
         let thread_runtime = Arc::new(ThreadRuntime::new(
             Arc::clone(&tool_registry),
             tool_registry.memory_repository(),
-            Arc::clone(&thread_initializer),
-            compact_config.enabled() && compact_config.auto_compact(),
+            system_prompt.clone(),
+            compact_config.clone(),
         ));
         let agent_loop = match compact_provider {
             Some(compact_provider) => AgentLoop::with_compact_provider(

@@ -9,7 +9,7 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
     model::{IncomingMessage, ReplyTarget},
     thread::{
-        Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
+        Feature, Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
         derive_internal_thread_id,
     },
 };
@@ -199,7 +199,7 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
         "system prompt",
         now,
     )]);
-    thread_context.enable_auto_compact();
+    thread_context.enable_feature(Feature::AutoCompact);
     thread_context.append_persisted_messages_with_state_for_test(
         vec![ChatMessage::new(
             ChatMessageRole::User,
@@ -291,7 +291,7 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
         event.tool_name = Some("load_toolset".to_string());
         event
     };
-    thread_context.enable_auto_compact();
+    thread_context.enable_feature(Feature::AutoCompact);
     thread_context.append_persisted_messages_with_state_for_test(
         vec![openjarvis::context::ChatMessage::new(
             openjarvis::context::ChatMessageRole::User,

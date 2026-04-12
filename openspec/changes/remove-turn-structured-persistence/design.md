@@ -43,7 +43,7 @@
 新的主模型分为三层：
 
 - `Thread`: 对外暴露的线程句柄，负责 `push_message(...)`、状态变更和请求期串行约束。
-- `PersistedThreadSnapshot`: 仅包含可持久化字段，例如 `locator`、稳定 request context、正式消息序列、线程状态、revision。
+- `PersistedThreadSnapshot`: 仅包含可持久化字段，例如 `locator`、稳定 `System` 前缀、正式消息序列、线程状态、revision。
 - `ActiveRequestState`: 仅存在于内存中的请求期状态，例如当前外部消息 id、请求开始时间、临时工具审计缓冲和日志辅助字段。
 
 `ActiveRequestState` 不得序列化、不得写入 store、不得作为跨请求 API 结构返回。这样 `Thread.push_message(...)` 就不再需要先剥离 runtime 字段再伪装成“纯快照”。
@@ -111,7 +111,7 @@
 
 这里的“线程初始化”被进一步限定为“`SessionManager` 派生 thread handle 时的一次性正式消息注入”，而不是“agent loop 开始前的兜底补写”：
 
-- 当 `SessionManager` 首次解析并派生某个 thread handle 时，`ThreadRuntime` 负责根据 feature、tool registry 和稳定 request context 生成初始化消息；
+- 当 `SessionManager` 首次解析并派生某个 thread handle 时，`ThreadRuntime` 负责根据 feature、tool registry 和稳定 `System` 前缀规则生成初始化消息；
 - 初始化消息直接通过 thread-owned mutation 写入正式消息序列，并在返回 live `Thread` 前完成持久化；
 - worker 与 `AgentLoop` 只接收已经初始化完成的 live `Thread`，不再承担 `ensure_initialized()` 之类的补写职责；
 - `request_context_initialized_at` 这类“是否完成初始化”的补丁字段直接删除，初始化完成状态只由已持久化的 system/feature message 前缀与线程状态表达。
@@ -178,7 +178,7 @@ compact 输出改为一组正式消息，而不是 turn：
 新的持久化模型以 thread 为中心，至少包含：
 
 - `thread_id` / `thread_key` / `channel` / `user_id` / `external_thread_id`；
-- request context snapshot；
+- 稳定 `System` 前缀；
 - 正式消息序列；
 - thread state；
 - revision；
