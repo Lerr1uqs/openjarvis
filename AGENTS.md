@@ -23,7 +23,7 @@
 - `dev` 是默认开发基线，新的 feature branch 必须从 `dev` 拉出
 - 后续开发默认在 `dev` 分出的 feature branch 上进行，不直接在 `master` 上开发
 - 是否将 `dev` 或 feature branch 合入 `master`，由用户最终决定
-- spec需要开一个对应的{xx/$spec} 分支来做 比如 `feature/
+- spec需要开一个对应的{xx/$spec} 分支来做 比如 `refact/session-and-thread` 
 
 # 测试规范
 - 每一个src文件都要在对应的test/目录下以相同的文件映射方式进行ut 要求考虑边界情况 特殊情况
