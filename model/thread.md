@@ -8,7 +8,8 @@
 
 ## 严格边界
 
-- `PersistedThreadSnapshot` 只负责稳定 request context、正式消息序列、线程状态和 revision。
+- `PersistedThreadSnapshot` 只负责持久化消息序列、线程状态和 revision。
+- 其中稳定前缀直接表现为持久化消息序列开头的一组 `System` messages，而不是额外的 request context 成员。
 - `ActiveRequestState` 只负责请求期临时状态，例如日志锚点、临时工具审计缓冲和串行约束。
 - request-time 临时状态可以存在于 `Thread` 内部，但不能形成公共 turn 结构或持久化结构。
 - `Turn` 只保留为日志/事件概念，不再作为公共结构体或主存储结构。
@@ -20,9 +21,9 @@
 - `thread_key`
   归一化线程键，格式固定为 `user_id:channel:external_thread_id`。
 - `PersistedThreadSnapshot`
-  线程正式持久化事实，包含稳定 request context、正式消息序列、线程状态和 revision。
+  线程正式持久化事实，包含持久化消息序列、线程状态和 revision。
 - `ThreadState`
-  线程级 feature override、loaded toolsets、tool event、approval 状态。
+  线程级 feature flags、loaded toolsets、tool event、approval 状态。
 - `ActiveRequestState`
   线程内部的请求期临时状态，不持久化、不对外暴露。
 

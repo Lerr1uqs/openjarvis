@@ -8,7 +8,7 @@
 - **BREAKING** 规定 `Thread.push_message(...)` 和其他 thread-owned 事实写入 API 是唯一正式持久化边界；调用成功返回时，对应消息或状态必须已经完成原子落盘。
 - **BREAKING** `SessionManager` 退化为线程身份解析、thread handle 管理与热缓存边界，不再拥有“turn 最终提交”职责，也不再负责 dedup 或补做 thread snapshot 提交。
 - **BREAKING** 引入独立的 `ThreadRuntime` 承接线程创建期初始化、工具可见性、工具调用、memory 访问和 feature prompt 重建职责；当 `SessionManager` 派生/创建 `Thread` handle 时，就要完成 feature 初始化消息注入与落盘，删除 `ThreadRuntimeAttachment` 这一类挂在 `Thread` 上的运行时补丁层。
-- 重写 `Thread` 持久化模型：持久化快照只包含线程身份、稳定 request context、正式消息历史、线程状态和 revision；不得再包含任何 turn working set、turn finalization 结果或 turn 持久化快照。
+- 重写 `Thread` 持久化模型：持久化快照只包含线程身份、稳定 `System` 前缀、正式消息历史、线程状态和 revision；不得再包含任何 turn working set、turn finalization 结果或 turn 持久化快照。
 - 删除 `request_context_initialized_at`、`ensure_initialized()` 及同类“运行中补初始化”机制；初始化完成状态只通过已持久化的线程消息与线程状态表达。
 - **BREAKING** 不保留旧数据库兼容层；若 thread-first schema 与旧库冲突，允许直接删除旧数据库并按新 schema 重建。
 - 将当前请求期的临时执行状态从 turn 模型中拆出，改为 thread 内部的 request-local/live-only 状态，仅用于日志、当前请求串行约束和临时工具审计，不得形成持久化结构体契约。

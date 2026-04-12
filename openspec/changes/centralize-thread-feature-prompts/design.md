@@ -14,8 +14,8 @@
 
 **Goals:**
 
-- 让 `ThreadContext` 直接表达固定的静态 feature system prompt 槽位，而不是只保留一个泛化 live preamble。
-- 用统一的 `FeaturePromptProvider` trait 描述“某个 feature 如何产出 prompt messages”。
+- 让稳定 feature prompt 直接表现为 `Thread.messages()` 开头的 `System` 前缀，而不是新增固定槽位。
+- 用统一的 feature 构造入口描述“某个 feature 如何产出 prompt messages”，但不再把 `FeaturePromptProvider` trait 作为主模型。
 - 让动态 feature prompt 的重建通过一个固定 rebuild 入口完成，`AgentLoop` 只负责触发重建，不再手工拼接 prompt 片段。
 - 保持基础 system snapshot 与动态 feature prompt 的边界清晰：前者初始化时固化，后者按 turn / 状态变化重建。
 
@@ -27,32 +27,34 @@
 
 ## Decisions
 
-### 1. `ThreadContext` 改为固定 feature 槽位，而不是通用 provider map
+### 1. 稳定 feature prompt 继续直接写入 `System` 前缀，而不是新增固定槽位
 
-系统将在线程上下文中直接声明固定的静态 feature system prompt 结构，而不是把 feature prompt 存成 `HashMap<String, Vec<ChatMessage>>`。首版固定槽位至少包括：
+系统将继续把稳定 feature prompt 直接写入 `Thread.messages()` 开头的 `System` 前缀，而不是把 feature prompt 存成 `HashMap<String, Vec<ChatMessage>>` 或固定字段槽位。首版稳定 prompt 至少包括：
 
-- `toolset_catalog`
-- `skill_catalog`
-- `auto_compact`
+- `toolset catalog`
+- `skill catalog`
+- `auto_compact` 稳定说明
 
 这样做的原因是：
 
 - 这些 feature 集合在当前系统里是闭集，不是插件式开放集合。
 - prompt 导出顺序需要稳定且可审计，不适合交给注册顺序决定。
-- 固定字段更容易调试，也更容易在测试里直接断言。
+- 直接复用单一消息序列更容易调试，也不会把稳定前缀再拆成新的成员。
 
 被拒绝的方案：
 
 - 方案 A: 使用 `[id] -> provider/messages` 的动态 map
   原因: 过度通用，顺序和去重都会回到运行时约定，增加维护复杂度。
+- 方案 B: 新增固定 `features_system_prompt` 字段
+  原因: 会重新制造“稳定前缀单独占一个成员”的模型，和单一持久化消息序列方向冲突。
 
-### 2. 用 `FeaturePromptProvider` 产出消息，但 provider 本身不进入 `ThreadContext`
+### 2. 用统一 feature 构造入口产出消息，但构造逻辑本身不进入 `ThreadContext`
 
-系统会引入统一的 `FeaturePromptProvider` trait，用来描述“如何根据当前线程状态和运行时依赖产出 feature prompt messages”。但 `ThreadContext` 里只保存 feature message 槽位数据，不保存 provider trait object。
+系统会引入统一的 feature 构造入口，用来描述“如何根据当前线程状态和运行时依赖产出 feature prompt messages”。但 `ThreadContext` 仍只保存消息序列和线程状态，不保存 provider trait object 或 prompt 槽位数据。
 
 这样做可以保持边界：
 
-- `ThreadContext` 只承载线程事实和 live message 结果
+- `ThreadContext` 只承载线程事实和消息结果
 - provider 的行为逻辑留在 agent/feature 侧
 - `thread.rs` 不需要反向依赖 tool registry、skill registry、compact runtime 或 memory 子系统
 
@@ -63,15 +65,15 @@
 
 ### 3. 基础 system prompt 继续由初始化 snapshot 管理，动态 feature 统一 rebuild
 
-基础角色设定 system prompt 继续只在线程初始化时进入 persisted snapshot。dynamic feature prompt 不追加到历史里，而是在每次发起请求前或 feature 状态变化后统一重建 `features_system_prompt` 与其他瞬时 live messages。
+基础角色设定 system prompt 继续只在线程初始化时进入持久化消息序列开头前缀。dynamic feature prompt 不追加到历史里，而是在每次发起请求前或 feature 状态变化后统一刷新稳定前缀相关状态与其他瞬时 live messages。
 
 对应策略：
 
 - `base system prompt` 属于 persisted snapshot
-- `toolset/skill/auto_compact` 的稳定说明属于 `features_system_prompt`
+- `toolset/skill/auto_compact` 的稳定说明属于持久化 `System` 前缀
 - `memory` 属于 request-time `live_memory_messages`
 - auto-compact 的动态容量属于 request-time `live_system_messages`
-- feature 从关到开时重建 `features_system_prompt`；预算变化时只刷新动态容量消息
+- feature 从关到开时刷新稳定前缀相关状态；预算变化时只刷新动态容量消息
 
 被拒绝的方案：
 
@@ -87,7 +89,7 @@
 
 系统将把这两部分显式分层：
 
-- 稳定说明属于 auto-compact 的稳定 feature prompt
+- 稳定说明属于 auto-compact 的稳定 `System` 前缀
 - 动态预算信息属于可频繁刷新的 live message
 
 这样做的原因是，预算数值会在同一轮或相邻轮中频繁变化。如果每次预算刷新都改写 auto-compact 的 system prompt，会破坏稳定前缀并放大后续缓存失效范围。首版即使不专门优化 KV cache，也应保持这个边界。
@@ -107,7 +109,7 @@
 但 loop 不再自己把 `toolset catalog + skill catalog + auto_compact prompt` 拼成临时向量。它只会：
 
 1. 检查当前线程 feature state
-2. 调用统一 rebuild 入口更新 `ThreadContext.features_system_prompt`
+2. 调用统一刷新入口更新稳定 feature prompt
 3. 通过 `ThreadContext.messages()` 导出完整请求消息
 
 被拒绝的方案：
@@ -117,8 +119,8 @@
 
 ## Risks / Trade-offs
 
-- [Risk] 固定 feature 槽位会让未来新增 prompt feature 需要修改 `ThreadContext` 结构
-  Mitigation: 当前 feature 集是闭集，显式扩字段比提前设计过度通用容器更稳。
+- [Risk] 若重新引入额外 prompt 槽位，会让未来新增 prompt feature 需要修改 `ThreadContext` 结构
+  Mitigation: 保持单一持久化消息序列模型，稳定提示继续直接写入 `System` 前缀。
 
 - [Risk] auto-compact 预算信息仍然依赖先计算、再刷新，重建入口可能出现两次调用
   Mitigation: 在设计中明确允许少量重算，但要求预算刷新只更新 `live_system_messages`，不改稳定 system prompt。
@@ -128,9 +130,9 @@
 
 ## Migration Plan
 
-1. 在 `ThreadContext` 中引入固定的 `features_system_prompt` 槽位，并调整 `messages()` 导出顺序。
-2. 新增 `FeaturePromptProvider` trait，并为 toolset catalog、skill catalog、auto-compact、memory 提供固定实现。
-3. 提供统一的 `features_system_prompt` rebuild 入口，并让 `AutoCompactor` 负责动态容量注入。
+1. 调整线程初始化路径，让稳定 feature prompt 直接写入 `Thread.messages()` 的 `System` 前缀。
+2. 提供统一 feature 构造入口，为 toolset catalog、skill catalog、auto-compact、memory 提供固定实现。
+3. 提供统一的稳定 feature prompt 刷新入口，并让 `AutoCompactor` 负责动态容量注入。
 4. 移除 loop 中分散的 feature prompt 拼装 helper，更新测试和文档。
 
 ## Open Questions

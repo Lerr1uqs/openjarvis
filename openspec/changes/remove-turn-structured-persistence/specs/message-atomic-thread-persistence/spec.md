@@ -42,11 +42,11 @@
 - **THEN** 线程正式状态的持久化 owner 只有目标 `Thread`
 
 ### Requirement: 持久化线程快照 SHALL 只包含 flat message 序列与 thread state
-系统 MUST 以 thread 为核心聚合持久化正式状态。持久化快照 SHALL 只包含线程身份、稳定 request context、正式消息序列、thread state、revision 与必要时间戳；系统 SHALL NOT 以 `ConversationTurn`、`ThreadCurrentTurn`、`ThreadFinalizedTurn` 或任何 turn 结构持久化线程正式状态。
+系统 MUST 以 thread 为核心聚合持久化正式状态。持久化快照 SHALL 只包含线程身份、稳定 `System` 前缀、正式消息序列、thread state、revision 与必要时间戳；系统 SHALL NOT 以 `ConversationTurn`、`ThreadCurrentTurn`、`ThreadFinalizedTurn` 或任何 turn 结构持久化线程正式状态。
 
 #### Scenario: 重启恢复后不会看到 turn 结构
 - **WHEN** 系统从持久化层恢复一个线程
-- **THEN** 恢复结果只包含正式消息序列、稳定 request context 和 thread state
+- **THEN** 恢复结果只包含正式消息序列、稳定 `System` 前缀和 thread state
 - **THEN** 恢复结果中不会出现可被继续消费的 turn 结构或 turn 快照
 
 ### Requirement: thread store SHALL 使用 compare-and-swap revision 保护原子写入

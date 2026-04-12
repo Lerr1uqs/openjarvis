@@ -50,7 +50,7 @@
 - **THEN** thread 不会因为 finalize 成功而自动补齐任何 turn event 或用户可见消息
 
 ### Requirement: Thread 与 Session SHALL NOT 持有 dispatch 发送账本状态
-线程上下文 SHALL 只保存 request context、conversation history、active turn working set、turn 完成态与 dedup 相关事实，而 SHALL NOT 保存 router ack cursor、pending dispatch ledger 或其他消息送达进度状态。Session SHALL 只作为 thread commit persistence 与 dedup 的基础设施，而 SHALL NOT 承担 dispatch/checkpoint 管理职责。
+线程上下文 SHALL 只保存稳定 `System` 前缀、conversation history、active turn working set、turn 完成态与 dedup 相关事实，而 SHALL NOT 保存 router ack cursor、pending dispatch ledger 或其他消息送达进度状态。Session SHALL 只作为 thread commit persistence 与 dedup 的基础设施，而 SHALL NOT 承担 dispatch/checkpoint 管理职责。
 
 #### Scenario: thread snapshot 中不再包含待发送账本
 - **WHEN** 某个 turn 已经 commit 了若干消息，但外发尚未全部完成

@@ -33,14 +33,14 @@
 
 `Thread` 将继续作为聚合根存在，但内部边界拆成两层：
 
-- 持久化层：thread locator、稳定 request context、conversation history、feature/tool/audit state
+- 持久化层：thread locator、稳定 `System` 前缀、conversation history、feature/tool/audit state
 - 运行时层：当前 turn working set、全局 runtime service attachment
 
 运行时 attachment 首版至少包含：
 
 - 全局 `ToolRegistry`
 - `MemoryRepository`
-- `FeaturePromptProvider` 集合
+- feature 初始化辅助逻辑
 
 这些对象由外部注入到 `Thread`，但一旦 attach 完成，后续如何使用它们由 `Thread` 自己决定。`AgentLoop` 和 `AgentWorker` 不再直接用这些 service 处理 thread-scoped 逻辑。
 
@@ -56,7 +56,7 @@ Alternative considered:
 1. Session/Worker 取出 `Thread`
 2. 外部为该 thread attach runtime services
 3. 外部调用 `thread.ensure_initialized()`
-4. `Thread` 自己判断是否已经初始化，并在需要时构造稳定 request context snapshot
+4. `Thread` 自己判断是否已经初始化，并在需要时构造稳定 `System` 前缀
 
 初始化所需的 system prompt、feature prompt 和 memory catalog prompt 不再由 worker 直接写消息数组，而是由 `Thread` 基于已 attach 的 feature provider / memory repository 生成并落入自身状态。
 
@@ -79,7 +79,7 @@ Alternative considered:
 
 都应收敛到同一个 message mutation 入口。由 `Thread` 根据当前生命周期和 message scope 决定该消息进入：
 
-- 稳定 request context
+- 稳定 `System` 前缀
 - 当前 turn working set
 - 或最终持久化 history
 
@@ -130,7 +130,7 @@ memory 与 feature prompt 虽然依赖全局基础设施，但行为上是 threa
 
 因此：
 
-- `Thread` 自己调用 attached `FeaturePromptProvider` 生成初始化 snapshot
+- `Thread` 自己调用 attached feature 初始化辅助逻辑生成初始化前缀
 - `Thread` 自己调用 attached `MemoryRepository` 构造初始化阶段的 active memory catalog prompt
 - `AgentLoop` 不再直接查 memory repository，也不直接重建 feature prompt，更不会自动注入 memory 正文
 
@@ -162,7 +162,7 @@ Alternative considered:
 
 Session/store 仍然只保存可持久化的 thread snapshot：
 
-- request context snapshot
+- 稳定 `System` 前缀
 - history
 - feature/tool/audit state
 

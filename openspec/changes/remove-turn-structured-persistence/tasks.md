@@ -1,6 +1,6 @@
 ## 1. Store 与持久化模型重写
 
-- [x] 1.1 设计并实现 thread-first 的持久化快照模型，只保留 request context、flat message 序列、thread state、revision 与必要定位字段。
+- [x] 1.1 设计并实现 thread-first 的持久化快照模型，只保留稳定 `System` 前缀、flat message 序列、thread state、revision 与必要定位字段。
 - [x] 1.2 移除 `Session` 聚合对持久化的前置依赖，让 store 可以直接按稳定 thread identity 读写线程。
 - [x] 1.3 从 `Session/ThreadStore` 中移除平台入口 dedup 的持久化职责与相关 schema 字段，保持 `Session/Thread` 接口精炼。
 - [x] 1.4 为 memory/sqlite store 补充 compare-and-swap revision 写入与冲突错误覆盖测试。
