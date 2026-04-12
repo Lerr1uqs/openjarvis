@@ -871,6 +871,7 @@ impl AgentLoop {
 
     fn auto_compact_enabled_for_thread(&self, thread_context: &Thread) -> bool {
         self.compact_config.enabled()
+            && self.compact_config.auto_compact()
             && thread_context.auto_compact_enabled(self.compact_config.auto_compact())
     }
 

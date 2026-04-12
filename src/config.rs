@@ -1,5 +1,6 @@
 //! Configuration loading and default values for the application, channels, and LLM provider.
 
+use crate::thread::Features;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -316,6 +317,7 @@ impl AppConfig {
 
     fn validate(&self) -> Result<()> {
         self.logging.validate()?;
+        self.channels.validate()?;
         self.session.validate()?;
         self.llm.validate()?;
         self.agent.validate()
@@ -680,6 +682,10 @@ impl ChannelConfig {
     pub fn feishu_config(&self) -> &FeishuConfig {
         &self.feishu
     }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.feishu.validate()
+    }
 }
 
 /// Session persistence configuration loaded from `session`.
@@ -823,6 +829,7 @@ pub struct FeishuConfig {
     pub auto_start_sidecar: bool,
     pub node_bin: String,
     pub sidecar_script: String,
+    users: HashMap<String, FeishuUserConfig>,
 }
 
 impl Default for FeishuConfig {
@@ -839,6 +846,7 @@ impl Default for FeishuConfig {
             auto_start_sidecar: true,
             node_bin: "node".to_string(),
             sidecar_script: "scripts/feishu_ws_client.mjs".to_string(),
+            users: HashMap::new(),
         }
     }
 }
@@ -850,6 +858,34 @@ impl FeishuConfig {
             self.mode.as_str(),
             "long_connection" | "long-connection" | "long_connection_sdk" | "ws" | "websocket"
         )
+    }
+
+    /// Return the configured per-user channel overrides.
+    pub fn users(&self) -> &HashMap<String, FeishuUserConfig> {
+        &self.users
+    }
+
+    /// Return the explicit thread feature override for one Feishu user when configured.
+    pub fn user_features(&self, user_id: &str) -> Option<&Features> {
+        self.users.get(user_id).and_then(FeishuUserConfig::features)
+    }
+
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// One Feishu user-scoped override entry.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeishuUserConfig {
+    features: Option<Features>,
+}
+
+impl FeishuUserConfig {
+    /// Return the explicit feature override for this user when configured.
+    pub fn features(&self) -> Option<&Features> {
+        self.features.as_ref()
     }
 }
 

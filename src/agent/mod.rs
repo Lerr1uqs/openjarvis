@@ -13,16 +13,12 @@ pub use agent_loop::{
     AgentDispatchEvent, AgentEventSender, AgentLoop, AgentLoopEvent, AgentLoopEventKind,
     AgentLoopOutput,
 };
-pub use feature::{
-    AutoCompactFeaturePromptProvider, AutoCompactor, FeaturePromptBuildContext,
-    FeaturePromptProvider, FeaturePromptRebuilder, SkillCatalogFeaturePromptProvider,
-    ToolsetCatalogFeaturePromptProvider,
-};
+pub use feature::{AutoCompactor, FeatureResolver, ShellEnv};
 pub use hook::{HookEvent, HookEventKind, HookHandler, HookRegistry};
 pub use memory::{
-    ActiveMemoryCatalogEntry, ActiveMemoryCatalogFeaturePromptProvider, MemoryDocument,
-    MemoryDocumentMetadata, MemoryDocumentSummary, MemoryRepository, MemorySearchResponse,
-    MemoryType, MemoryWriteRequest, register_memory_toolset,
+    ActiveMemoryCatalogEntry, MemoryDocument, MemoryDocumentMetadata, MemoryDocumentSummary,
+    MemoryRepository, MemorySearchResponse, MemoryType, MemoryWriteRequest,
+    register_memory_toolset,
 };
 pub use runtime::AgentRuntime;
 pub use sandbox::DummySandboxContainer;
