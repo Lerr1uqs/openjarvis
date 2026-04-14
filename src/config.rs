@@ -326,6 +326,7 @@ impl AppConfig {
     fn resolve_paths(&mut self, config_path: &Path) {
         self.logging.resolve_paths(config_path);
         self.session.resolve_paths(config_path);
+        self.agent.resolve_paths(config_path);
     }
 
     fn load_external_mcp_sidecar(&mut self, config_path: &Path) -> Result<()> {
@@ -951,6 +952,10 @@ impl AgentConfig {
         self.tool.validate()?;
         self.compact.validate()
     }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        self.tool.resolve_paths(config_path);
+    }
 }
 
 /// Compact runtime configuration loaded from `agent.compact`.
@@ -1079,6 +1084,7 @@ impl AgentCompactConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentToolConfig {
     mcp: AgentMcpConfig,
+    browser: AgentBrowserToolConfig,
 }
 
 impl AgentToolConfig {
@@ -1095,8 +1101,91 @@ impl AgentToolConfig {
         &self.mcp
     }
 
+    /// Return the configured browser runtime subsection.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(config.agent_config().tool_config().browser_config().cookies_state_file().is_none());
+    /// ```
+    pub fn browser_config(&self) -> &AgentBrowserToolConfig {
+        &self.browser
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
-        self.mcp.validate()
+        self.mcp.validate()?;
+        self.browser.validate()
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        self.browser.resolve_paths(config_path);
+    }
+}
+
+/// Browser runtime configuration loaded from `agent.tool.browser`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert!(!config.agent_config().tool_config().browser_config().load_cookies_on_open());
+/// assert!(!config.agent_config().tool_config().browser_config().save_cookies_on_close());
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentBrowserToolConfig {
+    cookies_state_file: Option<PathBuf>,
+    load_cookies_on_open: bool,
+    save_cookies_on_close: bool,
+}
+
+impl AgentBrowserToolConfig {
+    /// Return the optional cookies state file path used for browser session reuse.
+    pub fn cookies_state_file(&self) -> Option<&Path> {
+        self.cookies_state_file.as_deref()
+    }
+
+    /// Return whether launch-mode browser open should auto-load cookies from the configured file.
+    pub fn load_cookies_on_open(&self) -> bool {
+        self.load_cookies_on_open
+    }
+
+    /// Return whether launch-mode browser close should auto-save cookies to the configured file.
+    pub fn save_cookies_on_close(&self) -> bool {
+        self.save_cookies_on_close
+    }
+
+    fn validate(&self) -> Result<()> {
+        if (self.load_cookies_on_open || self.save_cookies_on_close)
+            && self.cookies_state_file.is_none()
+        {
+            bail!(
+                "agent.tool.browser.cookies_state_file is required when browser cookies auto-load or auto-save is enabled"
+            );
+        }
+        if self
+            .cookies_state_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            bail!("agent.tool.browser.cookies_state_file must not be blank");
+        }
+        Ok(())
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        let Some(path) = self.cookies_state_file.as_mut() else {
+            return;
+        };
+        if path.is_absolute() || path.as_os_str().is_empty() {
+            return;
+        }
+
+        let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        *path = config_root.join(&*path);
     }
 }
 

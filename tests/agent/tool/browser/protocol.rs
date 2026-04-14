@@ -1,7 +1,7 @@
 use openjarvis::agent::tool::browser::{
-    BrowserCloseResult, BrowserSidecarRequest, BrowserSidecarRequestPayload,
-    BrowserSidecarResponse, BrowserSidecarResponsePayload, BrowserSnapshotElement,
-    BrowserSnapshotResult,
+    BrowserCloseResult, BrowserOpenRequest, BrowserSessionMode, BrowserSidecarRequest,
+    BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
+    BrowserSnapshotElement, BrowserSnapshotResult,
 };
 
 #[test]
@@ -24,6 +24,30 @@ fn browser_protocol_round_trips_snapshot_request() {
             max_elements: Some(120)
         }
     ));
+}
+
+#[test]
+fn browser_protocol_round_trips_open_request() {
+    // 验证显式 attach open 请求可以完整编解码。
+    let encoded = serde_json::to_string(&BrowserSidecarRequest::new(
+        "req-open",
+        BrowserSidecarRequestPayload::Open(BrowserOpenRequest::attach("http://127.0.0.1:9222")),
+    ))
+    .expect("open request should serialize");
+    let decoded: BrowserSidecarRequest =
+        serde_json::from_str(&encoded).expect("open request should deserialize");
+
+    assert_eq!(decoded.id, "req-open");
+    match decoded.payload {
+        BrowserSidecarRequestPayload::Open(request) => {
+            assert_eq!(request.mode, BrowserSessionMode::Attach);
+            assert_eq!(
+                request.cdp_endpoint.as_deref(),
+                Some("http://127.0.0.1:9222")
+            );
+        }
+        other => panic!("unexpected request payload: {other:?}"),
+    }
 }
 
 #[test]
@@ -98,10 +122,16 @@ fn browser_protocol_successfully_serializes_close_payload() {
     // 验证 close 动作仍然使用统一的 action 字段编码。
     let encoded = serde_json::to_string(&BrowserSidecarResponse::success(
         "req-4",
-        BrowserSidecarResponsePayload::Close(BrowserCloseResult { closed: true }),
+        BrowserSidecarResponsePayload::Close(BrowserCloseResult {
+            closed: true,
+            mode: Some(BrowserSessionMode::Launch),
+            exported_cookies_path: Some("/tmp/browser-cookies.json".to_string()),
+            exported_cookie_count: Some(3),
+        }),
     ))
     .expect("close response should serialize");
 
     assert!(encoded.contains("\"action\":\"close\""));
     assert!(encoded.contains("\"closed\":true"));
+    assert!(encoded.contains("\"exported_cookie_count\":3"));
 }

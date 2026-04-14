@@ -8,6 +8,9 @@ const headless = readBoolEnv('OPENJARVIS_BROWSER_HEADLESS', true);
 const sessionDir = process.env.OPENJARVIS_BROWSER_SESSION_DIR ?? '';
 const userDataDir = process.env.OPENJARVIS_BROWSER_USER_DATA_DIR ?? '';
 const chromePathOverride = process.env.OPENJARVIS_BROWSER_CHROME_PATH ?? '';
+const cookiesStateFile = process.env.OPENJARVIS_BROWSER_COOKIES_STATE_FILE ?? '';
+const loadCookiesOnOpen = readBoolEnv('OPENJARVIS_BROWSER_LOAD_COOKIES_ON_OPEN', false);
+const saveCookiesOnClose = readBoolEnv('OPENJARVIS_BROWSER_SAVE_COOKIES_ON_CLOSE', false);
 const launchTimeoutMs = Number.parseInt(
   process.env.OPENJARVIS_BROWSER_LAUNCH_TIMEOUT_MS ?? '30000',
   10,
@@ -19,6 +22,8 @@ const snapshotElementDefaultLimit = Number.parseInt(
 
 let browserContext = null;
 let page = null;
+let attachedBrowser = null;
+let sessionMode = null;
 let refIndex = new Map();
 
 process.on('SIGINT', async () => {
@@ -66,6 +71,8 @@ for await (const line of rl) {
 
 async function handleRequest(request) {
   switch (request.action) {
+    case 'open':
+      return openSession(request);
     case 'navigate':
       return navigate(request.url);
     case 'snapshot':
@@ -76,12 +83,10 @@ async function handleRequest(request) {
       return typeRef(request.ref, request.text, Boolean(request.submit));
     case 'screenshot':
       return screenshot(request.path);
+    case 'export_cookies':
+      return exportCookies(request.path);
     case 'close':
-      await closeBrowser();
-      return {
-        action: 'close',
-        closed: true,
-      };
+      return closeBrowser();
     default:
       throw sidecarError(
         'bad_request',
@@ -91,26 +96,75 @@ async function handleRequest(request) {
 }
 
 async function ensurePage() {
+  await ensureSessionOpen({ mode: 'launch' });
+  return ensurePageFromCurrentContext();
+}
+
+async function ensureSessionOpen(defaultRequest) {
+  if (sessionMode && browserContext) {
+    return;
+  }
+
+  await openSession(defaultRequest);
+}
+
+async function ensurePageFromCurrentContext() {
   if (page && !page.isClosed()) {
     return page;
   }
 
   if (browserContext) {
-    const openPages = browserContext.pages().filter((candidate) => !candidate.isClosed());
+    const openPages = collectContextPages(browserContext);
     if (openPages.length > 0) {
       page = openPages[openPages.length - 1];
       configurePage(page);
       return page;
     }
+    page = await browserContext.newPage();
+    configurePage(page);
+    return page;
   }
 
-  if (!sessionDir || !userDataDir) {
-    throw sidecarError(
-      'invalid_config',
-      'OPENJARVIS_BROWSER_SESSION_DIR and OPENJARVIS_BROWSER_USER_DATA_DIR are required',
-    );
-  }
+  throw sidecarError('no_session', 'browser session is not open');
+}
 
+async function openSession(request) {
+  const openRequest = normalizeOpenRequest(request);
+  await disposeCurrentSession();
+
+  try {
+    if (openRequest.mode === 'launch') {
+      await openLaunchSession();
+      const cookiesLoaded = await maybeAutoLoadCookies();
+      const currentPage = await ensurePageFromCurrentContext();
+      refIndex.clear();
+      return {
+        action: 'open',
+        mode: sessionMode,
+        url: currentPage.url(),
+        title: await currentPage.title(),
+        cookies_loaded: cookiesLoaded,
+      };
+    }
+
+    await openAttachSession(openRequest.cdp_endpoint);
+    const currentPage = await ensurePageFromCurrentContext();
+    refIndex.clear();
+    return {
+        action: 'open',
+        mode: sessionMode,
+        url: currentPage.url(),
+        title: await currentPage.title(),
+        cookies_loaded: 0,
+      };
+  } catch (error) {
+    await hardResetSession();
+    throw error;
+  }
+}
+
+async function openLaunchSession() {
+  assertLaunchConfig();
   await fs.mkdir(sessionDir, { recursive: true });
   await fs.mkdir(userDataDir, { recursive: true });
 
@@ -127,11 +181,35 @@ async function ensurePage() {
       '--no-default-browser-check',
     ],
   });
+  sessionMode = 'launch';
+}
 
-  const existingPages = browserContext.pages();
-  page = existingPages.length > 0 ? existingPages[0] : await browserContext.newPage();
+async function openAttachSession(cdpEndpoint) {
+  if (!cdpEndpoint || typeof cdpEndpoint !== 'string' || !cdpEndpoint.trim()) {
+    throw sidecarError('bad_request', 'attach mode requires a non-empty cdp_endpoint');
+  }
+
+  attachedBrowser = await chromium.connectOverCDP(cdpEndpoint);
+  const existingPages = attachedBrowser
+    .contexts()
+    .flatMap((context) => collectContextPages(context));
+  if (existingPages.length > 0) {
+    page = existingPages[existingPages.length - 1];
+    browserContext = page.context();
+    configurePage(page);
+    sessionMode = 'attach';
+    return;
+  }
+
+  if (attachedBrowser.contexts().length > 0) {
+    browserContext = attachedBrowser.contexts()[0];
+    page = await browserContext.newPage();
+  } else {
+    browserContext = await attachedBrowser.newContext();
+    page = await browserContext.newPage();
+  }
   configurePage(page);
-  return page;
+  sessionMode = 'attach';
 }
 
 async function navigate(url) {
@@ -523,13 +601,20 @@ async function screenshot(filePath) {
   };
 }
 
+async function exportCookies(filePath) {
+  if (!browserContext || !sessionMode) {
+    throw sidecarError('no_session', 'browser session is not open');
+  }
+  if (!filePath || typeof filePath !== 'string') {
+    throw sidecarError('bad_request', 'export_cookies requires a non-empty path');
+  }
+
+  return exportCookiesToPath(filePath);
+}
+
 async function closeBrowser() {
   refIndex.clear();
-  if (browserContext) {
-    await browserContext.close().catch(() => {});
-  }
-  browserContext = null;
-  page = null;
+  return disposeCurrentSession();
 }
 
 function resolveRef(reference) {
@@ -573,6 +658,223 @@ async function resolveChromeExecutable() {
     'missing_chrome',
     'failed to locate a local Chrome executable; set OPENJARVIS_BROWSER_CHROME_PATH explicitly',
   );
+}
+
+function collectContextPages(context) {
+  return context.pages().filter((candidate) => !candidate.isClosed());
+}
+
+function normalizeOpenRequest(request) {
+  const mode = request?.mode ?? 'launch';
+  if (mode !== 'launch' && mode !== 'attach') {
+    throw sidecarError('bad_request', `unsupported browser open mode: ${mode}`);
+  }
+  if (mode === 'attach' && (!request?.cdp_endpoint || !String(request.cdp_endpoint).trim())) {
+    throw sidecarError('bad_request', 'attach mode requires a non-empty cdp_endpoint');
+  }
+  if (mode === 'launch' && request?.cdp_endpoint) {
+    throw sidecarError('bad_request', 'launch mode does not accept cdp_endpoint');
+  }
+
+  return {
+    mode,
+    cdp_endpoint: request?.cdp_endpoint ?? null,
+  };
+}
+
+function assertLaunchConfig() {
+  if (!sessionDir || !userDataDir) {
+    throw sidecarError(
+      'invalid_config',
+      'OPENJARVIS_BROWSER_SESSION_DIR and OPENJARVIS_BROWSER_USER_DATA_DIR are required',
+    );
+  }
+}
+
+async function maybeAutoLoadCookies() {
+  if (sessionMode !== 'launch' || !loadCookiesOnOpen || !cookiesStateFile) {
+    return 0;
+  }
+
+  try {
+    return await loadCookiesFromPath(cookiesStateFile, true);
+  } catch (error) {
+    throw sidecarError(
+      error.code ?? 'cookies_load_failed',
+      `failed to auto-load cookies from ${cookiesStateFile}: ${error.message ?? error}`,
+    );
+  }
+}
+
+async function loadCookiesFromPath(filePath, allowMissing) {
+  let raw;
+  try {
+    raw = await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if (allowMissing && error?.code === 'ENOENT') {
+      return 0;
+    }
+    throw sidecarError(
+      error?.code === 'ENOENT' ? 'cookies_state_missing' : 'cookies_state_read_failed',
+      `failed to read cookies state file ${filePath}: ${error.message ?? error}`,
+    );
+  }
+
+  const cookies = parseCookiesState(raw, filePath);
+  if (cookies.length === 0) {
+    return 0;
+  }
+  await browserContext.addCookies(cookies);
+  return cookies.length;
+}
+
+async function exportCookiesToPath(filePath) {
+  const cookies = await browserContext.cookies();
+  const normalizedCookies = cookies.map((cookie) => ({
+    name: cookie.name,
+    value: cookie.value,
+    domain: cookie.domain,
+    path: cookie.path,
+    expires: cookie.expires,
+    httpOnly: Boolean(cookie.httpOnly),
+    secure: Boolean(cookie.secure),
+    sameSite: cookie.sameSite ?? 'Lax',
+  }));
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        version: 1,
+        exported_at: new Date().toISOString(),
+        cookies: normalizedCookies,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  );
+
+  return {
+    action: 'export_cookies',
+    mode: sessionMode,
+    path: filePath,
+    cookie_count: normalizedCookies.length,
+  };
+}
+
+function parseCookiesState(raw, filePath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw sidecarError(
+      'cookies_state_parse_failed',
+      `failed to parse cookies state file ${filePath}: ${error.message ?? error}`,
+    );
+  }
+
+  const cookies = Array.isArray(parsed) ? parsed : parsed?.cookies;
+  if (!Array.isArray(cookies)) {
+    throw sidecarError(
+      'cookies_state_invalid',
+      `cookies state file ${filePath} must contain a top-level cookies array`,
+    );
+  }
+
+  return cookies.map((cookie, index) => normalizeCookie(cookie, filePath, index));
+}
+
+function normalizeCookie(cookie, filePath, index) {
+  if (!cookie || typeof cookie !== 'object') {
+    throw sidecarError(
+      'cookies_state_invalid',
+      `cookie #${index + 1} in ${filePath} must be an object`,
+    );
+  }
+  for (const field of ['name', 'value', 'domain', 'path']) {
+    if (typeof cookie[field] !== 'string') {
+      throw sidecarError(
+        'cookies_state_invalid',
+        `cookie #${index + 1} in ${filePath} is missing string field ${field}`,
+      );
+    }
+  }
+
+  return {
+    name: cookie.name,
+    value: cookie.value,
+    domain: cookie.domain,
+    path: cookie.path,
+    expires: Number.isFinite(cookie.expires) ? cookie.expires : -1,
+    httpOnly: Boolean(cookie.httpOnly),
+    secure: Boolean(cookie.secure),
+    sameSite: normalizeSameSite(cookie.sameSite),
+  };
+}
+
+function normalizeSameSite(value) {
+  const normalized = String(value ?? 'Lax');
+  switch (normalized.toLowerCase()) {
+    case 'strict':
+      return 'Strict';
+    case 'none':
+      return 'None';
+    case 'lax':
+    default:
+      return 'Lax';
+  }
+}
+
+async function disposeCurrentSession() {
+  const closeResult = {
+    action: 'close',
+    closed: Boolean(sessionMode),
+    mode: sessionMode,
+    exported_cookies_path: null,
+    exported_cookie_count: null,
+  };
+
+  if (!sessionMode) {
+    return closeResult;
+  }
+
+  if (sessionMode === 'launch' && saveCookiesOnClose && cookiesStateFile && browserContext) {
+    const exportResult = await exportCookiesToPath(cookiesStateFile);
+    closeResult.exported_cookies_path = exportResult.path;
+    closeResult.exported_cookie_count = exportResult.cookie_count;
+  }
+
+  if (sessionMode === 'launch' && browserContext) {
+    await browserContext.close().catch(() => {});
+  }
+  if (sessionMode === 'attach' && attachedBrowser) {
+    await attachedBrowser.close().catch(() => {});
+  }
+
+  resetSessionState();
+  return closeResult;
+}
+
+async function hardResetSession() {
+  try {
+    if (browserContext && sessionMode === 'launch') {
+      await browserContext.close().catch(() => {});
+    }
+    if (attachedBrowser && sessionMode === 'attach') {
+      await attachedBrowser.close().catch(() => {});
+    }
+  } finally {
+    resetSessionState();
+  }
+}
+
+function resetSessionState() {
+  browserContext = null;
+  attachedBrowser = null;
+  page = null;
+  sessionMode = null;
+  refIndex.clear();
 }
 
 function chromeCandidates() {

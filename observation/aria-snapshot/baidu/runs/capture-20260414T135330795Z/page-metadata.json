@@ -1,0 +1,9 @@
+{
+  "target_url": "https://www.baidu.com/",
+  "final_url": "https://www.baidu.com/",
+  "title": "百度一下，你就知道",
+  "captured_at": "2026-04-14T13:53:30.795Z",
+  "screenshot": "baidu-homepage.png",
+  "aria_snapshot": "aria-snapshot.yaml",
+  "chromium_executable": "/usr/bin/chromium-browser"
+}

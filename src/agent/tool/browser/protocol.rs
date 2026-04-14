@@ -1,5 +1,6 @@
 //! Shared JSON-line protocol between Rust browser tools and the Node Playwright sidecar.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -34,10 +35,70 @@ impl BrowserSidecarRequest {
     }
 }
 
+/// Browser session source mode used by the sidecar and tool layer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserSessionMode {
+    Launch,
+    Attach,
+}
+
+impl Default for BrowserSessionMode {
+    fn default() -> Self {
+        Self::Launch
+    }
+}
+
+/// Explicit browser open request sent to the sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserOpenRequest {
+    #[serde(default)]
+    pub mode: BrowserSessionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_endpoint: Option<String>,
+}
+
+impl BrowserOpenRequest {
+    /// Create one launch-mode open request.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::tool::browser::{BrowserOpenRequest, BrowserSessionMode};
+    ///
+    /// let request = BrowserOpenRequest::launch();
+    /// assert_eq!(request.mode, BrowserSessionMode::Launch);
+    /// assert!(request.cdp_endpoint.is_none());
+    /// ```
+    pub fn launch() -> Self {
+        Self {
+            mode: BrowserSessionMode::Launch,
+            cdp_endpoint: None,
+        }
+    }
+
+    /// Create one attach-mode open request with an explicit CDP endpoint.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::tool::browser::{BrowserOpenRequest, BrowserSessionMode};
+    ///
+    /// let request = BrowserOpenRequest::attach("http://127.0.0.1:9222");
+    /// assert_eq!(request.mode, BrowserSessionMode::Attach);
+    /// assert_eq!(request.cdp_endpoint.as_deref(), Some("http://127.0.0.1:9222"));
+    /// ```
+    pub fn attach(cdp_endpoint: impl Into<String>) -> Self {
+        Self {
+            mode: BrowserSessionMode::Attach,
+            cdp_endpoint: Some(cdp_endpoint.into()),
+        }
+    }
+}
+
 /// One browser action request sent to the sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BrowserSidecarRequestPayload {
+    Open(BrowserOpenRequest),
     Navigate {
         url: String,
     },
@@ -55,6 +116,9 @@ pub enum BrowserSidecarRequestPayload {
         submit: bool,
     },
     Screenshot {
+        path: String,
+    },
+    ExportCookies {
         path: String,
     },
     Close,
@@ -122,11 +186,13 @@ impl BrowserSidecarResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BrowserSidecarResponsePayload {
+    Open(BrowserOpenResult),
     Navigate(BrowserNavigateResult),
     Snapshot(BrowserSnapshotResult),
     ClickRef(BrowserActionResult),
     TypeRef(BrowserTypeResult),
     Screenshot(BrowserScreenshotResult),
+    ExportCookies(BrowserCookiesExportResult),
     Close(BrowserCloseResult),
 }
 
@@ -163,6 +229,15 @@ impl BrowserSidecarError {
 pub struct BrowserNavigateResult {
     pub url: String,
     pub title: String,
+}
+
+/// Result returned after a successful `open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserOpenResult {
+    pub mode: BrowserSessionMode,
+    pub url: String,
+    pub title: String,
+    pub cookies_loaded: usize,
 }
 
 /// Result returned after a successful `snapshot`.
@@ -230,8 +305,22 @@ pub struct BrowserScreenshotResult {
     pub path: String,
 }
 
+/// Result returned after a successful cookies export.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserCookiesExportResult {
+    pub mode: BrowserSessionMode,
+    pub path: String,
+    pub cookie_count: usize,
+}
+
 /// Result returned after a successful `close`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserCloseResult {
     pub closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<BrowserSessionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_cookies_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_cookie_count: Option<usize>,
 }

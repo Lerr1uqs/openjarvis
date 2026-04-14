@@ -8,7 +8,8 @@ pub mod tool;
 use std::path::PathBuf;
 
 pub use protocol::{
-    BrowserActionResult, BrowserCloseResult, BrowserNavigateResult, BrowserScreenshotResult,
+    BrowserActionResult, BrowserCloseResult, BrowserCookiesExportResult, BrowserNavigateResult,
+    BrowserOpenRequest, BrowserOpenResult, BrowserScreenshotResult, BrowserSessionMode,
     BrowserSidecarError, BrowserSidecarRequest, BrowserSidecarRequestPayload,
     BrowserSidecarResponse, BrowserSidecarResponsePayload, BrowserSnapshotElement,
     BrowserSnapshotResult, BrowserTypeResult,

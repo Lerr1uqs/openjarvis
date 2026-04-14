@@ -4,10 +4,10 @@ use super::super::{parse_tool_arguments, tool_definition_from_args};
 use super::{
     default_sidecar_script_path,
     protocol::{
-        BrowserActionResult, BrowserCloseResult, BrowserNavigateResult, BrowserScreenshotResult,
-        BrowserSidecarRequest, BrowserSidecarRequestPayload, BrowserSidecarResponse,
-        BrowserSidecarResponsePayload, BrowserSnapshotElement, BrowserSnapshotResult,
-        BrowserTypeResult,
+        BrowserActionResult, BrowserCloseResult, BrowserNavigateResult, BrowserOpenRequest,
+        BrowserOpenResult, BrowserScreenshotResult, BrowserSessionMode, BrowserSidecarRequest,
+        BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
+        BrowserSnapshotElement, BrowserSnapshotResult, BrowserTypeResult,
     },
     service::{BrowserProcessCommandSpec, BrowserRuntimeOptions},
     session::{BrowserSessionCloseOutcome, BrowserSessionManager, BrowserSessionManagerConfig},
@@ -17,7 +17,7 @@ use crate::{
         ToolCallContext, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler,
         ToolRegistry, ToolsetCatalogEntry, ToolsetRuntime, empty_tool_input_schema,
     },
-    cli::InternalBrowserCommand,
+    cli::{InternalBrowserCommand, InternalBrowserMode},
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -105,12 +105,16 @@ pub async fn register_browser_toolset_with_config(
     let runtime = Arc::new(BrowserToolsetRuntime::new(config));
     let sessions = runtime.session_manager();
     registry
+        .remember_browser_session_manager(Arc::clone(&sessions))
+        .await;
+    registry
         .register_toolset_with_runtime(
             ToolsetCatalogEntry::new(
                 "browser",
                 "Browser automation tools powered by a Node Playwright sidecar.",
             ),
             vec![
+                Arc::new(BrowserOpenTool::new(Arc::clone(&sessions))),
                 Arc::new(BrowserNavigateTool::new(Arc::clone(&sessions))),
                 Arc::new(BrowserSnapshotTool::new(Arc::clone(&sessions))),
                 Arc::new(BrowserClickRefTool::new(Arc::clone(&sessions))),
@@ -141,11 +145,16 @@ pub async fn run_internal_browser_command(command: &InternalBrowserCommand) -> R
     match command {
         InternalBrowserCommand::Smoke {
             url,
+            mode,
+            cdp_endpoint,
             headless,
             output_dir,
             node_bin,
             script_path,
             chrome_path,
+            cookies_state_file,
+            load_cookies_on_open,
+            save_cookies_on_close,
         } => {
             let manager = BrowserSessionManager::new(build_helper_manager_config(
                 *headless,
@@ -153,17 +162,30 @@ pub async fn run_internal_browser_command(command: &InternalBrowserCommand) -> R
                 node_bin.clone(),
                 script_path.clone(),
                 chrome_path.clone(),
+                cookies_state_file.clone(),
+                *load_cookies_on_open,
+                *save_cookies_on_close,
                 "openjarvis-browser-smoke",
             ));
-            run_smoke_flow(&manager, url).await
+            run_smoke_flow(
+                &manager,
+                helper_open_request(*mode, cdp_endpoint.clone())?,
+                url,
+            )
+            .await
         }
         InternalBrowserCommand::Script {
             steps_file,
+            mode,
+            cdp_endpoint,
             headless,
             output_dir,
             node_bin,
             script_path,
             chrome_path,
+            cookies_state_file,
+            load_cookies_on_open,
+            save_cookies_on_close,
         } => {
             let manager = BrowserSessionManager::new(build_helper_manager_config(
                 *headless,
@@ -171,9 +193,17 @@ pub async fn run_internal_browser_command(command: &InternalBrowserCommand) -> R
                 node_bin.clone(),
                 script_path.clone(),
                 chrome_path.clone(),
+                cookies_state_file.clone(),
+                *load_cookies_on_open,
+                *save_cookies_on_close,
                 "openjarvis-browser-script",
             ));
-            run_script_flow(&manager, steps_file).await
+            run_script_flow(
+                &manager,
+                steps_file,
+                helper_open_request(*mode, cdp_endpoint.clone())?,
+            )
+            .await
         }
         InternalBrowserCommand::MockSidecar => run_mock_sidecar().await,
     }
@@ -201,6 +231,10 @@ impl BrowserToolBase {
 }
 
 struct BrowserNavigateTool {
+    base: BrowserToolBase,
+}
+
+struct BrowserOpenTool {
     base: BrowserToolBase,
 }
 
@@ -233,6 +267,14 @@ struct BrowserCloseTool {
 }
 
 impl BrowserNavigateTool {
+    fn new(sessions: Arc<BrowserSessionManager>) -> Self {
+        Self {
+            base: BrowserToolBase::new(sessions),
+        }
+    }
+}
+
+impl BrowserOpenTool {
     fn new(sessions: Arc<BrowserSessionManager>) -> Self {
         Self {
             base: BrowserToolBase::new(sessions),
@@ -298,6 +340,13 @@ impl BrowserCloseTool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct BrowserOpenArguments {
+    mode: Option<BrowserSessionMode>,
+    cdp_endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BrowserNavigateArguments {
     url: String,
 }
@@ -359,6 +408,35 @@ struct BrowserScreenshotArguments {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct BrowserNoArguments {}
+
+#[async_trait]
+impl ToolHandler for BrowserOpenTool {
+    fn definition(&self) -> ToolDefinition {
+        tool_definition_from_args::<BrowserOpenArguments>(
+            "browser__open",
+            "Open or replace the current thread-scoped browser session. Use `mode=attach` with `cdp_endpoint` to connect to an existing Chromium instance.",
+        )
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> Result<ToolCallResult> {
+        bail!("browser tool `browser__open` requires thread context");
+    }
+
+    async fn call_with_context(
+        &self,
+        context: ToolCallContext,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        let thread_id = self.base.require_thread_id(&context, "browser__open")?;
+        let args: BrowserOpenArguments = parse_tool_arguments(request, "browser__open")?;
+        let request = BrowserOpenRequest {
+            mode: args.mode.unwrap_or(BrowserSessionMode::Launch),
+            cdp_endpoint: args.cdp_endpoint,
+        };
+        let result = self.base.sessions.open(thread_id, request).await?;
+        Ok(render_open_result(result))
+    }
+}
 
 #[async_trait]
 impl ToolHandler for BrowserNavigateTool {
@@ -643,6 +721,27 @@ fn render_navigate_result(
     }
 }
 
+fn render_open_result(result: BrowserOpenResult) -> ToolCallResult {
+    ToolCallResult {
+        content: format!(
+            "Opened browser session in `{}` mode at {}.",
+            match result.mode {
+                BrowserSessionMode::Launch => "launch",
+                BrowserSessionMode::Attach => "attach",
+            },
+            result.url
+        ),
+        metadata: json!({
+            "toolset": "browser",
+            "mode": result.mode,
+            "url": result.url,
+            "title": result.title,
+            "cookies_loaded": result.cookies_loaded,
+        }),
+        is_error: false,
+    }
+}
+
 fn render_snapshot_result(result: BrowserSnapshotResult) -> ToolCallResult {
     ToolCallResult {
         content: result.snapshot_text.clone(),
@@ -760,7 +859,12 @@ fn render_close_result(result: BrowserSessionCloseOutcome) -> ToolCallResult {
         .map(|artifacts| artifacts.session_dir.display().to_string());
     ToolCallResult {
         content: if result.had_session {
-            "Browser session closed.".to_string()
+            match (&result.auto_exported_path, result.exported_cookie_count) {
+                (Some(path), Some(cookie_count)) => format!(
+                    "Browser session closed. Auto-exported {cookie_count} cookies to {path}."
+                ),
+                _ => "Browser session closed.".to_string(),
+            }
         } else {
             "No browser session was active for the current thread.".to_string()
         },
@@ -769,6 +873,9 @@ fn render_close_result(result: BrowserSessionCloseOutcome) -> ToolCallResult {
             "had_session": result.had_session,
             "kept_artifacts": result.kept_artifacts,
             "artifacts_dir": artifacts_dir,
+            "mode": result.session_mode,
+            "auto_exported_path": result.auto_exported_path,
+            "exported_cookie_count": result.exported_cookie_count,
         }),
         is_error: false,
     }
@@ -780,6 +887,9 @@ fn build_helper_manager_config(
     node_bin: String,
     script_path: Option<PathBuf>,
     chrome_path: Option<PathBuf>,
+    cookies_state_file: Option<PathBuf>,
+    load_cookies_on_open: bool,
+    save_cookies_on_close: bool,
     default_root_dir_name: &str,
 ) -> BrowserSessionManagerConfig {
     let artifact_root =
@@ -795,19 +905,64 @@ fn build_helper_manager_config(
             headless,
             keep_artifacts: true,
             chrome_executable: chrome_path,
+            cookies_state_file,
+            load_cookies_on_open,
+            save_cookies_on_close,
             ..Default::default()
         },
         artifact_root,
     }
 }
 
-async fn run_smoke_flow(manager: &BrowserSessionManager, url: &str) -> Result<()> {
+fn helper_open_request(
+    mode: InternalBrowserMode,
+    cdp_endpoint: Option<String>,
+) -> Result<BrowserOpenRequest> {
+    match mode {
+        InternalBrowserMode::Launch => {
+            if cdp_endpoint.is_some() {
+                bail!("launch mode does not accept `cdp_endpoint`");
+            }
+            Ok(BrowserOpenRequest::launch())
+        }
+        InternalBrowserMode::Attach => {
+            let cdp_endpoint = cdp_endpoint
+                .filter(|endpoint| !endpoint.trim().is_empty())
+                .with_context(|| "attach mode requires a non-empty `cdp_endpoint`")?;
+            Ok(BrowserOpenRequest::attach(cdp_endpoint))
+        }
+    }
+}
+
+async fn ensure_helper_session(
+    manager: &BrowserSessionManager,
+    thread_id: &str,
+    open_request: &BrowserOpenRequest,
+) -> Result<Option<BrowserOpenResult>> {
+    if manager.has_session(thread_id).await {
+        return Ok(None);
+    }
+
+    let result = manager.open(thread_id, open_request.clone()).await?;
+    Ok(Some(result))
+}
+
+async fn run_smoke_flow(
+    manager: &BrowserSessionManager,
+    open_request: BrowserOpenRequest,
+    url: &str,
+) -> Result<()> {
     let thread_id = "internal-browser-smoke";
+    let open = manager.open(thread_id, open_request).await?;
     let navigate = manager.navigate(thread_id, url).await?;
     let snapshot = manager.snapshot(thread_id, Some(120)).await?;
     let screenshot = manager.screenshot(thread_id, None).await?;
     let close = manager.close(thread_id).await?;
 
+    println!(
+        "open: mode={:?} url={} cookies_loaded={}",
+        open.mode, open.url, open.cookies_loaded
+    );
     println!("navigate: {}", navigate.url);
     println!("title: {}", navigate.title);
     println!("snapshot:");
@@ -1021,7 +1176,11 @@ enum BrowserScriptStep {
     Close,
 }
 
-async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> Result<()> {
+async fn run_script_flow(
+    manager: &BrowserSessionManager,
+    steps_file: &Path,
+    default_open_request: BrowserOpenRequest,
+) -> Result<()> {
     let steps_raw = fs::read_to_string(steps_file).with_context(|| {
         format!(
             "failed to read browser script steps file {}",
@@ -1040,11 +1199,33 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
     for (index, step) in steps.iter().enumerate() {
         match step {
             BrowserScriptStep::Navigate { url } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let result = manager.navigate(thread_id, url).await?;
                 println!("step {} navigate: {}", index + 1, result.url);
                 println!("title: {}", result.title);
             }
             BrowserScriptStep::Snapshot { max_elements } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let result = manager.snapshot(thread_id, *max_elements).await?;
                 println!("step {} snapshot:", index + 1);
                 println!("{}", result.snapshot_text);
@@ -1056,6 +1237,17 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
                 );
             }
             BrowserScriptStep::ClickRef { reference } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let result = manager.click_ref(thread_id, reference).await?;
                 println!("step {} click_ref: {}", index + 1, reference);
                 println!("url: {}", result.url);
@@ -1063,6 +1255,17 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
                 println!("opened_new_page: {}", result.opened_new_page);
             }
             BrowserScriptStep::ClickMatch { matcher } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let matched = resolve_element_match(manager, thread_id, matcher).await?;
                 let result = manager.click_ref(thread_id, &matched.reference).await?;
                 println!(
@@ -1086,6 +1289,17 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
                 text,
                 submit,
             } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let result = manager
                     .type_ref(thread_id, reference, text, submit.unwrap_or(false))
                     .await?;
@@ -1100,6 +1314,17 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
                 text,
                 submit,
             } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let matched = resolve_element_match(manager, thread_id, matcher).await?;
                 let result = manager
                     .type_ref(thread_id, &matched.reference, text, submit.unwrap_or(false))
@@ -1119,6 +1344,17 @@ async fn run_script_flow(manager: &BrowserSessionManager, steps_file: &Path) -> 
                 println!("opened_new_page: {}", result.opened_new_page);
             }
             BrowserScriptStep::Screenshot { path } => {
+                if let Some(open) =
+                    ensure_helper_session(manager, thread_id, &default_open_request).await?
+                {
+                    println!(
+                        "step {} open: mode={:?} url={} cookies_loaded={}",
+                        index + 1,
+                        open.mode,
+                        open.url,
+                        open.cookies_loaded
+                    );
+                }
                 let result = manager.screenshot(thread_id, path.as_deref()).await?;
                 println!("step {} screenshot: {}", index + 1, result.path);
             }
@@ -1152,7 +1388,7 @@ async fn run_mock_sidecar() -> Result<()> {
     let stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
     let mut writer = tokio::io::BufWriter::new(stdout);
-    let mut state = MockBrowserState::default();
+    let mut state = MockBrowserState::from_env();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -1162,6 +1398,10 @@ async fn run_mock_sidecar() -> Result<()> {
         let request: BrowserSidecarRequest = serde_json::from_str(&line)
             .with_context(|| format!("failed to parse mock browser sidecar request: {line}"))?;
         let response = match request.payload {
+            BrowserSidecarRequestPayload::Open(open_request) => BrowserSidecarResponse::success(
+                request.id,
+                BrowserSidecarResponsePayload::Open(state.open(open_request)),
+            ),
             BrowserSidecarRequestPayload::Navigate { url } => BrowserSidecarResponse::success(
                 request.id,
                 BrowserSidecarResponsePayload::Navigate(state.navigate(url)),
@@ -1209,11 +1449,31 @@ async fn run_mock_sidecar() -> Result<()> {
                     error.to_string(),
                 ),
             },
+            BrowserSidecarRequestPayload::ExportCookies { path } => {
+                match state.export_cookies(&path) {
+                    Ok(result) => BrowserSidecarResponse::success(
+                        request.id,
+                        BrowserSidecarResponsePayload::ExportCookies(result),
+                    ),
+                    Err(error) => BrowserSidecarResponse::failure(
+                        request.id,
+                        "export_cookies_failed",
+                        error.to_string(),
+                    ),
+                }
+            }
             BrowserSidecarRequestPayload::Close => {
-                let response = BrowserSidecarResponse::success(
-                    request.id,
-                    BrowserSidecarResponsePayload::Close(BrowserCloseResult { closed: true }),
-                );
+                let response = match state.close() {
+                    Ok(result) => BrowserSidecarResponse::success(
+                        request.id,
+                        BrowserSidecarResponsePayload::Close(result),
+                    ),
+                    Err(error) => BrowserSidecarResponse::failure(
+                        request.id,
+                        "close_failed",
+                        error.to_string(),
+                    ),
+                };
                 let encoded = serde_json::to_string(&response)?;
                 writer.write_all(encoded.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
@@ -1231,14 +1491,55 @@ async fn run_mock_sidecar() -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
 struct MockBrowserState {
     current_url: String,
     title: String,
     elements: Vec<BrowserSnapshotElement>,
+    session_mode: Option<BrowserSessionMode>,
+    cookies_state_file: Option<PathBuf>,
+    load_cookies_on_open: bool,
+    save_cookies_on_close: bool,
+    mock_cookie_count: usize,
 }
 
 impl MockBrowserState {
+    fn from_env() -> Self {
+        Self {
+            current_url: String::new(),
+            title: String::new(),
+            elements: Vec::new(),
+            session_mode: None,
+            cookies_state_file: env::var_os("OPENJARVIS_BROWSER_COOKIES_STATE_FILE")
+                .map(PathBuf::from),
+            load_cookies_on_open: read_mock_bool_env("OPENJARVIS_BROWSER_LOAD_COOKIES_ON_OPEN"),
+            save_cookies_on_close: read_mock_bool_env("OPENJARVIS_BROWSER_SAVE_COOKIES_ON_CLOSE"),
+            mock_cookie_count: read_mock_usize_env("OPENJARVIS_BROWSER_MOCK_COOKIE_COUNT"),
+        }
+    }
+
+    fn open(&mut self, request: BrowserOpenRequest) -> BrowserOpenResult {
+        self.session_mode = Some(request.mode);
+        if self.current_url.is_empty() {
+            self.current_url = "about:blank".to_string();
+        }
+        if self.title.is_empty() {
+            self.title = "Untitled".to_string();
+        }
+        let cookies_loaded =
+            if matches!(request.mode, BrowserSessionMode::Launch) && self.load_cookies_on_open {
+                self.load_cookie_count_from_state_file().unwrap_or(0)
+            } else {
+                0
+            };
+
+        BrowserOpenResult {
+            mode: request.mode,
+            url: self.current_url.clone(),
+            title: self.title.clone(),
+            cookies_loaded,
+        }
+    }
+
     fn navigate(&mut self, url: String) -> BrowserNavigateResult {
         self.current_url = url;
         self.title = mock_title(&self.current_url);
@@ -1336,6 +1637,48 @@ impl MockBrowserState {
         })
     }
 
+    fn export_cookies(&self, path: &str) -> Result<super::BrowserCookiesExportResult> {
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let cookies = self.mock_cookies();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "cookies": cookies,
+            })
+            .to_string(),
+        )?;
+        Ok(super::BrowserCookiesExportResult {
+            mode: self.session_mode.unwrap_or(BrowserSessionMode::Launch),
+            path: path.display().to_string(),
+            cookie_count: self.mock_cookie_count,
+        })
+    }
+
+    fn close(&mut self) -> Result<BrowserCloseResult> {
+        let mode = self.session_mode.take();
+        let (exported_cookies_path, exported_cookie_count) =
+            if matches!(mode, Some(BrowserSessionMode::Launch)) && self.save_cookies_on_close {
+                if let Some(path) = self.cookies_state_file.clone() {
+                    let export = self.export_cookies(path.to_string_lossy().as_ref())?;
+                    (Some(export.path), Some(export.cookie_count))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+        Ok(BrowserCloseResult {
+            closed: mode.is_some(),
+            mode,
+            exported_cookies_path,
+            exported_cookie_count,
+        })
+    }
+
     fn ensure_ref(&self, reference: &str) -> Result<()> {
         if self
             .elements
@@ -1363,6 +1706,52 @@ impl MockBrowserState {
             self.title.clone()
         }
     }
+
+    fn load_cookie_count_from_state_file(&self) -> Result<usize> {
+        let Some(path) = &self.cookies_state_file else {
+            return Ok(0);
+        };
+        if !path.exists() {
+            return Ok(0);
+        }
+        let raw = fs::read_to_string(path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+        Ok(parsed
+            .get("cookies")
+            .and_then(|cookies| cookies.as_array())
+            .map(|cookies| cookies.len())
+            .unwrap_or(0))
+    }
+
+    fn mock_cookies(&self) -> Vec<serde_json::Value> {
+        (0..self.mock_cookie_count)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("mock-cookie-{index}"),
+                    "value": format!("value-{index}"),
+                    "domain": "example.com",
+                    "path": "/",
+                    "expires": -1,
+                    "httpOnly": false,
+                    "secure": true,
+                    "sameSite": "Lax",
+                })
+            })
+            .collect()
+    }
+}
+
+fn read_mock_bool_env(name: &str) -> bool {
+    env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn read_mock_usize_env(name: &str) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 fn mock_title(url: &str) -> String {

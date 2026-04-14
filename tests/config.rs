@@ -435,6 +435,68 @@ llm:
 }
 
 #[test]
+fn browser_cookies_state_file_resolves_relative_to_config_root() {
+    let fixture = ConfigFixture::new("openjarvis-browser-cookies-relative-path");
+    fixture.write_yaml(
+        r#"
+agent:
+  tool:
+    browser:
+      cookies_state_file: "runtime/browser/cookies.json"
+      load_cookies_on_open: true
+      save_cookies_on_close: true
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    );
+
+    let config =
+        AppConfig::from_path(fixture.config_path()).expect("browser cookies path should resolve");
+
+    assert_eq!(
+        config
+            .agent_config()
+            .tool_config()
+            .browser_config()
+            .cookies_state_file(),
+        Some(fixture.root.join("runtime/browser/cookies.json").as_path())
+    );
+    assert!(
+        config
+            .agent_config()
+            .tool_config()
+            .browser_config()
+            .load_cookies_on_open()
+    );
+    assert!(
+        config
+            .agent_config()
+            .tool_config()
+            .browser_config()
+            .save_cookies_on_close()
+    );
+}
+
+#[test]
+fn browser_cookie_auto_flags_require_state_file() {
+    let error = AppConfig::from_yaml_str(
+        r#"
+agent:
+  tool:
+    browser:
+      load_cookies_on_open: true
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    )
+    .expect_err("browser cookie auto flags without state file should fail");
+
+    assert!(format!("{error:#}").contains("agent.tool.browser.cookies_state_file is required"));
+}
+
+#[test]
 fn session_memory_backend_parses_from_yaml() {
     let config = AppConfig::from_yaml_str(
         r#"

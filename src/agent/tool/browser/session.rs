@@ -3,8 +3,9 @@
 use super::{
     default_sidecar_script_path,
     protocol::{
-        BrowserActionResult, BrowserNavigateResult, BrowserScreenshotResult, BrowserSnapshotResult,
-        BrowserTypeResult,
+        BrowserActionResult, BrowserCloseResult, BrowserCookiesExportResult, BrowserNavigateResult,
+        BrowserOpenRequest, BrowserOpenResult, BrowserScreenshotResult, BrowserSessionMode,
+        BrowserSnapshotResult, BrowserTypeResult,
     },
     service::{
         BrowserProcessCommandSpec, BrowserRuntimeOptions, BrowserSidecarService,
@@ -19,6 +20,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Filesystem locations allocated for one isolated browser session.
@@ -34,6 +36,9 @@ pub struct BrowserSessionCloseOutcome {
     pub had_session: bool,
     pub kept_artifacts: bool,
     pub artifacts: Option<BrowserSessionArtifacts>,
+    pub session_mode: Option<BrowserSessionMode>,
+    pub auto_exported_path: Option<String>,
+    pub exported_cookie_count: Option<usize>,
 }
 
 /// Configuration shared by all thread-scoped browser sessions.
@@ -90,6 +95,46 @@ impl BrowserSessionManager {
     /// Blocking-friendly helper used by documentation examples and simple assertions.
     pub fn has_session_blocking(&self, thread_id: &str) -> bool {
         self.sessions.blocking_read().contains_key(thread_id)
+    }
+
+    /// Explicitly open or replace the current thread-scoped browser session.
+    pub async fn open(
+        &self,
+        thread_id: &str,
+        request: BrowserOpenRequest,
+    ) -> Result<BrowserOpenResult> {
+        if let Some(previous) = self.sessions.write().await.remove(thread_id) {
+            let _ = self.close_managed_session_arc(thread_id, previous).await?;
+        }
+
+        let mut next_session = self.create_session(thread_id)?;
+        match next_session.service.open(request).await {
+            Ok(result) => {
+                let session = Arc::new(Mutex::new(next_session));
+                self.sessions
+                    .write()
+                    .await
+                    .insert(thread_id.to_string(), session);
+                info!(
+                    thread_id,
+                    mode = ?result.mode,
+                    url = %result.url,
+                    "opened thread-scoped browser session"
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                let cleanup_outcome = self.close_managed_session(thread_id, next_session).await;
+                if let Err(cleanup_error) = cleanup_outcome {
+                    warn!(
+                        thread_id,
+                        error = %cleanup_error,
+                        "failed to cleanup browser session after open error"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Navigate one thread-scoped browser session to the provided URL.
@@ -155,6 +200,27 @@ impl BrowserSessionManager {
         session.service.screenshot(&screenshot_path).await
     }
 
+    /// Export cookies from the current active browser session into one explicit file.
+    pub async fn export_cookies(
+        &self,
+        thread_id: &str,
+        requested_path: &Path,
+    ) -> Result<BrowserCookiesExportResult> {
+        let Some(session) = self.sessions.read().await.get(thread_id).cloned() else {
+            anyhow::bail!("no active browser session for thread `{thread_id}`");
+        };
+        let mut session = session.lock().await;
+        if let Some(parent) = requested_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create browser cookies export directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        session.service.export_cookies(requested_path).await
+    }
+
     /// Close and remove one thread-scoped browser session.
     pub async fn close(&self, thread_id: &str) -> Result<BrowserSessionCloseOutcome> {
         let session = self.sessions.write().await.remove(thread_id);
@@ -163,33 +229,13 @@ impl BrowserSessionManager {
                 had_session: false,
                 kept_artifacts: self.config.runtime.keep_artifacts,
                 artifacts: None,
+                session_mode: None,
+                auto_exported_path: None,
+                exported_cookie_count: None,
             });
         };
 
-        let mut session = session.lock().await;
-        let artifacts = session.artifacts.clone();
-        let _ = session.service.close().await?;
-        drop(session);
-
-        let kept_artifacts = self.config.runtime.keep_artifacts;
-        if !kept_artifacts && artifacts.session_dir.exists() {
-            fs::remove_dir_all(&artifacts.session_dir).with_context(|| {
-                format!(
-                    "failed to remove browser session directory {}",
-                    artifacts.session_dir.display()
-                )
-            })?;
-        }
-
-        Ok(BrowserSessionCloseOutcome {
-            had_session: true,
-            kept_artifacts,
-            artifacts: if kept_artifacts {
-                Some(artifacts)
-            } else {
-                None
-            },
-        })
+        self.close_managed_session_arc(thread_id, session).await
     }
 
     async fn session_for_thread(
@@ -241,6 +287,102 @@ impl BrowserSessionManager {
         ));
 
         Ok(ManagedBrowserSession { artifacts, service })
+    }
+
+    async fn close_managed_session(
+        &self,
+        thread_id: &str,
+        mut session: ManagedBrowserSession,
+    ) -> Result<BrowserSessionCloseOutcome> {
+        let artifacts = session.artifacts.clone();
+        let BrowserCloseResult {
+            closed,
+            mode,
+            exported_cookies_path,
+            exported_cookie_count,
+        } = session.service.close().await?;
+
+        let kept_artifacts = self.config.runtime.keep_artifacts;
+        if !kept_artifacts && artifacts.session_dir.exists() {
+            fs::remove_dir_all(&artifacts.session_dir).with_context(|| {
+                format!(
+                    "failed to remove browser session directory {}",
+                    artifacts.session_dir.display()
+                )
+            })?;
+        }
+
+        info!(
+            thread_id,
+            closed,
+            kept_artifacts,
+            session_mode = ?mode,
+            exported_cookies_path = ?exported_cookies_path,
+            exported_cookie_count = ?exported_cookie_count,
+            "closed thread-scoped browser session"
+        );
+
+        Ok(BrowserSessionCloseOutcome {
+            had_session: true,
+            kept_artifacts,
+            artifacts: if kept_artifacts {
+                Some(artifacts)
+            } else {
+                None
+            },
+            session_mode: mode,
+            auto_exported_path: exported_cookies_path,
+            exported_cookie_count,
+        })
+    }
+
+    async fn close_managed_session_arc(
+        &self,
+        thread_id: &str,
+        session: Arc<Mutex<ManagedBrowserSession>>,
+    ) -> Result<BrowserSessionCloseOutcome> {
+        let mut session = session.lock().await;
+        let artifacts = session.artifacts.clone();
+        let BrowserCloseResult {
+            closed,
+            mode,
+            exported_cookies_path,
+            exported_cookie_count,
+        } = session.service.close().await?;
+        drop(session);
+
+        let kept_artifacts = self.config.runtime.keep_artifacts;
+        if !kept_artifacts && artifacts.session_dir.exists() {
+            fs::remove_dir_all(&artifacts.session_dir).with_context(|| {
+                format!(
+                    "failed to remove browser session directory {}",
+                    artifacts.session_dir.display()
+                )
+            })?;
+        }
+
+        info!(
+            thread_id,
+            closed,
+            kept_artifacts,
+            session_mode = ?mode,
+            exported_cookies_path = ?exported_cookies_path,
+            exported_cookie_count = ?exported_cookie_count,
+            "closed thread-scoped browser session"
+        );
+
+        Ok(BrowserSessionCloseOutcome {
+            had_session: true,
+            kept_artifacts,
+            artifacts: if kept_artifacts {
+                Some(artifacts)
+            } else {
+                None
+            },
+            session_mode: mode,
+            auto_exported_path: exported_cookies_path,
+            exported_cookie_count,
+        })
     }
 }
 

@@ -1,6 +1,9 @@
 use clap::{Parser, error::ErrorKind};
 use openjarvis::{
-    cli::{InternalBrowserCommand, InternalMcpCommand, OpenJarvisCli, SkillCommand},
+    cli::{
+        InternalBrowserCommand, InternalBrowserMode, InternalMcpCommand, OpenJarvisCli,
+        SkillCommand,
+    },
     config::{AgentMcpServerTransportConfig, AppConfig, BUILTIN_MCP_SERVER_NAME},
 };
 
@@ -134,6 +137,47 @@ fn cli_parses_internal_browser_script_command() {
                 &std::path::PathBuf::from("tmp/browser-steps.json")
             );
             assert!(*headless);
+        }
+        other => panic!("unexpected parsed browser command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parses_internal_browser_attach_and_cookie_reuse_flags() {
+    // 测试场景: internal-browser helper 应能解析 attach 与 cookies 复用相关参数。
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-browser",
+        "smoke",
+        "--url",
+        "https://example.com",
+        "--mode",
+        "attach",
+        "--cdp-endpoint",
+        "http://127.0.0.1:9222",
+        "--cookies-state-file",
+        "tmp/browser-cookies.json",
+        "--load-cookies-on-open",
+        "--save-cookies-on-close",
+    ]);
+
+    match cli.internal_browser_command() {
+        Some(InternalBrowserCommand::Smoke {
+            mode,
+            cdp_endpoint,
+            cookies_state_file,
+            load_cookies_on_open,
+            save_cookies_on_close,
+            ..
+        }) => {
+            assert_eq!(*mode, InternalBrowserMode::Attach);
+            assert_eq!(cdp_endpoint.as_deref(), Some("http://127.0.0.1:9222"));
+            assert_eq!(
+                cookies_state_file.as_ref(),
+                Some(&std::path::PathBuf::from("tmp/browser-cookies.json"))
+            );
+            assert!(*load_cookies_on_open);
+            assert!(*save_cookies_on_close);
         }
         other => panic!("unexpected parsed browser command: {other:?}"),
     }

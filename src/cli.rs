@@ -1,6 +1,6 @@
 //! Command-line parsing for the OpenJarvis binary and local protocol helpers.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// Parsed command-line arguments for the main OpenJarvis binary.
@@ -182,6 +182,13 @@ pub struct InternalBrowserArgs {
     pub command: InternalBrowserCommand,
 }
 
+/// Browser open mode used by hidden browser helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InternalBrowserMode {
+    Launch,
+    Attach,
+}
+
 /// Demo-only internal browser helper commands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum InternalBrowserCommand {
@@ -191,6 +198,12 @@ pub enum InternalBrowserCommand {
         /// Target URL used by the smoke flow.
         #[arg(long)]
         url: String,
+        /// Browser session source mode used before the smoke actions run.
+        #[arg(long = "mode", value_enum, default_value_t = InternalBrowserMode::Launch)]
+        mode: InternalBrowserMode,
+        /// Explicit CDP endpoint used when `--mode attach`.
+        #[arg(long)]
+        cdp_endpoint: Option<String>,
         /// Run the browser in headless mode.
         #[arg(long, default_value_t = false)]
         headless: bool,
@@ -206,6 +219,15 @@ pub enum InternalBrowserCommand {
         /// Optional explicit Chrome executable path.
         #[arg(long)]
         chrome_path: Option<PathBuf>,
+        /// Optional cookies state file used by helper-driven browser session reuse.
+        #[arg(long)]
+        cookies_state_file: Option<PathBuf>,
+        /// Auto-load cookies from the configured state file when launch-mode open starts.
+        #[arg(long, default_value_t = false)]
+        load_cookies_on_open: bool,
+        /// Auto-save cookies into the configured state file when close runs.
+        #[arg(long, default_value_t = false)]
+        save_cookies_on_close: bool,
     },
     /// Run a structured multi-step browser script from a JSON file.
     #[command(name = "script")]
@@ -213,6 +235,12 @@ pub enum InternalBrowserCommand {
         /// JSON file containing a list of browser actions to execute in order.
         #[arg(long)]
         steps_file: PathBuf,
+        /// Default browser session source mode used by helper-triggered open.
+        #[arg(long = "mode", value_enum, default_value_t = InternalBrowserMode::Launch)]
+        mode: InternalBrowserMode,
+        /// Explicit CDP endpoint used when `--mode attach`.
+        #[arg(long)]
+        cdp_endpoint: Option<String>,
         /// Run the browser in headless mode.
         #[arg(long, default_value_t = false)]
         headless: bool,
@@ -228,6 +256,15 @@ pub enum InternalBrowserCommand {
         /// Optional explicit Chrome executable path.
         #[arg(long)]
         chrome_path: Option<PathBuf>,
+        /// Optional cookies state file used by helper-driven browser session reuse.
+        #[arg(long)]
+        cookies_state_file: Option<PathBuf>,
+        /// Auto-load cookies from the configured state file when launch-mode open starts.
+        #[arg(long, default_value_t = false)]
+        load_cookies_on_open: bool,
+        /// Auto-save cookies into the configured state file when close runs.
+        #[arg(long, default_value_t = false)]
+        save_cookies_on_close: bool,
     },
     /// Test-only mock sidecar that speaks the same JSON-line protocol as the Node sidecar.
     #[command(name = "mock-sidecar", hide = true)]

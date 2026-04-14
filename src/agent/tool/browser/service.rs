@@ -1,7 +1,8 @@
 //! Sidecar process management and JSON-line transport for browser automation.
 
 use super::protocol::{
-    BrowserActionResult, BrowserCloseResult, BrowserNavigateResult, BrowserScreenshotResult,
+    BrowserActionResult, BrowserCloseResult, BrowserCookiesExportResult, BrowserNavigateResult,
+    BrowserOpenRequest, BrowserOpenResult, BrowserScreenshotResult, BrowserSessionMode,
     BrowserSidecarRequest, BrowserSidecarRequestPayload, BrowserSidecarResponse,
     BrowserSidecarResponsePayload, BrowserSnapshotResult, BrowserTypeResult,
 };
@@ -17,6 +18,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     time::timeout,
 };
+use tracing::{debug, info};
 
 /// Executable command line used to launch one browser sidecar process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,9 @@ pub struct BrowserRuntimeOptions {
     pub headless: bool,
     pub keep_artifacts: bool,
     pub chrome_executable: Option<PathBuf>,
+    pub cookies_state_file: Option<PathBuf>,
+    pub load_cookies_on_open: bool,
+    pub save_cookies_on_close: bool,
     pub launch_timeout_ms: u64,
 }
 
@@ -75,6 +80,9 @@ impl Default for BrowserRuntimeOptions {
             headless: true,
             keep_artifacts: false,
             chrome_executable: None,
+            cookies_state_file: None,
+            load_cookies_on_open: false,
+            save_cookies_on_close: false,
             launch_timeout_ms: 30_000,
         }
     }
@@ -129,6 +137,7 @@ pub struct BrowserSidecarService {
     stdin: Option<ChildStdin>,
     stdout: Option<Lines<BufReader<ChildStdout>>>,
     next_request_id: u64,
+    session_opened: bool,
 }
 
 impl BrowserSidecarService {
@@ -157,6 +166,7 @@ impl BrowserSidecarService {
             stdin: None,
             stdout: None,
             next_request_id: 1,
+            session_opened: false,
         }
     }
 
@@ -165,8 +175,38 @@ impl BrowserSidecarService {
         self.child.is_some()
     }
 
+    /// Return whether the current sidecar already owns one opened browser session.
+    pub fn is_session_open(&self) -> bool {
+        self.session_opened
+    }
+
+    /// Open one browser session explicitly with the provided mode and optional CDP endpoint.
+    pub async fn open(&mut self, request: BrowserOpenRequest) -> Result<BrowserOpenResult> {
+        validate_open_request(&request)?;
+        let result = match self
+            .call(BrowserSidecarRequestPayload::Open(request.clone()))
+            .await?
+        {
+            BrowserSidecarResponsePayload::Open(result) => result,
+            other => bail!(
+                "browser sidecar returned `{}` for open",
+                response_action_name(&other)
+            ),
+        };
+        self.session_opened = true;
+        info!(
+            mode = ?result.mode,
+            url = %result.url,
+            title = %result.title,
+            cookies_loaded = result.cookies_loaded,
+            "opened browser session"
+        );
+        Ok(result)
+    }
+
     /// Navigate the browser session to the provided URL.
     pub async fn navigate(&mut self, url: &str) -> Result<BrowserNavigateResult> {
+        self.ensure_opened_with_default_launch().await?;
         match self
             .call(BrowserSidecarRequestPayload::Navigate {
                 url: url.to_string(),
@@ -183,6 +223,7 @@ impl BrowserSidecarService {
 
     /// Capture the current browser snapshot and element refs.
     pub async fn snapshot(&mut self, max_elements: Option<usize>) -> Result<BrowserSnapshotResult> {
+        self.ensure_opened_with_default_launch().await?;
         match self
             .call(BrowserSidecarRequestPayload::Snapshot { max_elements })
             .await?
@@ -197,6 +238,7 @@ impl BrowserSidecarService {
 
     /// Click one element ref produced by a prior snapshot.
     pub async fn click_ref(&mut self, reference: &str) -> Result<BrowserActionResult> {
+        self.ensure_opened_with_default_launch().await?;
         match self
             .call(BrowserSidecarRequestPayload::ClickRef {
                 reference: reference.to_string(),
@@ -218,6 +260,7 @@ impl BrowserSidecarService {
         text: &str,
         submit: bool,
     ) -> Result<BrowserTypeResult> {
+        self.ensure_opened_with_default_launch().await?;
         match self
             .call(BrowserSidecarRequestPayload::TypeRef {
                 reference: reference.to_string(),
@@ -236,6 +279,7 @@ impl BrowserSidecarService {
 
     /// Write a screenshot to the provided absolute or relative file path.
     pub async fn screenshot(&mut self, path: &Path) -> Result<BrowserScreenshotResult> {
+        self.ensure_opened_with_default_launch().await?;
         match self
             .call(BrowserSidecarRequestPayload::Screenshot {
                 path: path.display().to_string(),
@@ -250,16 +294,59 @@ impl BrowserSidecarService {
         }
     }
 
+    /// Export cookies from the current opened browser session into the provided path.
+    pub async fn export_cookies(&mut self, path: &Path) -> Result<BrowserCookiesExportResult> {
+        if !self.session_opened {
+            bail!("browser session is not open");
+        }
+        match self
+            .call(BrowserSidecarRequestPayload::ExportCookies {
+                path: path.display().to_string(),
+            })
+            .await?
+        {
+            BrowserSidecarResponsePayload::ExportCookies(result) => {
+                info!(
+                    mode = ?result.mode,
+                    path = %result.path,
+                    cookie_count = result.cookie_count,
+                    "exported browser cookies"
+                );
+                Ok(result)
+            }
+            other => bail!(
+                "browser sidecar returned `{}` for export_cookies",
+                response_action_name(&other)
+            ),
+        }
+    }
+
     /// Close the browser sidecar session and wait for the child process to exit.
     pub async fn close(&mut self) -> Result<BrowserCloseResult> {
         if !self.is_started() {
-            return Ok(BrowserCloseResult { closed: false });
+            return Ok(BrowserCloseResult {
+                closed: false,
+                mode: None,
+                exported_cookies_path: None,
+                exported_cookie_count: None,
+            });
         }
 
         let response = self.call(BrowserSidecarRequestPayload::Close).await;
         let _ = self.shutdown_process().await;
         match response? {
-            BrowserSidecarResponsePayload::Close(result) => Ok(result),
+            BrowserSidecarResponsePayload::Close(result) => {
+                self.session_opened = false;
+                if result.closed {
+                    info!(
+                        mode = ?result.mode,
+                        exported_cookies_path = ?result.exported_cookies_path,
+                        exported_cookie_count = ?result.exported_cookie_count,
+                        "closed browser session"
+                    );
+                }
+                Ok(result)
+            }
             other => bail!(
                 "browser sidecar returned `{}` for close",
                 response_action_name(&other)
@@ -276,6 +363,11 @@ impl BrowserSidecarService {
         let request_id = format!("browser-{}", self.next_request_id);
         self.next_request_id += 1;
         let request = BrowserSidecarRequest::new(request_id.clone(), payload);
+        debug!(
+            request_id = %request_id,
+            action = %request_action_name(&request.payload),
+            "sending browser sidecar request"
+        );
         let encoded = serde_json::to_string(&request)
             .context("failed to serialize browser sidecar request")?;
 
@@ -315,15 +407,35 @@ impl BrowserSidecarService {
         }
 
         if response.ok {
-            response
+            let result = response
                 .result
-                .context("browser sidecar returned `ok=true` without a result payload")
+                .context("browser sidecar returned `ok=true` without a result payload")?;
+            debug!(
+                request_id = %request_id,
+                action = %response_action_name(&result),
+                "received browser sidecar success response"
+            );
+            Ok(result)
         } else {
             let error = response
                 .error
                 .context("browser sidecar returned `ok=false` without an error payload")?;
+            debug!(
+                request_id = %request_id,
+                error_code = %error.code,
+                error_message = %error.message,
+                "browser sidecar returned error response"
+            );
             bail!("browser sidecar `{}`: {}", error.code, error.message);
         }
+    }
+
+    async fn ensure_opened_with_default_launch(&mut self) -> Result<()> {
+        if self.session_opened {
+            return Ok(());
+        }
+        let _ = self.open(BrowserOpenRequest::launch()).await?;
+        Ok(())
     }
 
     async fn ensure_started(&mut self) -> Result<()> {
@@ -375,6 +487,28 @@ impl BrowserSidecarService {
                 chrome_executable.display().to_string(),
             );
         }
+        if let Some(cookies_state_file) = &self.config.runtime.cookies_state_file {
+            command.env(
+                "OPENJARVIS_BROWSER_COOKIES_STATE_FILE",
+                cookies_state_file.display().to_string(),
+            );
+        }
+        command.env(
+            "OPENJARVIS_BROWSER_LOAD_COOKIES_ON_OPEN",
+            if self.config.runtime.load_cookies_on_open {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        command.env(
+            "OPENJARVIS_BROWSER_SAVE_COOKIES_ON_CLOSE",
+            if self.config.runtime.save_cookies_on_close {
+                "1"
+            } else {
+                "0"
+            },
+        );
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -423,11 +557,47 @@ impl BrowserSidecarService {
 
 fn response_action_name(payload: &BrowserSidecarResponsePayload) -> &'static str {
     match payload {
+        BrowserSidecarResponsePayload::Open(_) => "open",
         BrowserSidecarResponsePayload::Navigate(_) => "navigate",
         BrowserSidecarResponsePayload::Snapshot(_) => "snapshot",
         BrowserSidecarResponsePayload::ClickRef(_) => "click_ref",
         BrowserSidecarResponsePayload::TypeRef(_) => "type_ref",
         BrowserSidecarResponsePayload::Screenshot(_) => "screenshot",
+        BrowserSidecarResponsePayload::ExportCookies(_) => "export_cookies",
         BrowserSidecarResponsePayload::Close(_) => "close",
     }
+}
+
+fn request_action_name(payload: &BrowserSidecarRequestPayload) -> &'static str {
+    match payload {
+        BrowserSidecarRequestPayload::Open(_) => "open",
+        BrowserSidecarRequestPayload::Navigate { .. } => "navigate",
+        BrowserSidecarRequestPayload::Snapshot { .. } => "snapshot",
+        BrowserSidecarRequestPayload::ClickRef { .. } => "click_ref",
+        BrowserSidecarRequestPayload::TypeRef { .. } => "type_ref",
+        BrowserSidecarRequestPayload::Screenshot { .. } => "screenshot",
+        BrowserSidecarRequestPayload::ExportCookies { .. } => "export_cookies",
+        BrowserSidecarRequestPayload::Close => "close",
+    }
+}
+
+fn validate_open_request(request: &BrowserOpenRequest) -> Result<()> {
+    match request.mode {
+        BrowserSessionMode::Launch => {
+            if request.cdp_endpoint.is_some() {
+                bail!("browser launch mode does not accept `cdp_endpoint`");
+            }
+        }
+        BrowserSessionMode::Attach => {
+            if request
+                .cdp_endpoint
+                .as_deref()
+                .map(|cdp_endpoint| cdp_endpoint.trim().is_empty())
+                .unwrap_or(true)
+            {
+                bail!("browser attach mode requires a non-empty `cdp_endpoint`");
+            }
+        }
+    }
+    Ok(())
 }

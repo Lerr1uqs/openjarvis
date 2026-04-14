@@ -10,6 +10,7 @@
 //! enter the persisted session history.
 
 use crate::{
+    agent::ToolRegistry,
     compact::{ContextBudgetEstimator, ContextBudgetReport},
     config::{AppConfig, try_global_config},
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
@@ -18,8 +19,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, path::Path, sync::Arc};
 use tracing::info;
 
 const CONTEXT_MESSAGE_PREVIEW_LIMIT: usize = 48;
@@ -266,21 +266,19 @@ impl CommandRegistry {
     /// ```
     pub fn with_builtin_commands() -> Self {
         let mut registry = Self::new();
+        registry.register_standard_builtin_commands();
         registry
-            .register("test", Arc::new(TestCommand))
-            .expect("built-in test command should register");
+    }
+
+    /// Create a registry with the standard built-in commands plus tool-aware browser commands.
+    pub fn with_builtin_commands_and_tools(tools: Arc<ToolRegistry>) -> Self {
+        let mut registry = Self::with_builtin_commands();
         registry
-            .register("equal", Arc::new(EqualCommand))
-            .expect("built-in equal command should register");
-        registry
-            .register("echo", Arc::new(EchoCommand))
-            .expect("built-in echo command should register");
-        registry
-            .register("context", Arc::new(ContextCommand))
-            .expect("built-in context command should register");
-        registry
-            .register("clear", Arc::new(ClearCommand))
-            .expect("built-in clear command should register");
+            .register(
+                "browser-export-cookies",
+                Arc::new(BrowserExportCookiesCommand::new(tools)),
+            )
+            .expect("built-in browser-export-cookies command should register");
         registry
     }
 
@@ -294,6 +292,19 @@ impl CommandRegistry {
     /// ```
     pub fn is_empty(&self) -> bool {
         self.handlers.is_empty()
+    }
+
+    fn register_standard_builtin_commands(&mut self) {
+        self.register("test", Arc::new(TestCommand))
+            .expect("built-in test command should register");
+        self.register("equal", Arc::new(EqualCommand))
+            .expect("built-in equal command should register");
+        self.register("echo", Arc::new(EchoCommand))
+            .expect("built-in echo command should register");
+        self.register("context", Arc::new(ContextCommand))
+            .expect("built-in context command should register");
+        self.register("clear", Arc::new(ClearCommand))
+            .expect("built-in clear command should register");
     }
 
     /// Register one command handler under a normalized slash command name.
@@ -596,6 +607,64 @@ impl CommandHandler for ClearCommand {
             format!(
                 "cleared current thread `{}`; all chat messages and thread-scoped runtime state have been reset",
                 thread_context.locator.external_thread_id
+            ),
+        ))
+    }
+}
+
+struct BrowserExportCookiesCommand {
+    tools: Arc<ToolRegistry>,
+}
+
+impl BrowserExportCookiesCommand {
+    fn new(tools: Arc<ToolRegistry>) -> Self {
+        Self { tools }
+    }
+
+    fn usage(name: &str) -> CommandReply {
+        CommandReply::failed(name, "usage: /browser-export-cookies <path>")
+    }
+}
+
+#[async_trait]
+impl CommandHandler for BrowserExportCookiesCommand {
+    fn requires_idle_thread(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        invocation: &CommandInvocation,
+        _incoming: &IncomingMessage,
+        thread_context: &mut Thread,
+    ) -> Result<CommandReply> {
+        if invocation.raw_arguments().trim().is_empty() {
+            return Ok(Self::usage(invocation.name()));
+        }
+
+        let Some(manager) = self.tools.browser_session_manager().await else {
+            return Ok(CommandReply::failed(
+                invocation.name(),
+                "browser runtime is not registered in the current process",
+            ));
+        };
+
+        let export_path = Path::new(invocation.raw_arguments().trim());
+        let result = manager
+            .export_cookies(&thread_context.locator.thread_id, export_path)
+            .await?;
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            external_thread_id = %thread_context.locator.external_thread_id,
+            export_path = %result.path,
+            cookie_count = result.cookie_count,
+            "exported browser cookies by slash command"
+        );
+        Ok(CommandReply::success(
+            invocation.name(),
+            format!(
+                "exported {} cookies to {}",
+                result.cookie_count, result.path
             ),
         ))
     }
