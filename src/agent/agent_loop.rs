@@ -16,7 +16,7 @@ use crate::{
     config::{AgentCompactConfig, LLMConfig},
     llm::{LLMProvider, LLMRequest},
     model::{IncomingMessage, ReplyTarget},
-    thread::{Thread, ThreadToolEvent, ThreadToolEventKind},
+    thread::Thread,
 };
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -34,7 +34,6 @@ pub enum AgentLoopEventKind {
     TextOutput,
     ToolCall,
     ToolResult,
-    Compact,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -684,11 +683,9 @@ impl AgentLoop {
                         ),
                         "agent loop starting tool call"
                     );
-
-                    let tool_result = if tool_call.name == "compact" {
-                        self.handle_model_requested_compact(
+                    let tool_result = self
+                        .call_thread_tool(
                             &hooks,
-                            &thread_id,
                             &mut thread_context,
                             &tool_call,
                             &provider_tool_call.id,
@@ -696,62 +693,18 @@ impl AgentLoop {
                             ut_probe,
                             loop_iteration,
                         )
-                        .await?
-                    } else {
-                        let tool_result =
-                            match self.call_thread_tool(&mut thread_context, &tool_call).await {
-                                Ok(result) => {
-                                    hooks
-                                        .emit(HookEvent {
-                                            kind: HookEventKind::PostToolUse,
-                                            payload: json!({
-                                                "tool": tool_call.name.clone(),
-                                                "result": result.metadata.clone(),
-                                            }),
-                                        })
-                                        .await?;
-                                    result
-                                }
-                                Err(error) => {
-                                    hooks
-                                        .emit(HookEvent {
-                                            kind: HookEventKind::PostToolUseFailure,
-                                            payload: json!({
-                                                "tool": tool_call.name.clone(),
-                                                "error": error.to_string(),
-                                            }),
-                                        })
-                                        .await?;
-                                    super::ToolCallResult {
-                                        content: error.to_string(),
-                                        metadata: json!({
-                                            "tool": tool_call.name.clone(),
-                                        }),
-                                        is_error: true,
-                                    }
-                                }
-                            };
-                        thread_context
-                            .append_tool_event(build_thread_tool_event(
-                            &tool_call,
-                            &provider_tool_call.id,
-                            &tool_result,
-                        ))
                         .await?;
-                        info!(
-                            thread_id = %thread_id,
-                            tool_name = %tool_call.name,
-                            tool_call_id = %provider_tool_call.id,
-                            is_error = tool_result.is_error,
-                            result_preview = %truncate_tool_log_preview(
-                                &tool_result.content,
-                                TOOL_LOG_PREVIEW_MAX_CHARS,
-                            ),
-                            "agent loop completed tool call"
-                        );
-
-                        tool_result
-                    };
+                    info!(
+                        thread_id = %thread_id,
+                        tool_name = %tool_call.name,
+                        tool_call_id = %provider_tool_call.id,
+                        is_error = tool_result.is_error,
+                        result_preview = %truncate_tool_log_preview(
+                            &tool_result.content,
+                            TOOL_LOG_PREVIEW_MAX_CHARS,
+                        ),
+                        "agent loop completed tool call"
+                    );
 
                     let tool_result_message = ChatMessage::new(
                         ChatMessageRole::ToolResult,
@@ -934,12 +887,68 @@ impl AgentLoop {
 
     async fn call_thread_tool(
         &self,
+        hooks: &Arc<super::HookRegistry>,
         thread_context: &mut Thread,
         tool_call: &ToolCallRequest,
+        tool_call_id: &str,
+        budget_report: &ContextBudgetReport,
+        ut_probe: &mut AgentLoopUTProberHandle<'_>,
+        loop_iteration: usize,
     ) -> Result<super::ToolCallResult> {
-        self.runtime
+        if tool_call.name == "compact" {
+            let thread_id = thread_context.locator.thread_id.clone();
+            return self
+                .handle_model_requested_compact(
+                    hooks,
+                    &thread_id,
+                    thread_context,
+                    tool_call,
+                    tool_call_id,
+                    budget_report,
+                    ut_probe,
+                    loop_iteration,
+                )
+                .await;
+        }
+
+        let tool_result = match self
+            .runtime
             .call_tool(thread_context, tool_call.clone())
             .await
+        {
+            Ok(result) => {
+                hooks
+                    .emit(HookEvent {
+                        kind: HookEventKind::PostToolUse,
+                        payload: json!({
+                            "tool": tool_call.name.clone(),
+                            "result": result.metadata.clone(),
+                        }),
+                    })
+                    .await?;
+                result
+            }
+            Err(error) => {
+                hooks
+                    .emit(HookEvent {
+                        kind: HookEventKind::PostToolUseFailure,
+                        payload: json!({
+                            "tool": tool_call.name.clone(),
+                            "error": error.to_string(),
+                        }),
+                    })
+                    .await?;
+                super::ToolCallResult {
+                    content: error.to_string(),
+                    metadata: json!({
+                        "tool": tool_call.name.clone(),
+                    }),
+                    is_error: true,
+                }
+            }
+        };
+
+        Ok(tool_result)
     }
 
     async fn execute_turn_compaction(
@@ -1018,24 +1027,6 @@ impl AgentLoop {
                     }),
                 })
                 .await?;
-            thread_context
-                .append_tool_event(build_compact_thread_tool_event(
-                    tool_call,
-                    tool_call_id,
-                    build_compact_event(
-                        "tool_requested",
-                        true,
-                        true,
-                        budget_report,
-                        None,
-                        Some(tool_call_id),
-                        Some(&error_message),
-                    )
-                    .metadata
-                    .clone(),
-                    true,
-                ))
-                .await?;
             let result = super::ToolCallResult {
                 content: error_message.clone(),
                 metadata: json!({
@@ -1077,7 +1068,7 @@ impl AgentLoop {
                         payload: json!({
                             "tool": tool_call.name.clone(),
                             "result": outcome.as_ref().map(|value| {
-                                build_compact_event(
+                                build_compact_metadata(
                                     "tool_requested",
                                     true,
                                     false,
@@ -1086,32 +1077,9 @@ impl AgentLoop {
                                     Some(tool_call_id),
                                     None,
                                 )
-                                .metadata
                             }),
                         }),
                     })
-                    .await?;
-                thread_context
-                    .append_tool_event(build_compact_thread_tool_event(
-                        tool_call,
-                        tool_call_id,
-                        outcome
-                            .as_ref()
-                            .map(|value| {
-                                build_compact_event(
-                                    "tool_requested",
-                                    true,
-                                    false,
-                                    budget_report,
-                                    Some(value),
-                                    Some(tool_call_id),
-                                    None,
-                                )
-                                .metadata
-                            })
-                            .unwrap_or_else(default_compact_event_metadata),
-                        false,
-                    ))
                     .await?;
                 ut_probe.on_compact(AgentLoopUTCompactSnapshot {
                     iteration: loop_iteration,
@@ -1150,28 +1118,10 @@ impl AgentLoop {
                     .emit(HookEvent {
                         kind: HookEventKind::PostToolUseFailure,
                         payload: json!({
-                            "tool": tool_call.name.clone(),
-                            "error": error_message.clone(),
+                                "tool": tool_call.name.clone(),
+                                "error": error_message.clone(),
                         }),
                     })
-                    .await?;
-                thread_context
-                    .append_tool_event(build_compact_thread_tool_event(
-                        tool_call,
-                        tool_call_id,
-                        build_compact_event(
-                            "tool_requested",
-                            true,
-                            true,
-                            budget_report,
-                            None,
-                            Some(tool_call_id),
-                            Some(&error_message),
-                        )
-                        .metadata
-                        .clone(),
-                        true,
-                    ))
                     .await?;
                 ut_probe.on_compact(AgentLoopUTCompactSnapshot {
                     iteration: loop_iteration,
@@ -1373,7 +1323,7 @@ fn truncate_text_with_total_chars(content: &str, max_chars: usize) -> String {
     format!("{truncated}...(truncated, total_chars={char_count})")
 }
 
-fn build_compact_event(
+fn build_compact_metadata(
     reason: &str,
     requested_by_model: bool,
     is_error: bool,
@@ -1381,41 +1331,20 @@ fn build_compact_event(
     outcome: Option<&MessageCompactionOutcome>,
     tool_call_id: Option<&str>,
     error: Option<&str>,
-) -> AgentLoopEvent {
+) -> Value {
     let compacted = outcome.is_some() && !is_error;
-    let content = if let Some(error) = error {
-        format!("[openjarvis][compact] failed: {error}")
-    } else if let Some(outcome) = outcome {
-        format!(
-            "[openjarvis][compact] compacted {} messages from current chat history",
-            outcome.source_message_count
-        )
-    } else {
-        "[openjarvis][compact] no chat history was available to compact".to_string()
-    };
-
-    AgentLoopEvent {
-        kind: AgentLoopEventKind::Compact,
-        content,
-        metadata: json!({
-            "event_kind": "compact",
-            "reason": reason,
-            "requested_by_model": requested_by_model,
-            "compacted": compacted,
-            "is_error": is_error,
-            "tool_call_id": tool_call_id,
-            "source_message_count": outcome.map(|value| value.source_message_count),
-            "after_message_count": outcome.map(|value| value.compacted_messages.len()),
-            "summary_preview": outcome.map(|value| value.summary.compacted_assistant.clone()),
-            "budget_report": budget_report,
-            "error": error,
-        }),
-    }
-}
-
-fn default_compact_event_metadata() -> Value {
     json!({
         "event_kind": "compact",
+        "reason": reason,
+        "requested_by_model": requested_by_model,
+        "compacted": compacted,
+        "is_error": is_error,
+        "tool_call_id": tool_call_id,
+        "source_message_count": outcome.map(|value| value.source_message_count),
+        "after_message_count": outcome.map(|value| value.compacted_messages.len()),
+        "summary_preview": outcome.map(|value| value.summary.compacted_assistant.clone()),
+        "budget_report": budget_report,
+        "error": error,
     })
 }
 
@@ -1425,43 +1354,6 @@ fn incoming_message(incoming: &IncomingMessage) -> ChatMessage {
         incoming.content.clone(),
         incoming.received_at,
     )
-}
-
-fn build_thread_tool_event(
-    tool_call: &ToolCallRequest,
-    tool_call_id: &str,
-    tool_result: &super::ToolCallResult,
-) -> ThreadToolEvent {
-    let event_kind = match tool_result.metadata["event_kind"].as_str() {
-        Some("load_toolset") => ThreadToolEventKind::LoadToolset,
-        Some("unload_toolset") => ThreadToolEventKind::UnloadToolset,
-        _ => ThreadToolEventKind::ExecuteTool,
-    };
-    let mut event = ThreadToolEvent::new(event_kind, Utc::now());
-    event.toolset_name = tool_result.metadata["toolset"]
-        .as_str()
-        .map(|name| name.to_string());
-    event.tool_name = Some(tool_call.name.clone());
-    event.tool_call_id = Some(tool_call_id.to_string());
-    event.arguments = Some(tool_call.arguments.clone());
-    event.metadata = tool_result.metadata.clone();
-    event.is_error = tool_result.is_error;
-    event
-}
-
-fn build_compact_thread_tool_event(
-    tool_call: &ToolCallRequest,
-    tool_call_id: &str,
-    metadata: Value,
-    is_error: bool,
-) -> ThreadToolEvent {
-    let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, Utc::now());
-    event.tool_name = Some(tool_call.name.clone());
-    event.tool_call_id = Some(tool_call_id.to_string());
-    event.arguments = Some(tool_call.arguments.clone());
-    event.metadata = metadata;
-    event.is_error = is_error;
-    event
 }
 
 fn build_compact_provider(

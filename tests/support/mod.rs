@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
-    thread::{Thread, ThreadToolEvent},
+    thread::Thread,
 };
 
 pub trait ThreadTestExt {
@@ -16,7 +16,6 @@ pub trait ThreadTestExt {
         &mut self,
         messages: Vec<ChatMessage>,
         loaded_toolsets: Vec<String>,
-        tool_events: Vec<ThreadToolEvent>,
     );
     fn append_unpersisted_message_for_test(&mut self, message: ChatMessage) -> Result<()>;
 }
@@ -65,10 +64,8 @@ impl ThreadTestExt for Thread {
         &mut self,
         messages: Vec<ChatMessage>,
         loaded_toolsets: Vec<String>,
-        tool_events: Vec<ThreadToolEvent>,
     ) {
         self.replace_loaded_toolsets(loaded_toolsets);
-        self.state.tools.tool_events.extend(tool_events);
         for message in messages {
             append_message_without_persist(self, message);
         }

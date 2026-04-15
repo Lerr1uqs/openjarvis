@@ -8,10 +8,7 @@ use openjarvis::{
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
     model::{IncomingMessage, ReplyTarget},
-    thread::{
-        Feature, Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
-        derive_internal_thread_id,
-    },
+    thread::{Feature, Thread, ThreadContextLocator, derive_internal_thread_id},
 };
 use serde_json::json;
 use support::ThreadTestExt;
@@ -192,8 +189,6 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
     let registry = CommandRegistry::with_builtin_commands();
     let now = Utc::now();
     let mut thread_context = build_thread_context();
-    let mut load_event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
-    load_event.toolset_name = Some("demo".to_string());
     thread_context.seed_persisted_messages(vec![ChatMessage::new(
         ChatMessageRole::System,
         "system prompt",
@@ -207,12 +202,10 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
             now,
         )],
         vec!["demo".to_string()],
-        vec![load_event],
     );
 
     let messages_before = thread_context.messages();
     let toolsets_before = thread_context.load_toolsets();
-    let tool_events_before = thread_context.load_tool_events();
     let auto_compact_before = thread_context.auto_compact_enabled(false);
 
     registry
@@ -233,7 +226,6 @@ async fn builtin_context_commands_do_not_mutate_thread_state() {
 
     assert_eq!(thread_context.messages(), messages_before);
     assert_eq!(thread_context.load_toolsets(), toolsets_before);
-    assert_eq!(thread_context.load_tool_events(), tool_events_before);
     assert_eq!(
         thread_context.auto_compact_enabled(false),
         auto_compact_before
@@ -285,12 +277,6 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
     let incoming = build_incoming("/clear");
     let now = Utc::now();
     let mut thread_context = build_thread_context();
-    let event = {
-        let mut event = ThreadToolEvent::new(ThreadToolEventKind::LoadToolset, now);
-        event.toolset_name = Some("demo".to_string());
-        event.tool_name = Some("load_toolset".to_string());
-        event
-    };
     thread_context.enable_feature(Feature::AutoCompact);
     thread_context.append_persisted_messages_with_state_for_test(
         vec![openjarvis::context::ChatMessage::new(
@@ -299,7 +285,6 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
             now,
         )],
         vec!["demo".to_string()],
-        vec![event],
     );
 
     let reply = registry
@@ -314,7 +299,6 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
     );
     assert!(thread_context.non_system_messages().is_empty());
     assert!(thread_context.load_toolsets().is_empty());
-    assert!(thread_context.load_tool_events().is_empty());
     assert!(!thread_context.auto_compact_enabled(false));
 }
 

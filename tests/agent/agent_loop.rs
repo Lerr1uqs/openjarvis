@@ -116,8 +116,8 @@ async fn agent_loop_returns_success_output_without_turn_payload() {
 }
 
 #[tokio::test]
-async fn agent_loop_persists_tool_audit_without_request_finalize() {
-    // 测试场景: tool audit 在工具调用成功后立即进入线程正式状态。
+async fn agent_loop_emits_tool_messages_without_persisting_tool_audit_state() {
+    // 测试场景: 工具调用结果应直接写入正式消息序列，而不是额外堆积线程级 tool audit 状态。
     let incoming = build_incoming("hello");
     let runtime = AgentRuntime::new();
     runtime
@@ -165,10 +165,18 @@ async fn agent_loop_persists_tool_audit_without_request_finalize() {
 
     assert_eq!(reply, "tool finished");
     assert!(succeeded);
-    assert_eq!(thread.load_tool_events().len(), 1);
     assert_eq!(
-        thread.load_tool_events()[0].tool_name.as_deref(),
-        Some("demo__echo")
+        thread
+            .messages()
+            .into_iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>(),
+        vec![
+            ChatMessageRole::User,
+            ChatMessageRole::Toolcall,
+            ChatMessageRole::ToolResult,
+            ChatMessageRole::Assistant,
+        ]
     );
 }
 

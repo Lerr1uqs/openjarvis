@@ -2,10 +2,7 @@ use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     session::{MemorySessionStore, SessionStore, ThreadLocator},
-    thread::{
-        Feature, Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind,
-        derive_internal_thread_id,
-    },
+    thread::{Feature, Thread, ThreadContextLocator, derive_internal_thread_id},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -126,40 +123,6 @@ async fn compact_rewrite_replaces_non_system_messages_in_store() {
 }
 
 #[tokio::test]
-async fn append_tool_event_persists_without_request_finalization() {
-    // 测试场景: tool audit 在记录成功后立即进入正式线程状态，不依赖 request finalize。
-    let incoming = build_incoming();
-    let locator = build_locator(&incoming);
-    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-    store
-        .initialize_schema()
-        .await
-        .expect("memory store schema should initialize");
-
-    let mut thread = Thread::new(ThreadContextLocator::from(&locator), incoming.received_at);
-    thread.bind_store(store.clone());
-    let mut event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, incoming.received_at);
-    event.tool_name = Some("demo_tool".to_string());
-    thread
-        .append_tool_event(event)
-        .await
-        .expect("tool audit should persist");
-
-    let stored = store
-        .load_thread_context(&locator)
-        .await
-        .expect("stored thread should load")
-        .expect("stored thread should exist");
-    assert_eq!(stored.snapshot.state.tools.tool_events.len(), 1);
-    assert_eq!(
-        stored.snapshot.state.tools.tool_events[0]
-            .tool_name
-            .as_deref(),
-        Some("demo_tool")
-    );
-}
-
-#[tokio::test]
 async fn feature_override_persists_without_request_finalization() {
     // 测试场景: feature state 变更也必须走 thread-owned 原子持久化，不依赖 request finalize。
     let incoming = build_incoming();
@@ -198,11 +161,21 @@ async fn compact_source_messages_exclude_stable_system_prefix() {
     // 测试场景: runtime compact 只能消费非 system 正式消息，稳定前缀不能进入 compact source。
     let now = Utc::now();
     let mut thread = Thread::new(
-        ThreadContextLocator::new(None, "feishu", "ou_thread", "thread_compact", "thread_compact"),
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_thread",
+            "thread_compact",
+            "thread_compact",
+        ),
         now,
     );
     thread
-        .push_message(ChatMessage::new(ChatMessageRole::System, "system prompt", now))
+        .push_message(ChatMessage::new(
+            ChatMessageRole::System,
+            "system prompt",
+            now,
+        ))
         .await
         .expect("system prompt should persist");
     thread

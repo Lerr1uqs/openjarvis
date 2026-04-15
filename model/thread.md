@@ -23,7 +23,7 @@
 - `PersistedThreadSnapshot`
   线程正式持久化事实，包含持久化消息序列、线程状态和 revision。
 - `ThreadState`
-  线程级 feature flags、loaded toolsets、tool event、approval 状态。
+  线程级 feature flags、loaded toolsets、approval 状态。(一定是需要重载回复的状态才进行持久化)
 - `ActiveRequestState`
   线程内部的请求期临时状态，不持久化、不对外暴露。
 
@@ -59,7 +59,7 @@
 
 - 根据 `channel + user_id + external_thread_id` 派生稳定 `thread_id`。
 - 以 message 为最小持久化单位保存线程历史。
-- 以同样的原子写入模型持久化线程级 toolset 状态和 tool event 审计信息。
+- 以同样的原子写入模型持久化线程级 toolset 状态。
 - 在清空线程时保留线程身份，只重置消息和线程状态。
 
 ## 验收标准

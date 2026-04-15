@@ -1,9 +1,8 @@
 //! Thread-first aggregate model and atomic thread-owned persistence helpers.
 
 use crate::agent::{
-    FeatureResolver, MemoryRepository, ShellEnv, ToolCallRequest,
-    ToolCallResult, ToolDefinition, ToolRegistry,
-    feature,
+    FeatureResolver, MemoryRepository, ShellEnv, ToolCallRequest, ToolCallResult, ToolDefinition,
+    ToolRegistry, feature,
 };
 use crate::config::{AgentCompactConfig, try_global_config};
 use crate::context::{ChatMessage, ChatMessageRole};
@@ -102,7 +101,6 @@ impl Feature {
             Self::AutoCompact => "auto_compact",
         }
     }
-
 }
 
 /// Stable ordered thread feature set persisted as thread state truth.
@@ -125,11 +123,7 @@ impl Features {
     /// assert!(features.contains(Feature::AutoCompact));
     /// ```
     pub fn all() -> Self {
-        Self::from_iter([
-            Feature::Memory,
-            Feature::Skill,
-            Feature::AutoCompact,
-        ])
+        Self::from_iter([Feature::Memory, Feature::Skill, Feature::AutoCompact])
     }
 
     /// Return whether the target feature is enabled in this set.
@@ -194,59 +188,6 @@ impl<'a> IntoIterator for &'a Features {
 
     fn into_iter(self) -> Self::IntoIter {
         self.enabled.iter().copied()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ThreadToolEventKind {
-    LoadToolset,
-    UnloadToolset,
-    ExecuteTool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ThreadToolEvent {
-    pub id: Uuid,
-    pub kind: ThreadToolEventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolset_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<Value>,
-    #[serde(default = "default_tool_event_metadata")]
-    pub metadata: Value,
-    #[serde(default)]
-    pub is_error: bool,
-    pub recorded_at: DateTime<Utc>,
-}
-
-impl ThreadToolEvent {
-    /// Create one structured thread tool event.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// use chrono::Utc;
-    /// use openjarvis::thread::{ThreadToolEvent, ThreadToolEventKind};
-    ///
-    /// let event = ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, Utc::now());
-    /// assert_eq!(event.kind, ThreadToolEventKind::ExecuteTool);
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
-    pub fn new(kind: ThreadToolEventKind, recorded_at: DateTime<Utc>) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            kind,
-            toolset_name: None,
-            tool_name: None,
-            tool_call_id: None,
-            arguments: None,
-            metadata: default_tool_event_metadata(),
-            is_error: false,
-            recorded_at,
-        }
     }
 }
 
@@ -339,8 +280,6 @@ pub struct ThreadFeatureState {
 pub struct ThreadToolState {
     #[serde(default)]
     pub loaded_toolsets: Vec<String>,
-    #[serde(default)]
-    pub tool_events: Vec<ThreadToolEvent>,
 }
 
 /// One pending approval request reserved for future thread-scoped policy flows.
@@ -541,7 +480,9 @@ impl ThreadRuntime {
             return persisted_features;
         }
 
-        let resolved = self.feature_resolver.resolve_for_locator(&thread_context.locator);
+        let resolved = self
+            .feature_resolver
+            .resolve_for_locator(&thread_context.locator);
         info!(
             thread_id = %thread_context.locator.thread_id,
             enabled_features = ?resolved.names(),
@@ -655,11 +596,7 @@ impl ThreadRuntime {
             .map(|message| message.created_at);
         if let Some(initialized_at) = existing_system_prefix_at {
             thread_context
-                .mark_initialized_with_state(
-                    initialized_at,
-                    resolved_features,
-                    preloaded_toolsets,
-                )
+                .mark_initialized_with_state(initialized_at, resolved_features, preloaded_toolsets)
                 .await?;
             info!(
                 thread_id = %thread_context.locator.thread_id,
@@ -686,11 +623,10 @@ impl ThreadRuntime {
         }
 
         if thread_context.is_enabled(Feature::Memory)
-            && let Some(prompt) =
-                feature::init::memory::usage(
-                    &thread_context.locator.thread_id,
-                    &self.memory_repository,
-                )?
+            && let Some(prompt) = feature::init::memory::usage(
+                &thread_context.locator.thread_id,
+                &self.memory_repository,
+            )?
         {
             initialized_messages.push(ChatMessage::new(
                 ChatMessageRole::System,
@@ -886,11 +822,6 @@ impl Thread {
     /// Return the persisted loaded toolsets for the thread.
     pub fn load_toolsets(&self) -> Vec<String> {
         self.state.tools.loaded_toolsets.clone()
-    }
-
-    /// Return the persisted structured tool event history.
-    pub fn load_tool_events(&self) -> Vec<ThreadToolEvent> {
-        self.state.tools.tool_events.clone()
     }
 
     /// Return whether the thread currently owns one active request-local state.
@@ -1189,45 +1120,6 @@ impl Thread {
                 .filter(|message| message.role != ChatMessageRole::System)
                 .count(),
             "rewrote persisted thread non-system history after compaction"
-        );
-        Ok(())
-    }
-
-    /// Append one persisted thread tool event immediately.
-    ///
-    /// # 示例
-    /// ```rust,no_run
-    /// # async fn demo() -> anyhow::Result<()> {
-    /// use chrono::Utc;
-    /// use openjarvis::thread::{Thread, ThreadContextLocator, ThreadToolEvent, ThreadToolEventKind};
-    ///
-    /// let mut thread = Thread::new(
-    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
-    ///     Utc::now(),
-    /// );
-    /// thread
-    ///     .append_tool_event(ThreadToolEvent::new(ThreadToolEventKind::ExecuteTool, Utc::now()))
-    ///     .await?;
-    /// assert_eq!(thread.load_tool_events().len(), 1);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn append_tool_event(&mut self, event: ThreadToolEvent) -> Result<()> {
-        let event_kind = event.kind.clone();
-        let recorded_at = event.recorded_at;
-        self.apply_persisted_mutation("append_tool_event", |snapshot| {
-            snapshot.state.tools.tool_events.push(event);
-            if snapshot.thread.updated_at < recorded_at {
-                snapshot.thread.updated_at = recorded_at;
-            }
-            Ok(())
-        })
-        .await?;
-        info!(
-            thread_id = %self.locator.thread_id,
-            external_thread_id = %self.locator.external_thread_id,
-            event_kind = ?event_kind,
-            "persisted thread tool audit event"
         );
         Ok(())
     }
