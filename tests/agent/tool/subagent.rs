@@ -29,7 +29,13 @@ fn build_incoming(content: &str) -> IncomingMessage {
     }
 }
 
-async fn build_parent_thread() -> (AgentWorker, SessionManager, ThreadLocator, openjarvis::thread::Thread) {
+async fn build_parent_thread(
+) -> (
+    AgentWorker,
+    SessionManager,
+    ThreadLocator,
+    openjarvis::thread::Thread,
+) {
     let sessions = SessionManager::new();
     let worker = AgentWorker::builder()
         .llm(Arc::new(MockLLMProvider::new("tool child reply")))
@@ -95,7 +101,7 @@ async fn subagent_tools_are_visible_only_on_parent_threads() {
 
 #[tokio::test]
 async fn subagent_tools_manage_persist_lifecycle_and_list_view() {
-    // 测试场景: persist subagent 应可 spawn/send/close/list，close 后列表视图仍保留 identity 但不可继续发送。
+    // 测试场景: persist subagent 应由 spawn 完成首轮执行，send 只做后续交互，close 后列表仍保留 identity 但不可继续发送。
     let (worker, _sessions, parent_locator, mut parent_thread) = build_parent_thread().await;
     let registry = worker.runtime().tools();
 
@@ -106,6 +112,7 @@ async fn subagent_tools_manage_persist_lifecycle_and_list_view() {
                 name: "spawn_subagent".to_string(),
                 arguments: json!({
                     "subagent_key": "browser",
+                    "content": "child hello",
                     "spawn_mode": "persist",
                 }),
             },
@@ -113,6 +120,7 @@ async fn subagent_tools_manage_persist_lifecycle_and_list_view() {
         .await
         .expect("spawn_subagent should succeed");
     assert!(!spawn_result.is_error);
+    assert_eq!(spawn_result.content, "tool child reply");
 
     let send_result = registry
         .call_for_context(
@@ -121,8 +129,7 @@ async fn subagent_tools_manage_persist_lifecycle_and_list_view() {
                 name: "send_subagent".to_string(),
                 arguments: json!({
                     "subagent_key": "browser",
-                    "content": "child hello",
-                    "spawn_mode": "persist",
+                    "content": "child follow-up",
                 }),
             },
         )
@@ -178,6 +185,25 @@ async fn subagent_tools_manage_persist_lifecycle_and_list_view() {
     assert_eq!(subagents_after_close.len(), 1);
     assert_eq!(subagents_after_close[0]["available"], false);
 
+    let send_after_close = registry
+        .call_for_context(
+            &mut parent_thread,
+            ToolCallRequest {
+                name: "send_subagent".to_string(),
+                arguments: json!({
+                    "subagent_key": "browser",
+                    "content": "should fail after close",
+                }),
+            },
+        )
+        .await
+        .expect_err("send_subagent after close should fail");
+    assert!(
+        send_after_close
+            .to_string()
+            .contains("call spawn_subagent to reinitialize it first")
+    );
+
     let child_locator =
         ThreadLocator::for_child(&parent_locator, "browser", SubagentSpawnMode::Persist);
     assert_eq!(
@@ -189,16 +215,38 @@ async fn subagent_tools_manage_persist_lifecycle_and_list_view() {
 }
 
 #[tokio::test]
-async fn send_subagent_yolo_removes_child_thread_after_success() {
-    // 测试场景: yolo subagent 成功返回后必须 best-effort 删除已落盘 child thread 记录。
-    let (worker, sessions, parent_locator, mut parent_thread) = build_parent_thread().await;
+async fn send_subagent_requires_existing_persist_child_thread() {
+    // 测试场景: send_subagent 不再承担首轮创建职责；缺失 persist child 时必须显式失败。
+    let (worker, _sessions, _parent_locator, mut parent_thread) = build_parent_thread().await;
     let registry = worker.runtime().tools();
 
-    let send_result = registry
+    let error = registry
         .call_for_context(
             &mut parent_thread,
             ToolCallRequest {
                 name: "send_subagent".to_string(),
+                arguments: json!({
+                    "subagent_key": "browser",
+                    "content": "first task should fail",
+                }),
+            },
+        )
+        .await
+        .expect_err("send_subagent without spawn should fail");
+    assert!(error.to_string().contains("call spawn_subagent first"));
+}
+
+#[tokio::test]
+async fn spawn_subagent_yolo_removes_child_thread_after_completion() {
+    // 测试场景: yolo subagent 通过一次 spawn 完成执行后，必须 best-effort 删除 child thread 记录。
+    let (worker, sessions, parent_locator, mut parent_thread) = build_parent_thread().await;
+    let registry = worker.runtime().tools();
+
+    let spawn_result = registry
+        .call_for_context(
+            &mut parent_thread,
+            ToolCallRequest {
+                name: "spawn_subagent".to_string(),
                 arguments: json!({
                     "subagent_key": "browser",
                     "content": "child hello",
@@ -207,11 +255,12 @@ async fn send_subagent_yolo_removes_child_thread_after_success() {
             },
         )
         .await
-        .expect("yolo send_subagent should succeed");
-    assert!(!send_result.is_error);
-    assert_eq!(send_result.metadata["cleanup_removed"], true);
+        .expect("yolo spawn_subagent should succeed");
+    assert!(!spawn_result.is_error);
+    assert_eq!(spawn_result.metadata["cleanup_removed"], true);
 
-    let child_locator = ThreadLocator::for_child(&parent_locator, "browser", SubagentSpawnMode::Yolo);
+    let child_locator =
+        ThreadLocator::for_child(&parent_locator, "browser", SubagentSpawnMode::Yolo);
     assert!(
         sessions
             .load_thread(&child_locator)

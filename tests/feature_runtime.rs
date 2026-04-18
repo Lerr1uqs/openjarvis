@@ -1,8 +1,10 @@
+use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
         AgentRuntime, FeatureResolver, HookRegistry, MemoryType, MemoryWriteRequest, ShellEnv,
-        SubagentRunner, ToolRegistry,
+        SubagentRunner, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
+        ToolSource, ToolsetCatalogEntry, empty_tool_input_schema,
     },
     config::{AppConfig, LLMConfig},
     llm::MockLLMProvider,
@@ -10,7 +12,8 @@ use openjarvis::{
     session::{MemorySessionStore, SessionManager, SessionStore},
     thread::{
         ChildThreadIdentity, DEFAULT_ASSISTANT_SYSTEM_PROMPT, Feature, Features, SubagentSpawnMode,
-        Thread, ThreadAgentKind, ThreadContextLocator, ThreadRuntime, derive_child_thread_id,
+        Thread, ThreadAgent, ThreadAgentKind, ThreadContextLocator, ThreadRuntime,
+        derive_child_thread_id,
     },
 };
 use serde_json::json;
@@ -20,6 +23,30 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+
+struct BrowserEchoTool;
+
+#[async_trait]
+impl ToolHandler for BrowserEchoTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "browser__echo".to_string(),
+            description: "Echo from browser toolset regression test".to_string(),
+            input_schema: empty_tool_input_schema(),
+            source: ToolSource::Builtin,
+        }
+    }
+
+    async fn call(&self, _request: ToolCallRequest) -> anyhow::Result<ToolCallResult> {
+        Ok(ToolCallResult {
+            content: "browser-echo-ok".to_string(),
+            metadata: json!({
+                "event_kind": "browser_echo",
+            }),
+            is_error: false,
+        })
+    }
+}
 
 struct FeatureRuntimeFixture {
     root: PathBuf,
@@ -368,19 +395,33 @@ async fn thread_runtime_persists_features_and_preserves_them_across_restore() {
 
 #[tokio::test]
 async fn browser_thread_agent_preloads_browser_toolset_and_prompt() {
-    // 测试场景: Browser thread agent 要在唯一 initialize_thread 入口中注入浏览器角色 prompt，并预绑定 browser toolset。
+    // 测试场景: Browser kind 的 capability profile 是线程能力真相；
+    // 即使 resolver、skill、subagent runtime 和 compact 都已开启，也只能看到浏览器 prompt 与浏览器工具。
     let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-browser");
+    fixture.write_skill("browser_demo_skill", "browser-only fixture skill");
     let registry = fixture.registry();
     registry
-        .register_builtin_tools()
-        .await
-        .expect("builtin tools should register");
+        .memory_repository()
+        .write(MemoryWriteRequest {
+            memory_type: MemoryType::Active,
+            path: "browser/runtime.md".to_string(),
+            title: "Browser runtime".to_string(),
+            content: "browser runtime memory".to_string(),
+            keywords: Some(vec!["browser".to_string(), "runtime".to_string()]),
+        })
+        .expect("browser memory fixture should be written");
+
+    let compact_config = compact_enabled_config()
+        .agent_config()
+        .compact_config()
+        .clone();
+    let _runner = install_mock_subagent_runner(&registry, compact_config.clone()).await;
 
     let runtime = ThreadRuntime::with_feature_resolver(
         Arc::clone(&registry),
         registry.memory_repository(),
-        AppConfig::default().agent_config().compact_config().clone(),
-        FeatureResolver::development_default(Features::default()),
+        compact_config,
+        FeatureResolver::development_default(Features::all()),
     );
     let mut thread = Thread::new(
         ThreadContextLocator::new(
@@ -403,8 +444,160 @@ async fn browser_thread_agent_preloads_browser_toolset_and_prompt() {
     .expect("browser prompt markdown should load");
 
     assert_eq!(thread.thread_agent_kind(), ThreadAgentKind::Browser);
+    assert!(thread.enabled_features().is_empty());
     assert_eq!(thread.load_toolsets(), vec!["browser".to_string()]);
     assert_eq!(thread.messages()[0].content, expected_browser_prompt.trim());
+    assert!(thread.messages().iter().all(|message| {
+        !message
+            .content
+            .contains("browser, runtime -> browser/runtime.md")
+            && !message.content.contains("Available local skills")
+            && !message.content.contains("当前可用 subagent 数量:")
+            && !message.content.contains("Auto-compact 已开启")
+            && !message
+                .content
+                .contains("当 `compact` 工具未出现在当前工具列表中时")
+    }));
+
+    let visible_tools = registry
+        .list_for_context_with_compact(&thread, true)
+        .await
+        .expect("browser thread tools should list");
+    let visible_tool_names = visible_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        visible_tool_names
+            .iter()
+            .all(|tool_name| tool_name.starts_with("browser__"))
+    );
+    assert!(visible_tool_names.contains(&"browser__navigate"));
+    assert!(visible_tool_names.contains(&"browser__snapshot"));
+    assert!(!visible_tool_names.contains(&"load_toolset"));
+    assert!(!visible_tool_names.contains(&"unload_toolset"));
+    assert!(!visible_tool_names.contains(&"load_skill"));
+    assert!(!visible_tool_names.contains(&"spawn_subagent"));
+    assert!(!visible_tool_names.contains(&"send_subagent"));
+    assert!(!visible_tool_names.contains(&"memory_get"));
+    assert!(registry.catalog_prompt_for_context(&thread).await.is_none());
+}
+
+#[tokio::test]
+async fn browser_thread_reconcile_filters_disallowed_feature_and_toolset_state() {
+    // 测试场景: 已初始化的 Browser 线程即使带着脏的 feature/toolset 快照再次进入 runtime，
+    // 也必须被当前 kind profile 收敛回 browser-only 能力边界。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-browser-reconcile");
+    let registry = fixture.registry();
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register");
+
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        compact_enabled_config()
+            .agent_config()
+            .compact_config()
+            .clone(),
+        FeatureResolver::development_default(Features::all()),
+    );
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_browser_reconcile",
+            "thread_browser_reconcile",
+            "thread_browser_reconcile",
+        ),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut thread, ThreadAgentKind::Browser)
+        .await
+        .expect("browser thread should initialize");
+
+    thread.replace_thread_agent(ThreadAgent::new(
+        ThreadAgentKind::Browser,
+        vec!["browser".to_string(), "memory".to_string()],
+    ));
+    thread.replace_enabled_features(Features::from_iter([
+        Feature::Memory,
+        Feature::Skill,
+        Feature::Subagent,
+        Feature::AutoCompact,
+    ]));
+    thread.replace_loaded_toolsets(vec!["browser".to_string(), "memory".to_string()]);
+
+    runtime
+        .initialize_thread(&mut thread, ThreadAgentKind::Main)
+        .await
+        .expect("browser thread reconcile should succeed");
+
+    assert_eq!(thread.thread_agent_kind(), ThreadAgentKind::Browser);
+    assert_eq!(
+        thread.thread_agent().bound_toolsets,
+        vec!["browser".to_string()]
+    );
+    assert!(thread.enabled_features().is_empty());
+    assert_eq!(thread.load_toolsets(), vec!["browser".to_string()]);
+
+    let visible_tools = registry
+        .list_for_context_with_compact(&thread, true)
+        .await
+        .expect("reconciled browser thread tools should list");
+    let visible_tool_names = visible_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        visible_tool_names
+            .iter()
+            .all(|tool_name| tool_name.starts_with("browser__"))
+    );
+    assert!(!visible_tool_names.contains(&"memory_get"));
+    assert!(!visible_tool_names.contains(&"load_toolset"));
+    assert!(registry.catalog_prompt_for_context(&thread).await.is_none());
+}
+
+#[tokio::test]
+async fn browser_thread_can_call_bound_browser_toolset_tools() {
+    // 测试场景: Browser kind 绑定的 browser toolset 工具必须可调用，
+    // 不能被 always-visible tool 的 enabled 判定误挡住。
+    let registry = ToolRegistry::new();
+    registry
+        .register_toolset(
+            ToolsetCatalogEntry::new("browser", "Browser regression test toolset"),
+            vec![Arc::new(BrowserEchoTool)],
+        )
+        .await
+        .expect("browser regression toolset should register");
+
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_browser_call",
+            "thread_browser_call",
+            "thread_browser_call",
+        ),
+        Utc::now(),
+    );
+    thread.replace_thread_agent(ThreadAgent::from_kind(ThreadAgentKind::Browser));
+    thread.replace_loaded_toolsets(vec!["browser".to_string()]);
+
+    let result = registry
+        .call_for_context(
+            &mut thread,
+            ToolCallRequest {
+                name: "browser__echo".to_string(),
+                arguments: json!({}),
+            },
+        )
+        .await
+        .expect("browser bound toolset tool should execute");
+    assert_eq!(result.content, "browser-echo-ok");
 }
 
 #[tokio::test]

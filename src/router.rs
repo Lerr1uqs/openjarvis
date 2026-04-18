@@ -89,6 +89,9 @@ impl ChannelRouterBuilder {
 
     /// Replace the session manager used by the router.
     pub fn session_manager(mut self, sessions: SessionManager) -> Self {
+        if let Some(thread_runtime) = self.sessions.thread_runtime() {
+            sessions.install_thread_runtime(thread_runtime);
+        }
         self.sessions = sessions;
         self
     }
@@ -419,9 +422,15 @@ impl ChannelRouter {
                     locator.thread_id
                 )
             })?;
+            thread_context.bind_request_runtime(self.sessions.clone());
+            let thread_runtime = self.sessions.thread_runtime();
             if let Some(reply) = self
                 .commands
-                .try_execute_with_thread_context(&message, &mut thread_context)
+                .try_execute_with_thread_context_and_runtime(
+                    &message,
+                    &mut thread_context,
+                    thread_runtime.as_deref(),
+                )
                 .await?
             {
                 self.dispatch_command_reply(&message, reply).await?;

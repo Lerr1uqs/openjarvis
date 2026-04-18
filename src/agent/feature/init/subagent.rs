@@ -63,10 +63,7 @@ fn render_prompt(catalog: &[SubagentCatalogEntry]) -> String {
                     "  when_to_use: {}\n",
                     "  when_not_to_use: {}"
                 ),
-                entry.subagent_key,
-                entry.role_summary,
-                entry.when_to_use,
-                entry.when_not_to_use,
+                entry.subagent_key, entry.role_summary, entry.when_to_use, entry.when_not_to_use,
             )
         })
         .collect::<Vec<_>>()
@@ -78,6 +75,9 @@ fn render_prompt(catalog: &[SubagentCatalogEntry]) -> String {
             "当前可用 subagent 数量: {}。\n",
             "可用 subagent catalog:\n{}\n",
             "使用原则:\n",
+            "- `spawn_subagent` 用于启动某个 subagent，并把首个任务直接交给它执行。\n",
+            "- 只有当 `persist` child thread 已存在时，才使用 `send_subagent` 做后续交互。\n",
+            "- `yolo` 模式只执行一次，不需要 `send_subagent` 或 `close_subagent` 继续管理。\n",
             "- 当任务明显属于某个专用 profile，且需要独立子线程上下文时，优先使用 subagent。\n",
             "- 简单直接的工具调用不应默认升级成 subagent 调用。\n",
             "- 当某个 profile 已存在可复用 child thread 时，应优先复用，而不是额外创建并行实例。\n",

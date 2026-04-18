@@ -3,15 +3,23 @@ use crate::agent::tool::{build_thread, call_tool, list_tools};
 use openjarvis::agent::{
     ToolCallRequest, ToolRegistry, tool::browser::register_browser_toolset_with_config,
 };
+use openjarvis::thread::{Thread, ThreadAgent, ThreadAgentKind};
 use serde_json::json;
 use std::path::PathBuf;
 
+fn build_browser_thread(thread_id: &str) -> Thread {
+    let mut thread_context = build_thread(thread_id);
+    thread_context.replace_thread_agent(ThreadAgent::from_kind(ThreadAgentKind::Browser));
+    thread_context.replace_loaded_toolsets(vec!["browser".to_string()]);
+    thread_context
+}
+
 #[tokio::test]
-async fn browser_toolset_exposes_thread_loaded_tools_and_runs_mock_actions() {
-    // 验证 browser toolset 加载后会暴露核心工具，并能跑通基础 mock 动作。
+async fn browser_thread_exposes_bound_browser_tools_and_runs_mock_actions() {
+    // 验证 Browser 线程天然拥有 browser 绑定工具，并能跑通基础 mock 动作。
     let fixture = BrowserFixture::new("openjarvis-browser-toolset");
     let registry = ToolRegistry::new();
-    let mut thread_context = build_thread("thread-browser");
+    let mut thread_context = build_browser_thread("thread-browser");
     register_browser_toolset_with_config(&registry, fixture.manager_config(true))
         .await
         .expect("browser toolset should register");
@@ -20,32 +28,12 @@ async fn browser_toolset_exposes_thread_loaded_tools_and_runs_mock_actions() {
         .await
         .expect("initial tools should list");
     assert!(
-        !initial_tools
-            .iter()
-            .any(|definition| definition.name == "browser__navigate")
-    );
-
-    call_tool(
-        &registry,
-        &mut thread_context,
-        ToolCallRequest {
-            name: "load_toolset".to_string(),
-            arguments: json!({ "name": "browser" }),
-        },
-    )
-    .await
-    .expect("browser toolset should load");
-
-    let loaded_tools = list_tools(&registry, &thread_context)
-        .await
-        .expect("loaded tools should list");
-    assert!(
-        loaded_tools
+        initial_tools
             .iter()
             .any(|definition| definition.name == "browser__navigate")
     );
     assert!(
-        loaded_tools
+        initial_tools
             .iter()
             .any(|definition| definition.name == "browser__snapshot")
     );
@@ -90,25 +78,14 @@ async fn browser_toolset_exposes_thread_loaded_tools_and_runs_mock_actions() {
 }
 
 #[tokio::test]
-async fn browser_toolset_match_tools_resolve_elements_without_stable_refs() {
-    // 验证 match 工具可以根据元素特征重新定位目标，而不是依赖瞬时 ref。
+async fn browser_thread_match_tools_resolve_elements_without_stable_refs() {
+    // 验证 Browser 线程内的 match 工具可以根据元素特征重新定位目标，而不是依赖瞬时 ref。
     let fixture = BrowserFixture::new("openjarvis-browser-toolset-match");
     let registry = ToolRegistry::new();
-    let mut thread_context = build_thread("thread-browser-match");
+    let mut thread_context = build_browser_thread("thread-browser-match");
     register_browser_toolset_with_config(&registry, fixture.manager_config(true))
         .await
         .expect("browser toolset should register");
-
-    call_tool(
-        &registry,
-        &mut thread_context,
-        ToolCallRequest {
-            name: "load_toolset".to_string(),
-            arguments: json!({ "name": "browser" }),
-        },
-    )
-    .await
-    .expect("browser toolset should load");
     let _ = call_tool(
         &registry,
         &mut thread_context,
@@ -156,25 +133,15 @@ async fn browser_toolset_match_tools_resolve_elements_without_stable_refs() {
 }
 
 #[tokio::test]
-async fn browser_toolset_unload_closes_session_and_hides_tools() {
-    // 验证卸载 toolset 后会同步关闭 session 并移除线程可见工具。
-    let fixture = BrowserFixture::new("openjarvis-browser-toolset-unload");
+async fn browser_close_tool_closes_session_and_cleans_artifacts() {
+    // 验证 Browser 线程通过 browser__close 关闭 session 后会回收产物，
+    // browser 能力仍属于绑定能力，不再通过主线程 unload_toolset 暴露。
+    let fixture = BrowserFixture::new("openjarvis-browser-toolset-close");
     let registry = ToolRegistry::new();
-    let mut thread_context = build_thread("thread-browser-unload");
+    let mut thread_context = build_browser_thread("thread-browser-close");
     register_browser_toolset_with_config(&registry, fixture.manager_config(false))
         .await
         .expect("browser toolset should register");
-
-    call_tool(
-        &registry,
-        &mut thread_context,
-        ToolCallRequest {
-            name: "load_toolset".to_string(),
-            arguments: json!({ "name": "browser" }),
-        },
-    )
-    .await
-    .expect("browser toolset should load");
     let _ = call_tool(
         &registry,
         &mut thread_context,
@@ -198,27 +165,34 @@ async fn browser_toolset_unload_closes_session_and_hides_tools() {
 
     assert!(PathBuf::from(&screenshot.content).exists());
 
-    call_tool(
+    let close_result = call_tool(
         &registry,
         &mut thread_context,
         ToolCallRequest {
-            name: "unload_toolset".to_string(),
-            arguments: json!({ "name": "browser" }),
-        },
-    )
-    .await
-    .expect("browser toolset should unload");
-
-    assert!(!PathBuf::from(&screenshot.content).exists());
-    let error = call_tool(
-        &registry,
-        &mut thread_context,
-        ToolCallRequest {
-            name: "browser__snapshot".to_string(),
+            name: "browser__close".to_string(),
             arguments: json!({}),
         },
     )
     .await
-    .expect_err("unloaded browser tool should not be callable");
-    assert!(error.to_string().contains("not registered for thread"));
+    .expect("browser close should succeed");
+    assert_eq!(close_result.content, "Browser session closed.");
+    assert_eq!(close_result.metadata["toolset"], "browser");
+    assert_eq!(close_result.metadata["had_session"], true);
+
+    assert!(!PathBuf::from(&screenshot.content).exists());
+    let second_close = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "browser__close".to_string(),
+            arguments: json!({}),
+        },
+    )
+    .await
+    .expect("browser close without session should still succeed");
+    assert_eq!(
+        second_close.content,
+        "No browser session was active for the current thread."
+    );
+    assert_eq!(second_close.metadata["had_session"], false);
 }

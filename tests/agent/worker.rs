@@ -60,30 +60,40 @@ impl LLMProvider for MainCallsSubagentProvider {
         match self.call_index.fetch_add(1, Ordering::SeqCst) {
             0 => {
                 assert!(
-                    request.tools.iter().any(|tool| tool.name == "send_subagent"),
-                    "main agent must see send_subagent tool"
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "spawn_subagent"),
+                    "main agent must see spawn_subagent tool"
                 );
                 assert_eq!(
                     request.messages.last().map(|message| message.role.clone()),
                     Some(ChatMessageRole::User)
                 );
                 assert_eq!(
-                    request.messages.last().map(|message| message.content.as_str()),
+                    request
+                        .messages
+                        .last()
+                        .map(|message| message.content.as_str()),
                     Some("帮我让 demo agent 回一个 mock 结果")
                 );
                 Ok(LLMResponse {
                     items: vec![
-                        openjarvis::context::ChatMessage::new(ChatMessageRole::Toolcall, "", Utc::now())
-                            .with_tool_calls(vec![LLMToolCall {
-                                id: "call_send_subagent".to_string(),
-                                name: "send_subagent".to_string(),
-                                arguments: json!({
-                                    "subagent_key": "browser",
-                                    "content": "请返回 demo agent 的 mock 结果",
-                                    "spawn_mode": "persist",
-                                }),
-                                provider_item_id: None,
-                            }]),
+                        openjarvis::context::ChatMessage::new(
+                            ChatMessageRole::Toolcall,
+                            "",
+                            Utc::now(),
+                        )
+                        .with_tool_calls(vec![LLMToolCall {
+                            id: "call_spawn_subagent".to_string(),
+                            name: "spawn_subagent".to_string(),
+                            arguments: json!({
+                                "subagent_key": "browser",
+                                "content": "请返回 demo agent 的 mock 结果",
+                                "spawn_mode": "persist",
+                            }),
+                            provider_item_id: None,
+                        }]),
                     ],
                 })
             }
@@ -93,7 +103,10 @@ impl LLMProvider for MainCallsSubagentProvider {
                     Some(ChatMessageRole::User)
                 );
                 assert_eq!(
-                    request.messages.last().map(|message| message.content.as_str()),
+                    request
+                        .messages
+                        .last()
+                        .map(|message| message.content.as_str()),
                     Some("请返回 demo agent 的 mock 结果")
                 );
                 Ok(LLMResponse {
@@ -246,7 +259,7 @@ async fn worker_reports_failed_request_completion_after_fallback_message() {
 
 #[tokio::test]
 async fn worker_runs_full_main_to_subagent_roundtrip_with_mock_result() {
-    // 测试场景: mock main agent 通过 send_subagent 调起 mock demo agent，并把 child result 带回主线程继续生成最终回复。
+    // 测试场景: mock main agent 通过 spawn_subagent 直接发首个任务，并把 child result 带回主线程继续生成最终回复。
     let sessions = SessionManager::new();
     let worker = AgentWorker::builder()
         .llm(std::sync::Arc::new(MainCallsSubagentProvider::new()))
@@ -295,7 +308,7 @@ async fn worker_runs_full_main_to_subagent_roundtrip_with_mock_result() {
     assert!(
         dispatch_contents
             .iter()
-            .any(|content| content.contains("[openjarvis][tool_call] send_subagent"))
+            .any(|content| content.contains("[openjarvis][tool_call] spawn_subagent"))
     );
     assert!(
         dispatch_contents
@@ -328,8 +341,11 @@ async fn worker_runs_full_main_to_subagent_roundtrip_with_mock_result() {
                 && message.content == "main agent received demo agent mock result")
     );
 
-    let child_locator =
-        ThreadLocator::for_child(&locator, "browser", openjarvis::thread::SubagentSpawnMode::Persist);
+    let child_locator = ThreadLocator::for_child(
+        &locator,
+        "browser",
+        openjarvis::thread::SubagentSpawnMode::Persist,
+    );
     let child_thread = sessions
         .load_thread(&child_locator)
         .await

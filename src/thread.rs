@@ -22,11 +22,11 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub(crate) use agent::SubagentCatalogEntry;
 pub use agent::{
     DEFAULT_ASSISTANT_SYSTEM_PROMPT, DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT, ThreadAgent,
     ThreadAgentKind,
 };
+pub(crate) use agent::{SubagentCatalogEntry, ThreadAgentCapabilityProfile};
 
 const OPENJARVIS_THREAD_ID_NAMESPACE: Uuid =
     Uuid::from_u128(0x7f4b2e8d_5d33_4f51_9c27_9c5d7d76c1a1);
@@ -629,53 +629,39 @@ impl ThreadRuntime {
         self.tool_registry.register_builtin_tools().await
     }
 
-    fn filter_enabled_features_for_thread(
-        &self,
-        thread_context: &Thread,
-        thread_agent: &ThreadAgent,
-        mut features: Features,
-    ) -> Features {
-        if (thread_context.child_thread_identity().is_some() || thread_agent.kind.is_subagent())
-            && features.remove(Feature::Subagent)
-        {
-            info!(
-                thread_id = %thread_context.locator.thread_id,
-                thread_agent_kind = thread_agent.kind.as_str(),
-                enabled_features = ?features.names(),
-                "removed parent-only subagent feature from child thread feature snapshot"
-            );
-        }
-        features
-    }
-
     fn resolve_enabled_features(
         &self,
         thread_context: &Thread,
         thread_agent: &ThreadAgent,
     ) -> Features {
+        let capability_profile = thread_agent.kind.capability_profile();
+        let allowed_features = capability_profile.allowed_features();
         let persisted_features = thread_context.enabled_features();
         if !persisted_features.is_empty() {
+            let filtered = persisted_features.intersect(&allowed_features);
             info!(
                 thread_id = %thread_context.locator.thread_id,
-                enabled_features = ?persisted_features.names(),
-                "using persisted thread feature snapshot"
+                thread_agent_kind = thread_agent.kind.as_str(),
+                enabled_features = ?filtered.names(),
+                "resolved persisted thread features through thread agent capability profile"
             );
-            return self.filter_enabled_features_for_thread(
-                thread_context,
-                thread_agent,
-                persisted_features,
-            );
+            return filtered;
         }
 
-        let resolved = self
-            .feature_resolver
-            .resolve_for_locator(&thread_context.locator);
+        let resolved = if capability_profile.resolves_features_from_resolver() {
+            self.feature_resolver
+                .resolve_for_locator(&thread_context.locator)
+        } else {
+            capability_profile.default_features()
+        };
+        let filtered = resolved.intersect(&allowed_features);
         info!(
             thread_id = %thread_context.locator.thread_id,
-            enabled_features = ?resolved.names(),
-            "resolved thread feature snapshot for initialization"
+            thread_agent_kind = thread_agent.kind.as_str(),
+            enabled_features = ?filtered.names(),
+            "resolved thread feature snapshot through thread agent capability profile"
         );
-        self.filter_enabled_features_for_thread(thread_context, thread_agent, resolved)
+        filtered
     }
 
     fn resolve_thread_agent(
@@ -693,7 +679,7 @@ impl ThreadRuntime {
                     "initialized thread already owns a persisted thread agent; ignoring requested kind"
                 );
             }
-            return persisted_agent;
+            return ThreadAgent::from_kind(persisted_agent.kind);
         }
 
         ThreadAgent::from_kind(requested_kind)
@@ -712,10 +698,44 @@ impl ThreadRuntime {
         toolsets
     }
 
+    async fn resolve_loaded_toolsets(
+        &self,
+        thread_context: &Thread,
+        thread_agent: &ThreadAgent,
+        enabled_features: &Features,
+    ) -> Vec<String> {
+        let capability_profile = thread_agent.kind.capability_profile();
+        let preloaded_toolsets = self.preloaded_toolsets(thread_agent, enabled_features);
+        let registered_toolsets = self
+            .tool_registry
+            .list_toolsets()
+            .await
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut loaded_toolsets = thread_context.load_toolsets();
+        loaded_toolsets.extend(preloaded_toolsets);
+        let resolved = normalize_loaded_toolsets(loaded_toolsets)
+            .into_iter()
+            .filter(|toolset_name| {
+                capability_profile.binds_toolset(toolset_name)
+                    || (capability_profile.allows_optional_toolset(toolset_name)
+                        && registered_toolsets.contains(toolset_name))
+            })
+            .collect::<Vec<_>>();
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            thread_agent_kind = thread_agent.kind.as_str(),
+            loaded_toolsets = ?resolved,
+            "resolved thread loaded toolsets through thread agent capability profile"
+        );
+        resolved
+    }
+
     async fn build_predefined_role_messages(
         &self,
         thread_agent: &ThreadAgent,
-        preloaded_toolsets: &[String],
+        loaded_toolsets: &[String],
         initialized_at: DateTime<Utc>,
     ) -> Result<Vec<ChatMessage>> {
         let mut messages = Vec::new();
@@ -734,7 +754,7 @@ impl ThreadRuntime {
         ));
         if let Some(catalog_prompt) = self
             .tool_registry
-            .render_toolset_catalog_prompt(preloaded_toolsets)
+            .render_toolset_catalog_prompt(thread_agent.kind.capability_profile(), loaded_toolsets)
             .await
         {
             messages.push(ChatMessage::new(
@@ -791,15 +811,16 @@ impl ThreadRuntime {
             self.resolve_thread_agent(thread_context, requested_thread_agent_kind);
         let resolved_features =
             self.resolve_enabled_features(thread_context, &resolved_thread_agent);
-        let preloaded_toolsets =
-            self.preloaded_toolsets(&resolved_thread_agent, &resolved_features);
+        let resolved_loaded_toolsets = self
+            .resolve_loaded_toolsets(thread_context, &resolved_thread_agent, &resolved_features)
+            .await;
 
         if thread_context.is_initialized() {
             let backfilled = thread_context
                 .reconcile_initialized_feature_state(
                     resolved_thread_agent.clone(),
                     resolved_features,
-                    preloaded_toolsets,
+                    resolved_loaded_toolsets,
                 )
                 .await?;
             if backfilled {
@@ -825,7 +846,7 @@ impl ThreadRuntime {
                     initialized_at,
                     resolved_thread_agent.clone(),
                     resolved_features,
-                    preloaded_toolsets,
+                    resolved_loaded_toolsets,
                 )
                 .await?;
             info!(
@@ -842,7 +863,7 @@ impl ThreadRuntime {
         let mut initialized_messages = self
             .build_predefined_role_messages(
                 &resolved_thread_agent,
-                &preloaded_toolsets,
+                &resolved_loaded_toolsets,
                 initialized_at,
             )
             .await?;
@@ -923,7 +944,7 @@ impl ThreadRuntime {
                 initialized_at,
                 resolved_thread_agent,
                 resolved_features,
-                preloaded_toolsets,
+                resolved_loaded_toolsets,
             )
             .await?;
         info!(
@@ -940,6 +961,176 @@ impl ThreadRuntime {
             "persisted thread initialization prefix"
         );
         Ok(true)
+    }
+
+    /// Reset the current thread and immediately rebuild its initialized prefix.
+    ///
+    /// The thread keeps its current agent truth, and child threads keep their
+    /// persisted child identity across the reset.
+    ///
+    /// # 示例
+    /// ```rust,no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     agent::{MemoryRepository, ToolRegistry},
+    ///     config::AgentCompactConfig,
+    ///     thread::{Thread, ThreadAgentKind, ThreadContextLocator, ThreadRuntime},
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let runtime = ThreadRuntime::new(
+    ///     Arc::new(ToolRegistry::new()),
+    ///     Arc::new(MemoryRepository::new(".")),
+    ///     AgentCompactConfig::default(),
+    /// );
+    /// let mut thread = Thread::new(
+    ///     ThreadContextLocator::new(None, "feishu", "ou_xxx", "thread_ext", "thread_internal"),
+    ///     Utc::now(),
+    /// );
+    /// runtime
+    ///     .initialize_thread(&mut thread, ThreadAgentKind::Main)
+    ///     .await?;
+    /// runtime.reinitialize_thread(&mut thread, Utc::now()).await?;
+    /// assert!(thread.is_initialized());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn reinitialize_thread(
+        &self,
+        thread_context: &mut Thread,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let request_sessions = thread_context.request_sessions();
+        if thread_context.child_thread_identity().is_none() {
+            if let Some(sessions) = request_sessions {
+                match crate::session::ThreadLocator::try_from(&thread_context.locator) {
+                    Ok(parent_locator) => {
+                        self.reinitialize_attached_persist_child_threads(
+                            &sessions,
+                            &parent_locator,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        warn!(
+                            thread_id = %thread_context.locator.thread_id,
+                            external_thread_id = %thread_context.locator.external_thread_id,
+                            error = %error,
+                            "skipping persist child-thread reinitialize cascade because current thread locator is not session-bound"
+                        );
+                    }
+                }
+            }
+        }
+        self.reinitialize_current_thread_only(thread_context, now)
+            .await
+    }
+
+    async fn reinitialize_current_thread_only(
+        &self,
+        thread_context: &mut Thread,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let thread_agent_kind = Self::resolve_reinitialize_thread_agent_kind(thread_context);
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            external_thread_id = %thread_context.locator.external_thread_id,
+            thread_agent_kind = thread_agent_kind.as_str(),
+            child_thread = thread_context.child_thread_identity().is_some(),
+            "reinitializing current thread"
+        );
+        thread_context
+            .reset_to_initial_state_preserving_child_thread(now)
+            .await?;
+        let _ = self
+            .initialize_thread(thread_context, thread_agent_kind)
+            .await?;
+        info!(
+            thread_id = %thread_context.locator.thread_id,
+            external_thread_id = %thread_context.locator.external_thread_id,
+            thread_agent_kind = thread_context.thread_agent_kind().as_str(),
+            system_message_count = thread_context
+                .messages()
+                .iter()
+                .filter(|message| message.role == ChatMessageRole::System)
+                .count(),
+            "reinitialized current thread"
+        );
+        Ok(())
+    }
+
+    fn resolve_reinitialize_thread_agent_kind(thread_context: &Thread) -> ThreadAgentKind {
+        if thread_context.is_initialized() {
+            return thread_context.thread_agent_kind();
+        }
+
+        thread_context
+            .child_thread_identity()
+            .and_then(|child_thread| ThreadAgentKind::from_subagent_key(&child_thread.subagent_key))
+            .unwrap_or_else(|| thread_context.thread_agent_kind())
+    }
+
+    async fn reinitialize_attached_persist_child_threads(
+        &self,
+        sessions: &SessionManager,
+        parent_locator: &crate::session::ThreadLocator,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        let persist_child_locators = sessions
+            .list_child_threads(parent_locator)
+            .await?
+            .into_iter()
+            .filter_map(|record| {
+                let child_thread = record.snapshot.state.child_thread?;
+                if child_thread.spawn_mode != SubagentSpawnMode::Persist {
+                    return None;
+                }
+                Some((record.locator, child_thread.subagent_key))
+            })
+            .collect::<Vec<_>>();
+
+        if persist_child_locators.is_empty() {
+            debug!(
+                parent_thread_id = %parent_locator.thread_id,
+                "no persist child threads required reinitialize cascade"
+            );
+            return Ok(0);
+        }
+
+        info!(
+            parent_thread_id = %parent_locator.thread_id,
+            persist_child_count = persist_child_locators.len(),
+            "reinitializing attached persist child threads"
+        );
+
+        let mut reinitialized_count = 0usize;
+        for (child_locator, subagent_key) in persist_child_locators {
+            let child_locator = crate::session::ThreadLocator::try_from(&child_locator)?;
+            let Some(mut child_thread) = sessions.lock_thread(&child_locator, now).await? else {
+                bail!(
+                    "persist child thread `{}` disappeared before reinitialize cascade",
+                    child_locator.thread_id
+                );
+            };
+            info!(
+                parent_thread_id = %parent_locator.thread_id,
+                child_thread_id = %child_locator.thread_id,
+                subagent_key = %subagent_key,
+                "reinitializing attached persist child thread"
+            );
+            self.reinitialize_current_thread_only(&mut child_thread, now)
+                .await?;
+            reinitialized_count += 1;
+        }
+
+        info!(
+            parent_thread_id = %parent_locator.thread_id,
+            persist_child_count = reinitialized_count,
+            "reinitialized attached persist child threads"
+        );
+        Ok(reinitialized_count)
     }
 }
 
@@ -1048,6 +1239,13 @@ impl Thread {
     #[doc(hidden)]
     pub fn bind_request_runtime(&mut self, sessions: SessionManager) {
         self.request_runtime = Some(RequestRuntimeState { sessions });
+    }
+
+    #[doc(hidden)]
+    pub fn request_sessions(&self) -> Option<SessionManager> {
+        self.request_runtime
+            .as_ref()
+            .map(|runtime| runtime.sessions.clone())
     }
 
     /// Export the thread-owned formal message sequence.
@@ -1241,15 +1439,14 @@ impl Thread {
         initialized_at: DateTime<Utc>,
         thread_agent: ThreadAgent,
         enabled_features: Features,
-        preloaded_toolsets: Vec<String>,
+        loaded_toolsets: Vec<String>,
     ) -> Result<()> {
         self.apply_persisted_mutation("mark_initialized_with_state", |snapshot| {
             snapshot.state.lifecycle.initialized = true;
             snapshot.state.agent = thread_agent.clone();
             snapshot.state.features.enabled_features = enabled_features.clone();
-            let mut merged_toolsets = snapshot.state.tools.loaded_toolsets.clone();
-            merged_toolsets.extend(preloaded_toolsets.clone());
-            snapshot.state.tools.loaded_toolsets = normalize_loaded_toolsets(merged_toolsets);
+            snapshot.state.tools.loaded_toolsets =
+                normalize_loaded_toolsets(loaded_toolsets.clone());
             if snapshot.thread.created_at > initialized_at {
                 snapshot.thread.created_at = initialized_at;
             }
@@ -1267,7 +1464,7 @@ impl Thread {
         initialized_at: DateTime<Utc>,
         thread_agent: ThreadAgent,
         enabled_features: Features,
-        preloaded_toolsets: Vec<String>,
+        loaded_toolsets: Vec<String>,
     ) -> Result<()> {
         self.apply_persisted_mutation("initialize_thread", |snapshot| {
             if !initialized_messages.is_empty() {
@@ -1278,7 +1475,7 @@ impl Thread {
             snapshot.state.lifecycle.initialized = true;
             snapshot.state.agent = thread_agent.clone();
             snapshot.state.features.enabled_features = enabled_features.clone();
-            snapshot.state.tools.loaded_toolsets = normalize_loaded_toolsets(preloaded_toolsets);
+            snapshot.state.tools.loaded_toolsets = normalize_loaded_toolsets(loaded_toolsets);
             Ok(())
         })
         .await
@@ -1288,7 +1485,7 @@ impl Thread {
         &mut self,
         thread_agent: ThreadAgent,
         enabled_features: Features,
-        preloaded_toolsets: Vec<String>,
+        loaded_toolsets: Vec<String>,
     ) -> Result<bool> {
         let now = Utc::now();
         self.apply_persisted_mutation("reconcile_initialized_feature_state", |snapshot| {
@@ -1302,9 +1499,7 @@ impl Thread {
                 changed = true;
             }
 
-            let mut merged_toolsets = snapshot.state.tools.loaded_toolsets.clone();
-            merged_toolsets.extend(preloaded_toolsets.clone());
-            let normalized_toolsets = normalize_loaded_toolsets(merged_toolsets);
+            let normalized_toolsets = normalize_loaded_toolsets(loaded_toolsets.clone());
             if snapshot.state.tools.loaded_toolsets != normalized_toolsets {
                 snapshot.state.tools.loaded_toolsets = normalized_toolsets;
                 changed = true;
@@ -1576,7 +1771,10 @@ impl Thread {
         tool_registry: &ToolRegistry,
     ) -> Option<String> {
         tool_registry
-            .render_toolset_catalog_prompt(&self.load_toolsets())
+            .render_toolset_catalog_prompt(
+                self.thread_agent_kind().capability_profile(),
+                &self.load_toolsets(),
+            )
             .await
     }
 
@@ -1589,16 +1787,20 @@ impl Thread {
             .always_visible_definitions()
             .await
             .into_iter()
-            .filter(|definition| self.tool_allowed_by_feature_state(&definition.name))
+            .filter(|definition| self.tool_allowed_by_runtime_state(&definition.name))
             .collect::<Vec<_>>();
-        definitions.push(crate::agent::tool::load_toolset_definition());
-        definitions.push(crate::agent::tool::unload_toolset_definition());
-
-        for toolset_name in self.load_toolsets() {
-            definitions.extend(tool_registry.toolset_definitions(&toolset_name).await?);
+        if self.supports_optional_toolset_controls(tool_registry).await {
+            definitions.push(crate::agent::tool::load_toolset_definition());
+            definitions.push(crate::agent::tool::unload_toolset_definition());
         }
 
-        if compact_visible {
+        for toolset_name in self.load_toolsets() {
+            if self.toolset_allowed_by_runtime_state(&toolset_name) {
+                definitions.extend(tool_registry.toolset_definitions(&toolset_name).await?);
+            }
+        }
+
+        if compact_visible && self.tool_allowed_by_runtime_state("compact") {
             definitions.push(crate::agent::tool::compact_tool_definition());
         }
 
@@ -1615,6 +1817,13 @@ impl Thread {
         if toolset_name.is_empty() {
             bail!("load_toolset requires a non-empty tool name");
         }
+        if !self.optional_toolset_allowed_by_runtime_state(toolset_name) {
+            bail!(
+                "toolset `{}` is not available for thread agent kind `{}`",
+                toolset_name,
+                self.thread_agent_kind().as_str()
+            );
+        }
 
         tool_registry.toolset_definitions(toolset_name).await?;
         self.load_toolset(toolset_name).await
@@ -1628,6 +1837,13 @@ impl Thread {
         let toolset_name = toolset_name.trim();
         if toolset_name.is_empty() {
             bail!("unload_toolset requires a non-empty tool name");
+        }
+        if !self.optional_toolset_allowed_by_runtime_state(toolset_name) {
+            bail!(
+                "toolset `{}` is not unloadable for thread agent kind `{}`",
+                toolset_name,
+                self.thread_agent_kind().as_str()
+            );
         }
 
         let thread_id = self.locator.thread_id.clone();
@@ -1667,6 +1883,12 @@ impl Thread {
         let result = match request.name.as_str() {
             "compact" => bail!("tool `compact` must be handled by the agent loop compact runtime"),
             "load_toolset" => {
+                if !self.tool_allowed_by_runtime_state("load_toolset") {
+                    bail!(
+                        "tool `load_toolset` is not enabled for thread `{}`",
+                        thread_id
+                    );
+                }
                 let toolset_name = request
                     .arguments
                     .get("name")
@@ -1700,6 +1922,12 @@ impl Thread {
                 })
             }
             "unload_toolset" => {
+                if !self.tool_allowed_by_runtime_state("unload_toolset") {
+                    bail!(
+                        "tool `unload_toolset` is not enabled for thread `{}`",
+                        thread_id
+                    );
+                }
                 let toolset_name = request
                     .arguments
                     .get("name")
@@ -1736,18 +1964,21 @@ impl Thread {
                 if let Some(request_runtime) = self.request_runtime.as_ref() {
                     context = context.with_sessions(request_runtime.sessions.clone());
                 }
-                if !self.tool_allowed_by_feature_state(&request.name) {
-                    bail!(
-                        "tool `{}` is not enabled for thread `{}`",
-                        request.name,
-                        thread_id
-                    );
-                }
                 if let Some(handler) = tool_registry.always_visible_handler(&request.name).await {
+                    if !self.tool_allowed_by_runtime_state(&request.name) {
+                        bail!(
+                            "tool `{}` is not enabled for thread `{}`",
+                            request.name,
+                            thread_id
+                        );
+                    }
                     handler.call_with_context(context, request).await
                 } else {
                     let mut resolved_handler = None;
                     for toolset_name in self.load_toolsets() {
+                        if !self.toolset_allowed_by_runtime_state(&toolset_name) {
+                            continue;
+                        }
                         if let Some(handler) = tool_registry
                             .toolset_handler(&toolset_name, &request.name)
                             .await?
@@ -1865,18 +2096,54 @@ impl Thread {
         self.state.features.enabled_features.remove(feature);
     }
 
-    fn tool_allowed_by_feature_state(&self, tool_name: &str) -> bool {
+    fn tool_allowed_by_runtime_state(&self, tool_name: &str) -> bool {
+        let capability_profile = self.thread_agent_kind().capability_profile();
         match tool_name {
+            "load_toolset" | "unload_toolset" => {
+                capability_profile.allows_always_visible_tool(tool_name)
+                    && matches!(
+                        capability_profile.optional_toolset_access,
+                        agent::ThreadAgentOptionalToolsetAccess::AllRegisteredExcept(_)
+                    )
+            }
+            "compact" => capability_profile.allows_always_visible_tool(tool_name),
             _ if feature::init::subagent::owns_always_visible_tool(tool_name) => {
-                self.child_thread_identity().is_none()
+                capability_profile.allows_always_visible_tool(tool_name)
+                    && self.child_thread_identity().is_none()
                     && self.thread_agent_kind() == ThreadAgentKind::Main
                     && self.is_enabled(Feature::Subagent)
             }
             _ if feature::init::skill::owns_always_visible_tool(tool_name) => {
-                self.is_enabled(Feature::Skill)
+                capability_profile.allows_always_visible_tool(tool_name)
+                    && self.is_enabled(Feature::Skill)
             }
-            _ => true,
+            _ => capability_profile.allows_always_visible_tool(tool_name),
         }
+    }
+
+    fn optional_toolset_allowed_by_runtime_state(&self, toolset_name: &str) -> bool {
+        self.thread_agent_kind()
+            .capability_profile()
+            .allows_optional_toolset(toolset_name)
+    }
+
+    fn toolset_allowed_by_runtime_state(&self, toolset_name: &str) -> bool {
+        self.thread_agent_kind()
+            .capability_profile()
+            .allows_loaded_toolset(toolset_name)
+    }
+
+    async fn supports_optional_toolset_controls(&self, tool_registry: &ToolRegistry) -> bool {
+        let capability_profile = self.thread_agent_kind().capability_profile();
+        if !self.tool_allowed_by_runtime_state("load_toolset") {
+            return false;
+        }
+
+        tool_registry
+            .list_toolsets()
+            .await
+            .into_iter()
+            .any(|entry| capability_profile.allows_optional_toolset(&entry.name))
     }
 }
 

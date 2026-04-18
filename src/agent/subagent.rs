@@ -105,8 +105,7 @@ impl SubagentRunner {
         compact_config: AgentCompactConfig,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::channel(64);
-        let agent_loop =
-            AgentLoop::with_compact_config(llm, runtime, llm_config, compact_config);
+        let agent_loop = AgentLoop::with_compact_config(llm, runtime, llm_config, compact_config);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 run_subagent_worker(agent_loop, request_rx).await;
@@ -135,9 +134,7 @@ impl SubagentRunner {
             .map_err(|error| anyhow!("failed to enqueue subagent request: {error}"))?;
         response_rx
             .await
-            .map_err(|error| {
-                anyhow!("subagent worker dropped response channel: {error}")
-            })?
+            .map_err(|error| anyhow!("subagent worker dropped response channel: {error}"))?
     }
 }
 
@@ -203,12 +200,7 @@ async fn handle_subagent_request(
         dispatch_events: Vec::new(),
     };
     let output = agent_loop
-        .run_locked_thread(
-            event_sender,
-            &incoming,
-            &mut thread_context,
-            &mut collector,
-        )
+        .run_locked_thread(event_sender, &incoming, &mut thread_context, &mut collector)
         .await;
     let succeeded = output
         .as_ref()

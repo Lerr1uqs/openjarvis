@@ -605,17 +605,28 @@ impl ToolRegistry {
 
     pub(crate) async fn render_toolset_catalog_prompt(
         &self,
+        capability_profile: crate::thread::ThreadAgentCapabilityProfile,
         loaded_toolsets: &[String],
     ) -> Option<String> {
-        let entries = self.list_toolsets().await;
+        let entries = self
+            .list_toolsets()
+            .await
+            .into_iter()
+            .filter(|entry| capability_profile.allows_optional_toolset(&entry.name))
+            .collect::<Vec<_>>();
         if entries.is_empty() {
             return None;
         }
 
-        let loaded_summary = if loaded_toolsets.is_empty() {
+        let loaded_summary = loaded_toolsets
+            .iter()
+            .filter(|toolset_name| capability_profile.allows_optional_toolset(toolset_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let loaded_summary = if loaded_summary.is_empty() {
             "none".to_string()
         } else {
-            loaded_toolsets.join(", ")
+            loaded_summary.join(", ")
         };
         let catalog = entries
             .into_iter()

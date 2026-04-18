@@ -3,14 +3,21 @@ mod support;
 
 use chrono::Utc;
 use openjarvis::{
+    agent::{FeatureResolver, MemoryRepository, ToolRegistry},
     command::{CommandInvocation, CommandRegistry},
     compact::ContextBudgetEstimator,
     config::AppConfig,
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
     model::{IncomingMessage, ReplyTarget},
-    thread::{Feature, Thread, ThreadContextLocator, derive_internal_thread_id},
+    session::{SessionManager, ThreadLocator},
+    thread::{
+        ChildThreadIdentity, DEFAULT_ASSISTANT_SYSTEM_PROMPT, DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT,
+        Feature, Features, SubagentSpawnMode, Thread, ThreadAgentKind, ThreadContextLocator,
+        ThreadRuntime, derive_internal_thread_id,
+    },
 };
 use serde_json::json;
+use std::sync::Arc;
 use support::ThreadTestExt;
 use uuid::Uuid;
 
@@ -271,12 +278,18 @@ async fn builtin_context_command_rejects_invalid_detail_count() {
 }
 
 #[tokio::test]
-async fn builtin_clear_command_resets_thread_context_to_initial_state() {
-    // 测试场景: /clear 应清空当前线程全部历史消息和线程级 runtime 状态。
+async fn builtin_new_command_reinitializes_thread_context_to_initialized_state() {
+    // 测试场景: `/new` 应清掉普通历史和线程级运行态，但命令返回前必须恢复稳定初始化前缀。
     let registry = CommandRegistry::with_builtin_commands();
-    let incoming = build_incoming("/clear");
+    let runtime = build_thread_runtime();
+    let incoming = build_incoming("/new");
     let now = Utc::now();
     let mut thread_context = build_thread_context();
+    runtime
+        .initialize_thread(&mut thread_context, ThreadAgentKind::Main)
+        .await
+        .expect("main thread should initialize before /new");
+    let system_message_count_before = thread_context.system_messages().len();
     thread_context.enable_feature(Feature::AutoCompact);
     thread_context.append_persisted_messages_with_state_for_test(
         vec![openjarvis::context::ChatMessage::new(
@@ -288,18 +301,199 @@ async fn builtin_clear_command_resets_thread_context_to_initial_state() {
     );
 
     let reply = registry
-        .try_execute_with_thread_context(&incoming, &mut thread_context)
+        .try_execute_with_thread_context_and_runtime(
+            &incoming,
+            &mut thread_context,
+            Some(runtime.as_ref()),
+        )
         .await
-        .expect("clear command should execute")
-        .expect("clear command should be handled");
+        .expect("new command should execute")
+        .expect("new command should be handled");
 
     assert_eq!(
         reply.formatted_content(),
-        "[Command][clear][SUCCESS]: cleared current thread `thread_command`; all chat messages and thread-scoped runtime state have been reset"
+        "[Command][new][SUCCESS]: reinitialized current thread `thread_command`; stable system prefix and thread-scoped runtime state have been rebuilt"
+    );
+    assert!(thread_context.is_initialized());
+    assert_eq!(thread_context.thread_agent_kind(), ThreadAgentKind::Main);
+    assert_eq!(
+        thread_context.messages()[0].content,
+        DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim()
+    );
+    assert_eq!(
+        thread_context.system_messages().len(),
+        system_message_count_before
     );
     assert!(thread_context.non_system_messages().is_empty());
     assert!(thread_context.load_toolsets().is_empty());
     assert!(!thread_context.auto_compact_enabled(false));
+}
+
+#[tokio::test]
+async fn builtin_new_command_keeps_browser_child_thread_identity() {
+    // 测试场景: browser child thread 执行 `/new` 后仍然保留 browser kind 和 child identity。
+    let registry = CommandRegistry::with_builtin_commands();
+    let runtime = build_thread_runtime();
+    let now = Utc::now();
+    let child_identity =
+        ChildThreadIdentity::new("parent-thread", "browser", SubagentSpawnMode::Persist);
+    let mut thread_context = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_command",
+            "thread_browser_child",
+            "thread_browser_child",
+        )
+        .with_child_thread(child_identity.clone()),
+        now,
+    );
+    thread_context
+        .persist_child_thread_identity(child_identity.clone())
+        .await
+        .expect("browser child identity should persist before /new");
+    runtime
+        .initialize_thread(&mut thread_context, ThreadAgentKind::Browser)
+        .await
+        .expect("browser child thread should initialize before /new");
+    thread_context.append_persisted_messages_for_test(vec![ChatMessage::new(
+        ChatMessageRole::User,
+        "browser history before /new",
+        now,
+    )]);
+
+    let reply = registry
+        .try_execute_with_thread_context_and_runtime(
+            &build_incoming("/new"),
+            &mut thread_context,
+            Some(runtime.as_ref()),
+        )
+        .await
+        .expect("browser /new command should execute")
+        .expect("browser /new command should be handled");
+
+    assert_eq!(
+        reply.formatted_content(),
+        "[Command][new][SUCCESS]: reinitialized current thread `thread_browser_child`; stable system prefix and thread-scoped runtime state have been rebuilt"
+    );
+    assert!(thread_context.is_initialized());
+    assert_eq!(thread_context.thread_agent_kind(), ThreadAgentKind::Browser);
+    assert_eq!(
+        thread_context.child_thread_identity(),
+        Some(&child_identity)
+    );
+    assert_eq!(
+        thread_context.messages()[0].content,
+        DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT.trim()
+    );
+    assert!(thread_context.non_system_messages().is_empty());
+}
+
+#[tokio::test]
+async fn builtin_new_command_reinitializes_attached_persist_child_threads() {
+    // 测试场景: parent `/new` 必须把当前 parent 名下的 persist child thread 一起 reset/reinit。
+    let registry = CommandRegistry::with_builtin_commands();
+    let runtime = build_thread_runtime();
+    let sessions = SessionManager::new();
+    sessions.install_thread_runtime(runtime.clone());
+
+    let seed_incoming = build_incoming("seed parent");
+    let parent_locator = sessions
+        .create_thread(&seed_incoming, ThreadAgentKind::Main)
+        .await
+        .expect("parent thread should resolve");
+    let child_locator =
+        ThreadLocator::for_child(&parent_locator, "browser", SubagentSpawnMode::Persist);
+    let child_locator = sessions
+        .create_thread_at(
+            &child_locator,
+            seed_incoming.received_at,
+            ThreadAgentKind::Browser,
+        )
+        .await
+        .expect("persist child thread should resolve");
+
+    {
+        let mut child_thread = sessions
+            .lock_thread(&child_locator, seed_incoming.received_at)
+            .await
+            .expect("child lock should resolve")
+            .expect("child thread should exist");
+        child_thread
+            .push_message(ChatMessage::new(
+                ChatMessageRole::User,
+                "child history before /new",
+                seed_incoming.received_at,
+            ))
+            .await
+            .expect("child history should persist");
+    }
+
+    let mut parent_thread = sessions
+        .lock_thread(&parent_locator, seed_incoming.received_at)
+        .await
+        .expect("parent lock should resolve")
+        .expect("parent thread should exist");
+    parent_thread.bind_request_runtime(sessions.clone());
+    parent_thread
+        .push_message(ChatMessage::new(
+            ChatMessageRole::User,
+            "parent history before /new",
+            seed_incoming.received_at,
+        ))
+        .await
+        .expect("parent history should persist");
+
+    let reply = registry
+        .try_execute_with_thread_context_and_runtime(
+            &build_incoming("/new"),
+            &mut parent_thread,
+            Some(runtime.as_ref()),
+        )
+        .await
+        .expect("parent /new should execute")
+        .expect("parent /new should be handled");
+    assert!(
+        reply
+            .formatted_content()
+            .contains("[Command][new][SUCCESS]")
+    );
+    drop(parent_thread);
+
+    let child_after_new = sessions
+        .load_thread(&child_locator)
+        .await
+        .expect("child thread should load after /new")
+        .expect("child thread should still exist after /new");
+    assert!(child_after_new.is_initialized());
+    assert_eq!(
+        child_after_new.thread_agent_kind(),
+        ThreadAgentKind::Browser
+    );
+    assert_eq!(
+        child_after_new.messages()[0].content,
+        DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT.trim()
+    );
+    assert!(child_after_new.non_system_messages().is_empty());
+}
+
+#[tokio::test]
+async fn builtin_new_command_requires_installed_thread_runtime() {
+    // 测试场景: `/new` 若当前进程没有安装 thread runtime，应显式失败而不是留下半重置状态。
+    let registry = CommandRegistry::with_builtin_commands();
+    let mut thread_context = build_thread_context();
+
+    let reply = registry
+        .try_execute_with_thread_context(&build_incoming("/new"), &mut thread_context)
+        .await
+        .expect("new command without runtime should execute")
+        .expect("new command without runtime should be handled");
+
+    assert_eq!(
+        reply.formatted_content(),
+        "[Command][new][FAILED]: current process does not have one installed thread runtime; /new is unavailable"
+    );
+    assert!(!thread_context.is_initialized());
 }
 
 #[tokio::test]
@@ -348,6 +542,26 @@ async fn unknown_slash_command_returns_failed_reply() {
         reply.formatted_content(),
         "[Command][unknown][FAILED]: unknown command"
     );
+}
+
+#[tokio::test]
+async fn removed_clear_command_returns_unknown_reply_without_mutating_thread() {
+    // 测试场景: `/clear` 已被移除，执行时只返回 unknown command，不得再修改线程。
+    let registry = CommandRegistry::with_builtin_commands();
+    let mut thread_context = build_thread_context();
+
+    let reply = registry
+        .try_execute_with_thread_context(&build_incoming("/clear"), &mut thread_context)
+        .await
+        .expect("removed clear command should still execute through registry")
+        .expect("removed clear command should be handled as unknown command");
+
+    assert_eq!(
+        reply.formatted_content(),
+        "[Command][clear][FAILED]: unknown command"
+    );
+    assert!(thread_context.messages().is_empty());
+    assert!(!thread_context.is_initialized());
 }
 
 #[tokio::test]
@@ -447,6 +661,15 @@ fn build_thread_context() -> Thread {
         ),
         Utc::now(),
     )
+}
+
+fn build_thread_runtime() -> Arc<ThreadRuntime> {
+    Arc::new(ThreadRuntime::with_feature_resolver(
+        Arc::new(ToolRegistry::new()),
+        Arc::new(MemoryRepository::new(".")),
+        AppConfig::default().agent_config().compact_config().clone(),
+        FeatureResolver::development_default(Features::default()),
+    ))
 }
 
 fn context_estimator() -> ContextBudgetEstimator {

@@ -3,7 +3,8 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     session::{MemorySessionStore, SessionStore, ThreadLocator},
     thread::{
-        ChildThreadIdentity, Feature, SubagentSpawnMode, Thread, ThreadContextLocator,
+        ChildThreadIdentity, DEFAULT_ASSISTANT_SYSTEM_PROMPT, DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT,
+        Feature, SubagentSpawnMode, Thread, ThreadAgent, ThreadAgentKind, ThreadContextLocator,
         derive_child_thread_id, derive_internal_thread_id,
     },
 };
@@ -200,6 +201,24 @@ fn derive_internal_thread_id_is_stable() {
         thread_id,
         derive_internal_thread_id("ou_thread:feishu:chat_thread")
     );
+}
+
+#[test]
+fn thread_agent_kind_profiles_follow_predefined_catalog_defaults() {
+    // 测试场景: `ThreadAgentKind` 的初始化真相来自仓库静态 agent catalog，而不是散落的硬编码默认值。
+    let main_agent = ThreadAgent::from_kind(ThreadAgentKind::Main);
+    let browser_agent = ThreadAgent::from_kind(ThreadAgentKind::Browser);
+
+    assert_eq!(
+        ThreadAgentKind::Main.system_prompt(),
+        DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim()
+    );
+    assert_eq!(
+        ThreadAgentKind::Browser.system_prompt(),
+        DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT.trim()
+    );
+    assert!(main_agent.bound_toolsets.is_empty());
+    assert_eq!(browser_agent.bound_toolsets, vec!["browser".to_string()]);
 }
 
 #[test]

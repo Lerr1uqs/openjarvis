@@ -1,0 +1,42 @@
+# 预定义 Agent 能力画像静态清单。
+# 这里只定义仓库内置的 AgentKind 真相，不提供运行时覆盖。
+
+main:
+  system_prompt: main
+  features:
+    init_policy: resolver
+    default:
+      - memory
+      - skill
+      - subagent
+      - auto_compact
+    allowed:
+      - memory
+      - skill
+      - subagent
+      - auto_compact
+  visible_tools:
+    mode: all_registered
+    names: []
+  toolsets:
+    bound: []
+    optional:
+      mode: all_registered_except
+      names:
+        - browser
+
+browser:
+  system_prompt: browser
+  features:
+    init_policy: defaults
+    default: []
+    allowed: []
+  visible_tools:
+    mode: only
+    names: []
+  toolsets:
+    bound:
+      - browser
+    optional:
+      mode: none
+      names: []

@@ -16,12 +16,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::{Arc, Weak};
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SpawnSubagentArguments {
     subagent_key: String,
+    content: String,
     #[serde(default = "default_spawn_mode")]
     spawn_mode: SubagentSpawnMode,
 }
@@ -31,8 +32,6 @@ struct SpawnSubagentArguments {
 struct SendSubagentArguments {
     subagent_key: String,
     content: String,
-    #[serde(default = "default_spawn_mode")]
-    spawn_mode: SubagentSpawnMode,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -100,6 +99,77 @@ impl SubagentToolBase {
         spawn_mode: SubagentSpawnMode,
     ) -> ThreadLocator {
         ThreadLocator::for_child(parent_locator, subagent_key, spawn_mode)
+    }
+
+    fn require_non_empty_content(&self, content: &str, tool_name: &str) -> Result<()> {
+        if content.trim().is_empty() {
+            bail!("{tool_name} requires non-empty content");
+        }
+        Ok(())
+    }
+
+    async fn existing_child_mode(
+        &self,
+        sessions: &SessionManager,
+        child_locator: &ThreadLocator,
+    ) -> Result<Option<SubagentSpawnMode>> {
+        let child_thread = sessions.load_thread(child_locator).await?;
+        Ok(child_thread
+            .and_then(|thread| thread.child_thread_identity().map(|child| child.spawn_mode)))
+    }
+
+    async fn require_existing_persist_child(
+        &self,
+        sessions: &SessionManager,
+        parent_locator: &ThreadLocator,
+        subagent_key: &str,
+        tool_name: &str,
+        require_initialized: bool,
+    ) -> Result<ThreadLocator> {
+        let child_locator =
+            self.child_locator(parent_locator, subagent_key, SubagentSpawnMode::Persist);
+        let Some(child_thread) = sessions.load_thread(&child_locator).await? else {
+            bail!(
+                "{tool_name} requires an existing persist subagent `{subagent_key}`; call spawn_subagent first"
+            );
+        };
+        let Some(child_identity) = child_thread.child_thread_identity() else {
+            bail!(
+                "{tool_name} found child thread `{}` without persisted child identity",
+                child_locator.thread_id
+            );
+        };
+        if child_identity.spawn_mode != SubagentSpawnMode::Persist {
+            bail!(
+                "{tool_name} only supports persist subagents; `{subagent_key}` is currently `{}`",
+                child_identity.spawn_mode.as_str()
+            );
+        }
+        if require_initialized && !child_thread.is_initialized() {
+            bail!(
+                "persist subagent `{subagent_key}` is not available; call spawn_subagent to reinitialize it first"
+            );
+        }
+        Ok(child_locator)
+    }
+}
+
+async fn cleanup_yolo_child_thread(
+    sessions: &SessionManager,
+    child_locator: &ThreadLocator,
+    subagent_key: &str,
+) -> (bool, Option<String>) {
+    match sessions.remove_thread(child_locator).await {
+        Ok(removed) => (removed, None),
+        Err(error) => {
+            warn!(
+                thread_id = %child_locator.thread_id,
+                subagent_key = %subagent_key,
+                error = %error,
+                "best-effort yolo child-thread cleanup failed"
+            );
+            (false, Some(error.to_string()))
+        }
     }
 }
 
@@ -174,7 +244,7 @@ impl ToolHandler for SpawnSubagentTool {
     fn definition(&self) -> ToolDefinition {
         tool_definition_from_args::<SpawnSubagentArguments>(
             "spawn_subagent",
-            "Prepare one named subagent child thread for the current parent thread, reusing the existing child thread when the same profile was already prepared.",
+            "Create or reuse one named subagent child thread, immediately execute the first task, and return the aggregated result.",
         )
     }
 
@@ -189,6 +259,10 @@ impl ToolHandler for SpawnSubagentTool {
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: SpawnSubagentArguments = parse_tool_arguments(request, "spawn_subagent")?;
+        self.base
+            .require_non_empty_content(&args.content, "spawn_subagent")?;
+
+        let runner = self.base.upgrade_runner()?;
         let (sessions, parent_locator) = self
             .base
             .require_parent_context(&context, "spawn_subagent")?;
@@ -196,22 +270,60 @@ impl ToolHandler for SpawnSubagentTool {
         let child_locator =
             self.base
                 .child_locator(&parent_locator, &args.subagent_key, args.spawn_mode);
+
+        if let Some(existing_mode) = self
+            .base
+            .existing_child_mode(&sessions, &child_locator)
+            .await?
+            && existing_mode != args.spawn_mode
+        {
+            bail!(
+                "subagent `{}` already exists in `{}` mode; mixed-mode reuse is not supported",
+                args.subagent_key,
+                existing_mode.as_str()
+            );
+        }
+
+        info!(
+            parent_thread_id = %parent_locator.thread_id,
+            child_thread_id = %child_locator.thread_id,
+            subagent_key = %args.subagent_key,
+            spawn_mode = %args.spawn_mode.as_str(),
+            "spawning subagent and executing first task"
+        );
         let child_locator = sessions
             .create_thread_at(&child_locator, Utc::now(), thread_agent_kind)
             .await?;
+        let run_result = runner
+            .run(SubagentRequest {
+                parent_locator: parent_locator.clone(),
+                child_locator: child_locator.clone(),
+                prompt: args.content,
+                sessions: sessions.clone(),
+            })
+            .await;
+
+        let (cleanup_removed, cleanup_error) = if args.spawn_mode == SubagentSpawnMode::Yolo {
+            cleanup_yolo_child_thread(&sessions, &child_locator, &args.subagent_key).await
+        } else {
+            (false, None)
+        };
+
+        let result = run_result?;
         Ok(ToolCallResult {
-            content: format!(
-                "Subagent `{}` is ready on child thread `{}`.",
-                args.subagent_key, child_locator.thread_id
-            ),
+            content: result.output.reply.clone(),
             metadata: json!({
                 "event_kind": "spawn_subagent",
                 "subagent_key": args.subagent_key,
                 "spawn_mode": args.spawn_mode.as_str(),
                 "thread_id": child_locator.thread_id.to_string(),
-                "available": true,
+                "request_status": if result.output.succeeded { "succeeded" } else { "failed" },
+                "internal_dispatch_event_count": result.dispatch_events.len(),
+                "available": args.spawn_mode == SubagentSpawnMode::Persist,
+                "cleanup_removed": cleanup_removed,
+                "cleanup_error": cleanup_error,
             }),
-            is_error: false,
+            is_error: !result.output.succeeded,
         })
     }
 }
@@ -221,7 +333,7 @@ impl ToolHandler for SendSubagentTool {
     fn definition(&self) -> ToolDefinition {
         tool_definition_from_args::<SendSubagentArguments>(
             "send_subagent",
-            "Synchronously execute one subagent request on a dedicated child thread and return the aggregated result in a single tool response.",
+            "Send one follow-up task to an existing persist subagent child thread and return the aggregated result.",
         )
     }
 
@@ -236,21 +348,31 @@ impl ToolHandler for SendSubagentTool {
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: SendSubagentArguments = parse_tool_arguments(request, "send_subagent")?;
-        if args.content.trim().is_empty() {
-            bail!("send_subagent requires non-empty content");
-        }
+        self.base
+            .require_non_empty_content(&args.content, "send_subagent")?;
 
         let runner = self.base.upgrade_runner()?;
         let (sessions, parent_locator) = self
             .base
             .require_parent_context(&context, "send_subagent")?;
-        let thread_agent_kind = self.base.resolve_subagent_kind(&args.subagent_key)?;
-        let child_locator =
-            self.base
-                .child_locator(&parent_locator, &args.subagent_key, args.spawn_mode);
-        let child_locator = sessions
-            .create_thread_at(&child_locator, Utc::now(), thread_agent_kind)
+        let _ = self.base.resolve_subagent_kind(&args.subagent_key)?;
+        let child_locator = self
+            .base
+            .require_existing_persist_child(
+                &sessions,
+                &parent_locator,
+                &args.subagent_key,
+                "send_subagent",
+                true,
+            )
             .await?;
+
+        info!(
+            parent_thread_id = %parent_locator.thread_id,
+            child_thread_id = %child_locator.thread_id,
+            subagent_key = %args.subagent_key,
+            "sending follow-up task to persist subagent"
+        );
         let result = runner
             .run(SubagentRequest {
                 parent_locator: parent_locator.clone(),
@@ -260,37 +382,15 @@ impl ToolHandler for SendSubagentTool {
             })
             .await?;
 
-        let mut cleanup_error = None;
-        let cleanup_removed =
-            if args.spawn_mode == SubagentSpawnMode::Yolo && result.output.succeeded {
-                match sessions.remove_thread(&child_locator).await {
-                    Ok(removed) => removed,
-                    Err(error) => {
-                        warn!(
-                            thread_id = %child_locator.thread_id,
-                            subagent_key = %args.subagent_key,
-                            error = %error,
-                            "best-effort yolo child-thread cleanup failed"
-                        );
-                        cleanup_error = Some(error.to_string());
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
         Ok(ToolCallResult {
             content: result.output.reply.clone(),
             metadata: json!({
                 "event_kind": "send_subagent",
                 "subagent_key": args.subagent_key,
-                "spawn_mode": args.spawn_mode.as_str(),
+                "spawn_mode": SubagentSpawnMode::Persist.as_str(),
                 "thread_id": child_locator.thread_id.to_string(),
                 "request_status": if result.output.succeeded { "succeeded" } else { "failed" },
                 "internal_dispatch_event_count": result.dispatch_events.len(),
-                "cleanup_removed": cleanup_removed,
-                "cleanup_error": cleanup_error,
             }),
             is_error: !result.output.succeeded,
         })
@@ -302,7 +402,7 @@ impl ToolHandler for CloseSubagentTool {
     fn definition(&self) -> ToolDefinition {
         tool_definition_from_args::<CloseSubagentArguments>(
             "close_subagent",
-            "Stop reusing one prepared subagent child thread while keeping its stable child-thread identity for future re-prepare flows.",
+            "Close one existing persist subagent child thread while keeping its stable child-thread identity for future respawn flows.",
         )
     }
 
@@ -325,6 +425,36 @@ impl ToolHandler for CloseSubagentTool {
             &args.subagent_key,
             SubagentSpawnMode::Persist,
         );
+
+        let Some(existing_mode) = self
+            .base
+            .existing_child_mode(&sessions, &child_locator)
+            .await?
+        else {
+            return Ok(ToolCallResult {
+                content: format!("Subagent `{}` was not found.", args.subagent_key),
+                metadata: json!({
+                    "event_kind": "close_subagent",
+                    "subagent_key": args.subagent_key,
+                    "closed": false,
+                }),
+                is_error: false,
+            });
+        };
+        if existing_mode != SubagentSpawnMode::Persist {
+            bail!(
+                "close_subagent only supports persist subagents; `{}` is currently `{}`",
+                args.subagent_key,
+                existing_mode.as_str()
+            );
+        }
+
+        info!(
+            parent_thread_id = %parent_locator.thread_id,
+            child_thread_id = %child_locator.thread_id,
+            subagent_key = %args.subagent_key,
+            "closing persist subagent"
+        );
         let Some(mut child_thread) = sessions.lock_thread(&child_locator, Utc::now()).await? else {
             return Ok(ToolCallResult {
                 content: format!("Subagent `{}` was not found.", args.subagent_key),
@@ -336,22 +466,34 @@ impl ToolHandler for CloseSubagentTool {
                 is_error: false,
             });
         };
-        let spawn_mode = child_thread
-            .child_thread_identity()
-            .map(|child| child.spawn_mode.as_str())
-            .unwrap_or(SubagentSpawnMode::Persist.as_str());
+        if !child_thread.is_initialized() {
+            return Ok(ToolCallResult {
+                content: format!(
+                    "Persist subagent `{}` was already closed.",
+                    args.subagent_key
+                ),
+                metadata: json!({
+                    "event_kind": "close_subagent",
+                    "subagent_key": args.subagent_key,
+                    "spawn_mode": SubagentSpawnMode::Persist.as_str(),
+                    "closed": false,
+                    "already_closed": true,
+                }),
+                is_error: false,
+            });
+        }
         child_thread
             .reset_to_initial_state_preserving_child_thread(Utc::now())
             .await?;
         Ok(ToolCallResult {
             content: format!(
-                "Subagent `{}` was closed and must be prepared again before reuse.",
+                "Persist subagent `{}` was closed and must be spawned again before reuse.",
                 args.subagent_key
             ),
             metadata: json!({
                 "event_kind": "close_subagent",
                 "subagent_key": args.subagent_key,
-                "spawn_mode": spawn_mode,
+                "spawn_mode": SubagentSpawnMode::Persist.as_str(),
                 "closed": true,
             }),
             is_error: false,
@@ -391,11 +533,13 @@ impl ToolHandler for ListSubagentTool {
             .into_iter()
             .filter_map(|record| {
                 let child = record.snapshot.state.child_thread?;
+                let available = child.spawn_mode == SubagentSpawnMode::Persist
+                    && record.snapshot.state.lifecycle.initialized;
                 Some(json!({
                     "subagent_key": child.subagent_key,
                     "spawn_mode": child.spawn_mode.as_str(),
                     "thread_id": record.locator.thread_id,
-                    "available": record.snapshot.state.lifecycle.initialized,
+                    "available": available,
                 }))
             })
             .collect::<Vec<_>>();

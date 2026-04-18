@@ -386,6 +386,14 @@ impl SessionManager {
         *runtime = Some(thread_runtime);
     }
 
+    pub(crate) fn thread_runtime(&self) -> Option<Arc<ThreadRuntime>> {
+        self.inner
+            .thread_runtime
+            .read()
+            .expect("thread runtime lock should not be poisoned")
+            .clone()
+    }
+
     fn resolve_thread_locator(&self, incoming: &IncomingMessage) -> ThreadLocator {
         let session_key = SessionKey::from_incoming(incoming);
         let external_thread_id = incoming.resolved_external_thread_id();

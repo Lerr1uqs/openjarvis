@@ -14,7 +14,7 @@ use crate::{
     config::{AppConfig, try_global_config},
     context::{ChatMessage, ChatMessageRole, ContextTokenKind},
     model::IncomingMessage,
-    thread::Thread,
+    thread::{Thread, ThreadRuntime},
 };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -231,6 +231,7 @@ pub trait CommandHandler: Send + Sync {
         invocation: &CommandInvocation,
         incoming: &IncomingMessage,
         thread_context: &mut Thread,
+        thread_runtime: Option<&ThreadRuntime>,
     ) -> Result<CommandReply>;
 }
 
@@ -279,8 +280,8 @@ impl CommandRegistry {
             .register("context", Arc::new(ContextCommand))
             .expect("built-in context command should register");
         registry
-            .register("clear", Arc::new(ClearCommand))
-            .expect("built-in clear command should register");
+            .register("new", Arc::new(NewCommand))
+            .expect("built-in new command should register");
         registry
     }
 
@@ -314,6 +315,7 @@ impl CommandRegistry {
     ///         _invocation: &CommandInvocation,
     ///         _incoming: &IncomingMessage,
     ///         _thread_context: &mut openjarvis::thread::Thread,
+    ///         _thread_runtime: Option<&openjarvis::thread::ThreadRuntime>,
     ///     ) -> anyhow::Result<CommandReply> {
     ///         Ok(CommandReply::success("ping", "pong"))
     ///     }
@@ -370,6 +372,17 @@ impl CommandRegistry {
         incoming: &IncomingMessage,
         thread_context: &mut Thread,
     ) -> Result<Option<CommandReply>> {
+        self.try_execute_with_thread_context_and_runtime(incoming, thread_context, None)
+            .await
+    }
+
+    /// Try to execute one incoming message as a slash command with one optional installed runtime.
+    pub async fn try_execute_with_thread_context_and_runtime(
+        &self,
+        incoming: &IncomingMessage,
+        thread_context: &mut Thread,
+        thread_runtime: Option<&ThreadRuntime>,
+    ) -> Result<Option<CommandReply>> {
         let normalized_content = remove_prefix_at_if_exist(incoming);
         let Some(invocation) = CommandInvocation::parse(&normalized_content)? else {
             return Ok(None);
@@ -384,7 +397,7 @@ impl CommandRegistry {
 
         Ok(Some(
             handler
-                .execute(&invocation, incoming, thread_context)
+                .execute(&invocation, incoming, thread_context, thread_runtime)
                 .await?,
         ))
     }
@@ -405,6 +418,7 @@ impl CommandHandler for TestCommand {
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
         _thread_context: &mut Thread,
+        _thread_runtime: Option<&ThreadRuntime>,
     ) -> Result<CommandReply> {
         let message = if invocation.raw_arguments().is_empty() {
             "test command ok".to_string()
@@ -424,6 +438,7 @@ impl CommandHandler for EqualCommand {
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
         _thread_context: &mut Thread,
+        _thread_runtime: Option<&ThreadRuntime>,
     ) -> Result<CommandReply> {
         let arguments = invocation.arguments();
         if arguments.len() != 2 {
@@ -456,6 +471,7 @@ impl CommandHandler for EchoCommand {
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
         _thread_context: &mut Thread,
+        _thread_runtime: Option<&ThreadRuntime>,
     ) -> Result<CommandReply> {
         Ok(CommandReply::success(
             invocation.name(),
@@ -479,6 +495,7 @@ impl CommandHandler for ContextCommand {
         invocation: &CommandInvocation,
         _incoming: &IncomingMessage,
         thread_context: &mut Thread,
+        _thread_runtime: Option<&ThreadRuntime>,
     ) -> Result<CommandReply> {
         let messages = thread_context.messages();
         let estimator = context_budget_estimator();
@@ -559,16 +576,16 @@ impl CommandHandler for ContextCommand {
     }
 }
 
-struct ClearCommand;
+struct NewCommand;
 
-impl ClearCommand {
+impl NewCommand {
     fn usage(name: &str) -> CommandReply {
-        CommandReply::failed(name, "usage: /clear")
+        CommandReply::failed(name, "usage: /new")
     }
 }
 
 #[async_trait]
-impl CommandHandler for ClearCommand {
+impl CommandHandler for NewCommand {
     fn requires_idle_thread(&self) -> bool {
         true
     }
@@ -578,23 +595,33 @@ impl CommandHandler for ClearCommand {
         invocation: &CommandInvocation,
         incoming: &IncomingMessage,
         thread_context: &mut Thread,
+        thread_runtime: Option<&ThreadRuntime>,
     ) -> Result<CommandReply> {
         if !invocation.arguments().is_empty() {
             return Ok(Self::usage(invocation.name()));
         }
 
+        let Some(thread_runtime) = thread_runtime else {
+            return Ok(CommandReply::failed(
+                invocation.name(),
+                "current process does not have one installed thread runtime; /new is unavailable",
+            ));
+        };
+
         info!(
             thread_id = %thread_context.locator.thread_id,
             external_thread_id = %thread_context.locator.external_thread_id,
-            "clearing thread history and runtime state by command"
+            thread_agent_kind = thread_context.thread_agent_kind().as_str(),
+            child_thread = thread_context.child_thread_identity().is_some(),
+            "reinitializing current thread by command"
         );
-        thread_context
-            .reset_to_initial_state(incoming.received_at)
+        thread_runtime
+            .reinitialize_thread(thread_context, incoming.received_at)
             .await?;
         Ok(CommandReply::success(
             invocation.name(),
             format!(
-                "cleared current thread `{}`; all chat messages and thread-scoped runtime state have been reset",
+                "reinitialized current thread `{}`; stable system prefix and thread-scoped runtime state have been rebuilt",
                 thread_context.locator.external_thread_id
             ),
         ))
