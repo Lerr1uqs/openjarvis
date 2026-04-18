@@ -6,7 +6,10 @@ use super::{
 };
 use crate::{
     session::ThreadLocator,
-    thread::{PersistedThreadSnapshot, ThreadContextLocator, ThreadSnapshotStore},
+    thread::{
+        ChildThreadIdentity, PersistedThreadSnapshot, SubagentSpawnMode, ThreadContextLocator,
+        ThreadSnapshotStore,
+    },
 };
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
@@ -18,7 +21,7 @@ use std::{
 };
 use tracing::info;
 
-const SQLITE_SCHEMA_VERSION: i64 = 3;
+const SQLITE_SCHEMA_VERSION: i64 = 4;
 
 /// SQLite store backend that persists thread snapshots and revisions.
 pub struct SqliteSessionStore {
@@ -130,6 +133,9 @@ CREATE TABLE IF NOT EXISTS thread_snapshots (
     channel TEXT NOT NULL,
     user_id TEXT NOT NULL,
     external_thread_id TEXT NOT NULL,
+    parent_thread_id TEXT,
+    subagent_key TEXT,
+    spawn_mode TEXT,
     session_id TEXT,
     revision INTEGER NOT NULL,
     snapshot_json TEXT NOT NULL,
@@ -137,7 +143,7 @@ CREATE TABLE IF NOT EXISTS thread_snapshots (
     updated_at TEXT NOT NULL
 );
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 "#,
                 )
                 .context("failed to initialize sqlite session store schema")?;
@@ -162,6 +168,7 @@ PRAGMA user_version = 3;
                 .query_row(
                     r#"
 SELECT session_id, channel, user_id, external_thread_id, snapshot_json, revision
+     , parent_thread_id, subagent_key, spawn_mode
 FROM thread_snapshots
 WHERE thread_id = ?1
 "#,
@@ -174,6 +181,9 @@ WHERE thread_id = ?1
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, i64>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
@@ -187,14 +197,28 @@ WHERE thread_id = ?1
                         external_thread_id,
                         snapshot_json,
                         revision,
+                        parent_thread_id,
+                        subagent_key,
+                        spawn_mode,
                     )| {
-                        let locator = ThreadContextLocator::new(
+                        let mut locator = ThreadContextLocator::new(
                             session_id,
                             channel,
                             user_id,
                             external_thread_id,
                             thread_id,
                         );
+                        if let (Some(parent_thread_id), Some(subagent_key), Some(spawn_mode)) =
+                            (parent_thread_id, subagent_key, spawn_mode)
+                        {
+                            if let Some(spawn_mode) = SubagentSpawnMode::parse(&spawn_mode) {
+                                locator.child_thread = Some(ChildThreadIdentity::new(
+                                    parent_thread_id,
+                                    subagent_key,
+                                    spawn_mode,
+                                ));
+                            }
+                        }
                         let snapshot =
                             serde_json::from_str::<PersistedThreadSnapshot>(&snapshot_json)
                                 .context("failed to deserialize sqlite thread snapshot")?;
@@ -212,6 +236,105 @@ WHERE thread_id = ?1
         .await
         .map_err(|error| {
             SessionStoreError::from(anyhow!("sqlite load_thread_context task failed: {error}"))
+        })?
+    }
+
+    async fn remove_thread_context(&self, locator: &ThreadLocator) -> SessionStoreResult<bool> {
+        let thread_id = locator.thread_id.to_string();
+        self.run_blocking(move |connection| {
+            Ok(connection
+                .execute(
+                    "DELETE FROM thread_snapshots WHERE thread_id = ?1",
+                    params![thread_id],
+                )
+                .context("failed to delete sqlite thread snapshot")?
+                > 0)
+        })
+        .await
+        .map_err(|error| {
+            SessionStoreError::from(anyhow!("sqlite remove_thread_context task failed: {error}"))
+        })?
+    }
+
+    async fn list_child_threads(
+        &self,
+        parent_locator: &ThreadLocator,
+    ) -> SessionStoreResult<Vec<StoredThreadRecord>> {
+        let parent_thread_id = parent_locator.thread_id.to_string();
+        self.run_blocking(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    r#"
+SELECT thread_id, session_id, channel, user_id, external_thread_id, snapshot_json, revision,
+       parent_thread_id, subagent_key, spawn_mode
+FROM thread_snapshots
+WHERE parent_thread_id = ?1
+ORDER BY updated_at ASC, thread_id ASC
+"#,
+                )
+                .context("failed to prepare sqlite child-thread listing query")?;
+            let rows = statement
+                .query_map(params![parent_thread_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                })
+                .context("failed to query sqlite child-thread records")?;
+
+            let mut records = Vec::new();
+            for row in rows {
+                let (
+                    thread_id,
+                    session_id,
+                    channel,
+                    user_id,
+                    external_thread_id,
+                    snapshot_json,
+                    revision,
+                    parent_thread_id,
+                    subagent_key,
+                    spawn_mode,
+                ) = row.context("failed to decode sqlite child-thread record")?;
+                let mut locator = ThreadContextLocator::new(
+                    session_id,
+                    channel,
+                    user_id,
+                    external_thread_id,
+                    thread_id,
+                );
+                if let (Some(parent_thread_id), Some(subagent_key), Some(spawn_mode)) =
+                    (parent_thread_id, subagent_key, spawn_mode)
+                {
+                    if let Some(spawn_mode) = SubagentSpawnMode::parse(&spawn_mode) {
+                        locator.child_thread = Some(ChildThreadIdentity::new(
+                            parent_thread_id,
+                            subagent_key,
+                            spawn_mode,
+                        ));
+                    }
+                }
+                records.push(StoredThreadRecord {
+                    locator,
+                    snapshot: serde_json::from_str::<PersistedThreadSnapshot>(&snapshot_json)
+                        .context("failed to deserialize sqlite child-thread snapshot")?,
+                    revision: u64::try_from(revision)
+                        .context("sqlite revision must not be negative")?,
+                });
+            }
+            Ok(records)
+        })
+        .await
+        .map_err(|error| {
+            SessionStoreError::from(anyhow!("sqlite list_child_threads task failed: {error}"))
         })?
     }
 }
@@ -263,6 +386,11 @@ WHERE thread_id = ?1
                     .context("failed to serialize thread snapshot")?;
                 let created_at = snapshot.thread.created_at.to_rfc3339();
                 let updated_at = snapshot.thread.updated_at.to_rfc3339();
+                let child_thread = snapshot
+                    .state
+                    .child_thread
+                    .clone()
+                    .or_else(|| locator.child_thread.clone());
                 tx.execute(
                     r#"
 INSERT INTO thread_snapshots (
@@ -271,18 +399,24 @@ INSERT INTO thread_snapshots (
     channel,
     user_id,
     external_thread_id,
+    parent_thread_id,
+    subagent_key,
+    spawn_mode,
     session_id,
     revision,
     snapshot_json,
     created_at,
     updated_at
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
 ON CONFLICT(thread_id) DO UPDATE SET
     thread_key = excluded.thread_key,
     channel = excluded.channel,
     user_id = excluded.user_id,
     external_thread_id = excluded.external_thread_id,
+    parent_thread_id = excluded.parent_thread_id,
+    subagent_key = excluded.subagent_key,
+    spawn_mode = excluded.spawn_mode,
     session_id = excluded.session_id,
     revision = excluded.revision,
     snapshot_json = excluded.snapshot_json,
@@ -295,6 +429,13 @@ ON CONFLICT(thread_id) DO UPDATE SET
                         &locator.channel,
                         &locator.user_id,
                         &locator.external_thread_id,
+                        child_thread
+                            .as_ref()
+                            .map(|child| child.parent_thread_id.as_str()),
+                        child_thread
+                            .as_ref()
+                            .map(|child| child.subagent_key.as_str()),
+                        child_thread.as_ref().map(|child| child.spawn_mode.as_str()),
                         locator.session_id.as_deref(),
                         i64::try_from(new_revision)
                             .context("thread revision does not fit in sqlite i64")?,

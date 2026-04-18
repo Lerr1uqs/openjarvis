@@ -6,6 +6,7 @@ pub mod hook;
 pub mod memory;
 pub mod runtime;
 pub mod sandbox;
+pub mod subagent;
 pub mod tool;
 pub mod worker;
 
@@ -22,6 +23,7 @@ pub use memory::{
 };
 pub use runtime::AgentRuntime;
 pub use sandbox::DummySandboxContainer;
+pub use subagent::{SubagentRequest, SubagentRunOutput, SubagentRunner};
 pub use tool::{
     CommandExecutionRequest, CommandExecutionResult, CommandSessionManager, CommandTaskSnapshot,
     CommandTaskStatus, CommandWriteRequest, EditTool, ExecCommandTool, ListUnreadCommandTasksTool,

@@ -48,6 +48,7 @@ pub struct AgentDispatchEvent {
     pub kind: AgentLoopEventKind,
     pub content: String,
     pub metadata: Value,
+    pub channel_delivery_enabled: bool,
     pub channel: String,
     pub external_thread_id: Option<String>,
     pub source_message_id: Option<String>,
@@ -63,6 +64,10 @@ pub struct AgentDispatchEvent {
 /// Bind agent dispatch events to one resolved router/session context.
 #[derive(Clone)]
 pub struct AgentEventSender {
+    channel_delivery_enabled: bool,
+    dispatch_scope: &'static str,
+    parent_thread_id: Option<String>,
+    subagent_key: Option<String>,
     channel: String,
     external_thread_id: Option<String>,
     source_message_id: Option<String>,
@@ -125,6 +130,10 @@ impl AgentEventSender {
         locator: &crate::thread::ThreadContextLocator,
     ) -> Self {
         Self {
+            channel_delivery_enabled: true,
+            dispatch_scope: "external_channel",
+            parent_thread_id: None,
+            subagent_key: None,
             channel: incoming.channel.clone(),
             external_thread_id: incoming.external_thread_id.clone(),
             source_message_id: incoming.external_message_id.clone(),
@@ -137,17 +146,61 @@ impl AgentEventSender {
         }
     }
 
+    /// Bind one internal-only sender for one subagent child thread.
+    pub fn for_subagent_thread(
+        parent_locator: &crate::session::ThreadLocator,
+        child_locator: &crate::session::ThreadLocator,
+    ) -> Self {
+        Self {
+            channel_delivery_enabled: false,
+            dispatch_scope: "subagent_internal",
+            parent_thread_id: Some(parent_locator.thread_id.to_string()),
+            subagent_key: child_locator
+                .child_thread
+                .as_ref()
+                .map(|child| child.subagent_key.clone()),
+            channel: child_locator.channel.clone(),
+            external_thread_id: Some(child_locator.external_thread_id.clone()),
+            source_message_id: None,
+            target: ReplyTarget {
+                receive_id: parent_locator.external_thread_id.clone(),
+                receive_id_type: "internal_subagent".to_string(),
+            },
+            session_id: child_locator.session_id.to_string(),
+            session_channel: child_locator.channel.clone(),
+            session_user_id: child_locator.user_id.clone(),
+            session_external_thread_id: child_locator.external_thread_id.clone(),
+            session_thread_id: child_locator.thread_id.to_string(),
+        }
+    }
+
     /// Materialize one committed agent event into a router-ready payload.
     pub fn prepare_dispatch_event(
         &self,
-        event: AgentLoopEvent,
+        mut event: AgentLoopEvent,
         source_message_id: Option<String>,
         reply_to_source: bool,
     ) -> AgentDispatchEvent {
+        if let Some(metadata) = event.metadata.as_object_mut() {
+            metadata
+                .entry("dispatch_scope".to_string())
+                .or_insert_with(|| json!(self.dispatch_scope));
+            if let Some(parent_thread_id) = self.parent_thread_id.as_ref() {
+                metadata
+                    .entry("parent_thread_id".to_string())
+                    .or_insert_with(|| json!(parent_thread_id));
+            }
+            if let Some(subagent_key) = self.subagent_key.as_ref() {
+                metadata
+                    .entry("subagent_key".to_string())
+                    .or_insert_with(|| json!(subagent_key));
+            }
+        }
         AgentDispatchEvent {
             kind: event.kind,
             content: event.content,
             metadata: event.metadata,
+            channel_delivery_enabled: self.channel_delivery_enabled,
             channel: self.channel.clone(),
             external_thread_id: self.external_thread_id.clone(),
             source_message_id,
@@ -162,6 +215,7 @@ impl AgentEventSender {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct AgentLoopOutput {
     pub reply: String,
     pub metadata: Value,

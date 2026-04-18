@@ -2,7 +2,10 @@ use chrono::Utc;
 use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     session::{MemorySessionStore, SessionStore, ThreadLocator},
-    thread::{Feature, Thread, ThreadContextLocator, derive_internal_thread_id},
+    thread::{
+        ChildThreadIdentity, Feature, SubagentSpawnMode, Thread, ThreadContextLocator,
+        derive_child_thread_id, derive_internal_thread_id,
+    },
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -196,5 +199,30 @@ fn derive_internal_thread_id_is_stable() {
     assert_eq!(
         thread_id,
         derive_internal_thread_id("ou_thread:feishu:chat_thread")
+    );
+}
+
+#[test]
+fn child_thread_identity_uses_parent_and_profile_as_stable_key() {
+    // 测试场景: child thread id 只由 parent_thread_id + subagent_key 决定，spawn_mode 不会派生第二个实例。
+    let persist =
+        ThreadContextLocator::new(None, "feishu", "ou_thread", "chat_thread", "child-thread")
+            .with_child_thread(ChildThreadIdentity::new(
+                "parent-thread",
+                "browser",
+                SubagentSpawnMode::Persist,
+            ));
+    let yolo =
+        ThreadContextLocator::new(None, "feishu", "ou_thread", "chat_thread", "child-thread")
+            .with_child_thread(ChildThreadIdentity::new(
+                "parent-thread",
+                "browser",
+                SubagentSpawnMode::Yolo,
+            ));
+
+    assert_eq!(persist.thread_key(), yolo.thread_key());
+    assert_eq!(
+        derive_child_thread_id("parent-thread", "browser"),
+        derive_child_thread_id("parent-thread", "browser")
     );
 }

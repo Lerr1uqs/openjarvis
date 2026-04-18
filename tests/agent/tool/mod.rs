@@ -7,6 +7,7 @@ mod registry;
 mod schema;
 mod shell;
 pub(crate) mod skill;
+mod subagent;
 mod toolset;
 mod write;
 

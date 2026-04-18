@@ -8,9 +8,11 @@ use crate::agent::{
 };
 use crate::config::{AgentCompactConfig, try_global_config};
 use crate::context::{ChatMessage, ChatMessageRole};
+use crate::session::SessionManager;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -45,6 +47,105 @@ const TOOL_USE_MODE_PROMPT: &str = "You are running in OpenJarvis tool-use mode.
 /// ```
 pub fn derive_internal_thread_id(thread_key: &str) -> Uuid {
     Uuid::new_v5(&OPENJARVIS_THREAD_ID_NAMESPACE, thread_key.as_bytes())
+}
+
+/// Stable child-thread lifecycle mode used by subagent flows.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentSpawnMode {
+    Persist,
+    Yolo,
+}
+
+impl SubagentSpawnMode {
+    /// Return the stable spawn-mode label used by logs and persistence.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::thread::SubagentSpawnMode;
+    ///
+    /// assert_eq!(SubagentSpawnMode::Persist.as_str(), "persist");
+    /// assert_eq!(SubagentSpawnMode::Yolo.as_str(), "yolo");
+    /// ```
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Persist => "persist",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "persist" => Some(Self::Persist),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+}
+
+/// Stable child-thread identity reused across recovery and repeated prepare calls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ChildThreadIdentity {
+    pub parent_thread_id: String,
+    pub subagent_key: String,
+    pub spawn_mode: SubagentSpawnMode,
+}
+
+impl ChildThreadIdentity {
+    /// Build one explicit child-thread identity.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::thread::{ChildThreadIdentity, SubagentSpawnMode};
+    ///
+    /// let identity = ChildThreadIdentity::new(
+    ///     "parent-thread",
+    ///     "browser",
+    ///     SubagentSpawnMode::Persist,
+    /// );
+    /// assert_eq!(identity.parent_thread_id, "parent-thread");
+    /// assert_eq!(identity.subagent_key, "browser");
+    /// ```
+    pub fn new(
+        parent_thread_id: impl Into<String>,
+        subagent_key: impl Into<String>,
+        spawn_mode: SubagentSpawnMode,
+    ) -> Self {
+        Self {
+            parent_thread_id: parent_thread_id.into(),
+            subagent_key: subagent_key.into(),
+            spawn_mode,
+        }
+    }
+
+    pub fn storage_key(&self) -> String {
+        format!(
+            "child:{}:{}",
+            self.parent_thread_id.trim(),
+            self.subagent_key.trim()
+        )
+    }
+}
+
+/// Derive the stable child thread id from one parent thread id and subagent profile key.
+///
+/// `spawn_mode` is excluded so the same parent/profile always resolves to the same child thread.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::thread::derive_child_thread_id;
+///
+/// let thread_id = derive_child_thread_id("parent-thread", "browser");
+/// assert_eq!(thread_id, derive_child_thread_id("parent-thread", "browser"));
+/// ```
+pub fn derive_child_thread_id(parent_thread_id: &str, subagent_key: &str) -> Uuid {
+    derive_internal_thread_id(&format!(
+        "child:{}:{}",
+        parent_thread_id.trim(),
+        subagent_key.trim()
+    ))
 }
 
 fn default_tool_event_metadata() -> Value {
@@ -207,6 +308,8 @@ pub struct ThreadContextLocator {
     pub user_id: String,
     pub external_thread_id: String,
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_thread: Option<ChildThreadIdentity>,
 }
 
 impl ThreadContextLocator {
@@ -239,12 +342,43 @@ impl ThreadContextLocator {
             user_id: user_id.into(),
             external_thread_id: external_thread_id.into(),
             thread_id: thread_id.into(),
+            child_thread: None,
         }
     }
 
-    /// Return the normalized thread key used to derive the internal thread id.
+    /// Attach one child-thread identity to the locator.
     ///
-    /// `thread_key` follows the contract `user:channel:external_thread_id`.
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::thread::{ChildThreadIdentity, SubagentSpawnMode, ThreadContextLocator};
+    ///
+    /// let locator = ThreadContextLocator::new(
+    ///     Some("session-1".to_string()),
+    ///     "feishu",
+    ///     "ou_xxx",
+    ///     "thread_ext",
+    ///     "thread_internal",
+    /// )
+    /// .with_child_thread(ChildThreadIdentity::new(
+    ///     "parent-thread",
+    ///     "browser",
+    ///     SubagentSpawnMode::Persist,
+    /// ));
+    ///
+    /// assert_eq!(
+    ///     locator.child_thread.as_ref().map(|value| value.subagent_key.as_str()),
+    ///     Some("browser")
+    /// );
+    /// ```
+    pub fn with_child_thread(mut self, child_thread: ChildThreadIdentity) -> Self {
+        self.child_thread = Some(child_thread);
+        self
+    }
+
+    /// Return the normalized persistence key used to derive or store this thread.
+    ///
+    /// Main-thread keys follow `user:channel:external_thread_id`. Child-thread keys follow
+    /// `child:parent_thread_id:subagent_key`.
     ///
     /// # 示例
     /// ```rust,no_run
@@ -261,10 +395,15 @@ impl ThreadContextLocator {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn thread_key(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.user_id, self.channel, self.external_thread_id
-        )
+        self.child_thread
+            .as_ref()
+            .map(ChildThreadIdentity::storage_key)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}:{}",
+                    self.user_id, self.channel, self.external_thread_id
+                )
+            })
     }
 }
 
@@ -325,6 +464,8 @@ pub struct ThreadState {
     pub lifecycle: ThreadLifecycleState,
     #[serde(default)]
     pub agent: ThreadAgent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_thread: Option<ChildThreadIdentity>,
     #[serde(default)]
     pub features: ThreadFeatureState,
     #[serde(default)]
@@ -389,6 +530,11 @@ impl PersistedThreadSnapshot {
 struct ActiveRequestState {
     external_message_id: Option<String>,
     started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct RequestRuntimeState {
+    sessions: SessionManager,
 }
 
 /// Persistence boundary used by live `Thread` handles.
@@ -763,6 +909,7 @@ pub struct Thread {
     pub state: ThreadState,
     revision: u64,
     active_request: Option<ActiveRequestState>,
+    request_runtime: Option<RequestRuntimeState>,
     store: Option<Arc<dyn ThreadSnapshotStore>>,
 }
 
@@ -793,6 +940,7 @@ impl Thread {
             state: ThreadState::default(),
             revision: 0,
             active_request: None,
+            request_runtime: None,
             store: None,
         }
     }
@@ -820,6 +968,7 @@ impl Thread {
             state: snapshot.state,
             revision,
             active_request: None,
+            request_runtime: None,
             store: None,
         }
     }
@@ -840,6 +989,12 @@ impl Thread {
     /// Bind one thread snapshot store to the live handle.
     pub fn bind_store(&mut self, store: Arc<dyn ThreadSnapshotStore>) {
         self.store = Some(store);
+    }
+
+    /// Bind one request-scoped runtime context used by tools that need session access.
+    #[doc(hidden)]
+    pub fn bind_request_runtime(&mut self, sessions: SessionManager) {
+        self.request_runtime = Some(RequestRuntimeState { sessions });
     }
 
     /// Export the thread-owned formal message sequence.
@@ -869,6 +1024,11 @@ impl Thread {
     /// Return the persisted thread agent kind for the current thread.
     pub fn thread_agent_kind(&self) -> ThreadAgentKind {
         self.state.agent.kind
+    }
+
+    /// Return the persisted child-thread identity when this thread belongs to a parent thread.
+    pub fn child_thread_identity(&self) -> Option<&ChildThreadIdentity> {
+        self.state.child_thread.as_ref()
     }
 
     /// Return the persisted enabled feature set for the current thread.
@@ -958,7 +1118,37 @@ impl Thread {
             succeeded,
             "finished thread-owned active request"
         );
+        self.request_runtime = None;
         Ok(())
+    }
+
+    /// Persist one child-thread identity snapshot as part of the thread truth.
+    pub async fn persist_child_thread_identity(
+        &mut self,
+        child_thread: ChildThreadIdentity,
+    ) -> Result<bool> {
+        let updated_at = Utc::now();
+        let changed = self
+            .apply_persisted_mutation("persist_child_thread_identity", |snapshot| {
+                if snapshot.state.child_thread.as_ref() == Some(&child_thread) {
+                    return Ok(false);
+                }
+                snapshot.state.child_thread = Some(child_thread.clone());
+                snapshot.thread.updated_at = updated_at;
+                Ok(true)
+            })
+            .await?;
+        if changed {
+            self.locator.child_thread = Some(child_thread.clone());
+            info!(
+                thread_id = %self.locator.thread_id,
+                parent_thread_id = %child_thread.parent_thread_id,
+                subagent_key = %child_thread.subagent_key,
+                spawn_mode = child_thread.spawn_mode.as_str(),
+                "persisted child-thread identity"
+            );
+        }
+        Ok(changed)
     }
 
     async fn apply_persisted_mutation<F, R>(
@@ -1488,7 +1678,11 @@ impl Thread {
                 })
             }
             _ => {
-                let context = crate::agent::ToolCallContext::for_thread(thread_id.clone());
+                let mut context = crate::agent::ToolCallContext::for_thread(thread_id.clone())
+                    .with_locator(self.locator.clone());
+                if let Some(request_runtime) = self.request_runtime.as_ref() {
+                    context = context.with_sessions(request_runtime.sessions.clone());
+                }
                 if !self.tool_allowed_by_feature_state(&request.name) {
                     bail!(
                         "tool `{}` is not enabled for thread `{}`",
@@ -1516,12 +1710,7 @@ impl Thread {
                             thread_id
                         );
                     };
-                    handler
-                        .call_with_context(
-                            crate::agent::ToolCallContext::for_thread(thread_id.clone()),
-                            request,
-                        )
-                        .await
+                    handler.call_with_context(context, request).await
                 }
             }
         };
@@ -1563,6 +1752,7 @@ impl Thread {
         self.thread = ThreadContext::new(now);
         self.state = ThreadState::default();
         self.active_request = None;
+        self.request_runtime = None;
     }
 
     /// Persist one reset that clears the thread back to one empty initial state.
@@ -1574,6 +1764,28 @@ impl Thread {
         })
         .await?;
         self.active_request = None;
+        self.request_runtime = None;
+        Ok(())
+    }
+
+    /// Persist one reset that clears runtime history while preserving child-thread identity.
+    pub async fn reset_to_initial_state_preserving_child_thread(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.apply_persisted_mutation(
+            "reset_to_initial_state_preserving_child_thread",
+            |snapshot| {
+                let child_thread = snapshot.state.child_thread.clone();
+                snapshot.thread = ThreadContext::new(now);
+                snapshot.state = ThreadState::default();
+                snapshot.state.child_thread = child_thread;
+                Ok(())
+            },
+        )
+        .await?;
+        self.active_request = None;
+        self.request_runtime = None;
         Ok(())
     }
 
@@ -1602,6 +1814,10 @@ impl Thread {
 
     fn tool_allowed_by_feature_state(&self, tool_name: &str) -> bool {
         match tool_name {
+            "spawn_subagent" | "send_subagent" | "close_subagent" | "list_subagent" => {
+                self.child_thread_identity().is_none()
+                    && self.thread_agent_kind() == ThreadAgentKind::Main
+            }
             _ if feature::init::skill::owns_always_visible_tool(tool_name) => {
                 self.is_enabled(Feature::Skill)
             }
@@ -1632,6 +1848,7 @@ impl fmt::Debug for Thread {
             .field("state", &self.state)
             .field("revision", &self.revision)
             .field("active_request", &self.active_request)
+            .field("request_runtime", &self.request_runtime.is_some())
             .finish()
     }
 }

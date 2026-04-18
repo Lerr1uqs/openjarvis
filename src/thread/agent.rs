@@ -39,6 +39,36 @@ impl ThreadAgentKind {
         }
     }
 
+    /// Resolve one subagent profile key back to its thread-agent kind.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::thread::ThreadAgentKind;
+    ///
+    /// assert_eq!(
+    ///     ThreadAgentKind::from_subagent_key("browser"),
+    ///     Some(ThreadAgentKind::Browser)
+    /// );
+    /// assert_eq!(ThreadAgentKind::from_subagent_key("unknown"), None);
+    /// ```
+    pub fn from_subagent_key(value: &str) -> Option<Self> {
+        match value.trim() {
+            "browser" => Some(Self::Browser),
+            _ => None,
+        }
+    }
+
+    pub fn subagent_key(self) -> Option<&'static str> {
+        match self {
+            Self::Main => None,
+            Self::Browser => Some("browser"),
+        }
+    }
+
+    pub fn is_subagent(self) -> bool {
+        self.subagent_key().is_some()
+    }
+
     /// Return the bundled system prompt template bound to this thread agent kind.
     ///
     /// # 示例

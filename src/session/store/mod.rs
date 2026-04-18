@@ -58,4 +58,13 @@ pub trait SessionStore: ThreadSnapshotStore + Send + Sync {
         &self,
         locator: &ThreadLocator,
     ) -> SessionStoreResult<Option<StoredThreadRecord>>;
+
+    /// Remove one persisted thread snapshot by resolved thread locator.
+    async fn remove_thread_context(&self, locator: &ThreadLocator) -> SessionStoreResult<bool>;
+
+    /// List all persisted child threads owned by one parent thread.
+    async fn list_child_threads(
+        &self,
+        parent_locator: &ThreadLocator,
+    ) -> SessionStoreResult<Vec<StoredThreadRecord>>;
 }

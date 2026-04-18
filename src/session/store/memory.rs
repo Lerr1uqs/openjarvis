@@ -113,4 +113,37 @@ impl SessionStore for MemorySessionStore {
                 revision: record.revision,
             }))
     }
+
+    async fn remove_thread_context(&self, locator: &ThreadLocator) -> SessionStoreResult<bool> {
+        let mut state = self.state.lock().await;
+        Ok(state.threads.remove(&locator.thread_id).is_some())
+    }
+
+    async fn list_child_threads(
+        &self,
+        parent_locator: &ThreadLocator,
+    ) -> SessionStoreResult<Vec<StoredThreadRecord>> {
+        let state = self.state.lock().await;
+        let mut records = state
+            .threads
+            .values()
+            .filter(|record| {
+                record
+                    .snapshot
+                    .state
+                    .child_thread
+                    .as_ref()
+                    .map(|child| child.parent_thread_id == parent_locator.thread_id.to_string())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .map(|record| StoredThreadRecord {
+                locator: record.locator,
+                snapshot: record.snapshot,
+                revision: record.revision,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.locator.thread_id.cmp(&right.locator.thread_id));
+        Ok(records)
+    }
 }

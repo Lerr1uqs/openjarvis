@@ -7,8 +7,8 @@ pub mod store;
 
 use crate::model::IncomingMessage;
 use crate::thread::{
-    Thread, ThreadAgentKind, ThreadContextLocator, ThreadRuntime, ThreadSnapshotStore,
-    derive_internal_thread_id,
+    ChildThreadIdentity, SubagentSpawnMode, Thread, ThreadAgentKind, ThreadContextLocator,
+    ThreadRuntime, ThreadSnapshotStore, derive_child_thread_id, derive_internal_thread_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -105,6 +105,7 @@ pub struct ThreadLocator {
     pub user_id: String,
     pub external_thread_id: String,
     pub thread_id: Uuid,
+    pub child_thread: Option<ChildThreadIdentity>,
 }
 
 impl ThreadLocator {
@@ -154,6 +155,69 @@ impl ThreadLocator {
             user_id: incoming.user_id.clone(),
             external_thread_id: external_thread_id.into(),
             thread_id,
+            child_thread: None,
+        }
+    }
+
+    /// Build one child-thread locator that preserves the parent thread's channel identity.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::model::{IncomingMessage, ReplyTarget};
+    /// use openjarvis::session::{SessionKey, ThreadLocator};
+    /// use openjarvis::thread::SubagentSpawnMode;
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let incoming = IncomingMessage {
+    ///     id: Uuid::new_v4(),
+    ///     external_message_id: None,
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_xxx".to_string(),
+    ///     user_name: None,
+    ///     content: "hello".to_string(),
+    ///     external_thread_id: Some("chat_ext".to_string()),
+    ///     received_at: Utc::now(),
+    ///     metadata: json!({}),
+    ///     attachments: Vec::new(),
+    ///     reply_target: ReplyTarget {
+    ///         receive_id: "oc_xxx".to_string(),
+    ///         receive_id_type: "chat_id".to_string(),
+    ///     },
+    /// };
+    /// let session_key = SessionKey::from_incoming(&incoming);
+    /// let parent = ThreadLocator::new(
+    ///     session_key.derive_session_id(),
+    ///     &incoming,
+    ///     "chat_ext",
+    ///     session_key.derive_thread_id("chat_ext"),
+    /// );
+    ///
+    /// let child = ThreadLocator::for_child(&parent, "browser", SubagentSpawnMode::Persist);
+    /// assert_eq!(child.external_thread_id, parent.external_thread_id);
+    /// assert_eq!(
+    ///     child.child_thread.as_ref().map(|value| value.subagent_key.as_str()),
+    ///     Some("browser")
+    /// );
+    /// ```
+    pub fn for_child(
+        parent: &ThreadLocator,
+        subagent_key: impl Into<String>,
+        spawn_mode: SubagentSpawnMode,
+    ) -> Self {
+        let child_thread =
+            ChildThreadIdentity::new(parent.thread_id.to_string(), subagent_key, spawn_mode);
+        Self {
+            session_id: parent.session_id,
+            channel: parent.channel.clone(),
+            user_id: parent.user_id.clone(),
+            external_thread_id: parent.external_thread_id.clone(),
+            thread_id: derive_child_thread_id(
+                &child_thread.parent_thread_id,
+                &child_thread.subagent_key,
+            ),
+            child_thread: Some(child_thread),
         }
     }
 
@@ -167,19 +231,24 @@ impl ThreadLocator {
 
     /// Return the normalized thread key for this resolved thread locator.
     pub fn thread_key(&self) -> String {
-        self.session_key().thread_key(&self.external_thread_id)
+        self.child_thread
+            .as_ref()
+            .map(ChildThreadIdentity::storage_key)
+            .unwrap_or_else(|| self.session_key().thread_key(&self.external_thread_id))
     }
 }
 
 impl From<&ThreadLocator> for ThreadContextLocator {
     fn from(value: &ThreadLocator) -> Self {
-        Self::new(
+        let mut locator = Self::new(
             Some(value.session_id.to_string()),
             value.channel.clone(),
             value.user_id.clone(),
             value.external_thread_id.clone(),
             value.thread_id.to_string(),
-        )
+        );
+        locator.child_thread = value.child_thread.clone();
+        locator
     }
 }
 
@@ -198,6 +267,7 @@ impl TryFrom<&ThreadContextLocator> for ThreadLocator {
             user_id: value.user_id.clone(),
             external_thread_id: value.external_thread_id.clone(),
             thread_id: Uuid::parse_str(&value.thread_id)?,
+            child_thread: value.child_thread.clone(),
         })
     }
 }
@@ -361,26 +431,58 @@ impl SessionManager {
         incoming: &IncomingMessage,
         thread_agent_kind: ThreadAgentKind,
     ) -> SessionStoreResult<ThreadLocator> {
-        let session_key = SessionKey::from_incoming(incoming);
         let locator = self.resolve_thread_locator(incoming);
+        self.create_thread_at(&locator, incoming.received_at, thread_agent_kind)
+            .await
+    }
+
+    /// Prepare one thread from an explicit resolved locator.
+    ///
+    /// This path is reused by child-thread create flows so all thread preparation still runs
+    /// through the same create lifecycle.
+    pub async fn create_thread_at(
+        &self,
+        locator: &ThreadLocator,
+        now: DateTime<Utc>,
+        thread_agent_kind: ThreadAgentKind,
+    ) -> SessionStoreResult<ThreadLocator> {
         let thread_key = locator.thread_key();
 
         info!(
             session_id = %locator.session_id,
-            channel = %incoming.channel,
-            user_id = %incoming.user_id,
+            channel = %locator.channel,
+            user_id = %locator.user_id,
             external_thread_id = %locator.external_thread_id,
             thread_key = %thread_key,
             thread_id = %locator.thread_id,
+            parent_thread_id = ?locator
+                .child_thread
+                .as_ref()
+                .map(|child| child.parent_thread_id.as_str()),
+            subagent_key = ?locator
+                .child_thread
+                .as_ref()
+                .map(|child| child.subagent_key.as_str()),
+            spawn_mode = ?locator
+                .child_thread
+                .as_ref()
+                .map(|child| child.spawn_mode.as_str()),
             thread_agent_kind = thread_agent_kind.as_str(),
-            "resolved incoming thread identity for create_thread"
+            "resolved thread identity for create_thread"
         );
 
-        let handle = self
-            .create_or_restore_thread_handle(&locator, incoming.received_at)
-            .await?;
+        let handle = self.create_or_restore_thread_handle(locator, now).await?;
+        if let Some(child_thread) = locator.child_thread.clone() {
+            handle
+                .lock()
+                .await
+                .persist_child_thread_identity(child_thread)
+                .await?;
+        }
         self.initialize_thread_handle(&handle, thread_agent_kind)
             .await?;
+
+        let session_key = locator.session_key();
         let mut sessions = self.inner.sessions.lock().await;
         let session = sessions
             .entry(session_key.clone())
@@ -388,12 +490,11 @@ impl SessionManager {
                 id: locator.session_id,
                 key: session_key,
                 threads: HashMap::new(),
-                created_at: incoming.received_at,
-                updated_at: incoming.received_at,
+                created_at: now,
+                updated_at: now,
             });
-        session.updated_at = incoming.received_at;
-
-        Ok(locator)
+        session.updated_at = now;
+        Ok(locator.clone())
     }
 
     /// Load the current thread context snapshot for one channel/user/thread tuple.
@@ -439,6 +540,40 @@ impl SessionManager {
             "locked existing thread for mutation"
         );
         Ok(Some(handle.lock_owned().await))
+    }
+
+    /// Return all persisted child threads that belong to the provided parent thread.
+    pub async fn list_child_threads(
+        &self,
+        parent_locator: &ThreadLocator,
+    ) -> SessionStoreResult<Vec<StoredThreadRecord>> {
+        self.inner.store.list_child_threads(parent_locator).await
+    }
+
+    /// Remove one persisted thread from cache and store.
+    pub async fn remove_thread(&self, locator: &ThreadLocator) -> SessionStoreResult<bool> {
+        let removed = self.inner.store.remove_thread_context(locator).await?;
+        if !removed {
+            return Ok(false);
+        }
+
+        let session_key = locator.session_key();
+        let mut sessions = self.inner.sessions.lock().await;
+        let mut drop_session = false;
+        if let Some(session) = sessions.get_mut(&session_key) {
+            session.threads.remove(&locator.thread_id);
+            session.updated_at = Utc::now();
+            drop_session = session.threads.is_empty();
+        }
+        if drop_session {
+            sessions.remove(&session_key);
+        }
+        info!(
+            session_id = %locator.session_id,
+            thread_id = %locator.thread_id,
+            "removed persisted thread from session manager"
+        );
+        Ok(true)
     }
 
     /// Return a cloned session snapshot for debugging or tests.

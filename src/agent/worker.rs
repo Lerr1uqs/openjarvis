@@ -7,6 +7,7 @@ use super::{
     },
     runtime::AgentRuntime,
     sandbox::DummySandboxContainer,
+    subagent::SubagentRunner,
 };
 use crate::compact::CompactProvider;
 use crate::config::{AgentCompactConfig, AppConfig, LLMConfig, global_config};
@@ -58,6 +59,7 @@ pub struct AgentWorkerHandle {
 pub struct AgentWorker {
     agent_loop: AgentLoop,
     thread_runtime: Arc<ThreadRuntime>,
+    subagent_runner: Arc<SubagentRunner>,
     sandbox: DummySandboxContainer,
 }
 
@@ -182,20 +184,31 @@ impl AgentWorkerBuilder {
         ));
         let agent_loop = match compact_provider {
             Some(compact_provider) => AgentLoop::with_compact_provider(
-                llm,
-                runtime,
-                llm_config,
+                Arc::clone(&llm),
+                runtime.clone(),
+                llm_config.clone(),
                 compact_config.clone(),
                 compact_provider,
             ),
-            None => {
-                AgentLoop::with_compact_config(llm, runtime, llm_config, compact_config.clone())
-            }
+            None => AgentLoop::with_compact_config(
+                Arc::clone(&llm),
+                runtime.clone(),
+                llm_config.clone(),
+                compact_config.clone(),
+            ),
         };
+        let subagent_runner = Arc::new(SubagentRunner::new(
+            llm,
+            runtime.clone(),
+            llm_config,
+            compact_config,
+        ));
+        tool_registry.install_subagent_runner(&subagent_runner);
 
         Ok(AgentWorker {
             agent_loop,
             thread_runtime,
+            subagent_runner,
             sandbox: DummySandboxContainer::new(),
         })
     }
@@ -310,6 +323,11 @@ impl AgentWorker {
         Arc::clone(&self.thread_runtime)
     }
 
+    /// Return the dedicated subagent runner bound to this worker runtime.
+    pub fn subagent_runner(&self) -> Arc<SubagentRunner> {
+        Arc::clone(&self.subagent_runner)
+    }
+
     /// Return the sandbox container currently owned by this worker.
     ///
     /// # 示例
@@ -385,6 +403,7 @@ impl AgentWorker {
                 request.locator.thread_id
             )
         })?;
+        thread_context.bind_request_runtime(request.sessions.clone());
 
         let mut committed_message_handler = WorkerCommittedMessageHandler {
             locator: request.locator.clone(),

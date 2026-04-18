@@ -458,6 +458,14 @@ impl ChannelRouter {
     }
 
     async fn process_agent_dispatch_event(&self, event: AgentDispatchEvent) -> Result<()> {
+        if !event.channel_delivery_enabled {
+            info!(
+                session_thread_id = %event.session_thread_id,
+                event_kind = ?event.kind,
+                "router skipped internal-only agent dispatch event"
+            );
+            return Ok(());
+        }
         let source_message_id = event.source_message_id.clone();
         let outgoing = OutgoingMessage {
             id: Uuid::new_v4(),

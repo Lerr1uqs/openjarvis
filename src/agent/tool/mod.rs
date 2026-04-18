@@ -9,18 +9,25 @@ pub mod mcp;
 pub mod read;
 pub mod shell;
 pub mod skill;
+pub mod subagent;
 pub mod toolset;
 pub mod write;
 
 use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
-use crate::thread::Thread;
+use crate::session::SessionManager;
+use crate::thread::{Thread, ThreadContextLocator};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, RwLock as StdRwLock, Weak},
+    time::Instant,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -132,9 +139,11 @@ pub struct ToolCallResult {
 }
 
 /// Thread-scoped runtime context attached to one tool invocation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolCallContext {
-    pub thread_id: Option<String>,
+    thread_id: Option<String>,
+    locator: Option<ThreadContextLocator>,
+    sessions: Option<SessionManager>,
 }
 
 impl ToolCallContext {
@@ -150,12 +159,32 @@ impl ToolCallContext {
     pub fn for_thread(thread_id: impl Into<String>) -> Self {
         Self {
             thread_id: Some(thread_id.into()),
+            locator: None,
+            sessions: None,
         }
+    }
+
+    pub fn with_locator(mut self, locator: ThreadContextLocator) -> Self {
+        self.locator = Some(locator);
+        self
+    }
+
+    pub fn with_sessions(mut self, sessions: SessionManager) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     /// Return the bound internal thread id when present.
     pub fn thread_id(&self) -> Option<&str> {
         self.thread_id.as_deref()
+    }
+
+    pub fn locator(&self) -> Option<&ThreadContextLocator> {
+        self.locator.as_ref()
+    }
+
+    pub fn sessions(&self) -> Option<&SessionManager> {
+        self.sessions.as_ref()
     }
 }
 
@@ -211,6 +240,7 @@ pub struct ToolRegistry {
     skills: Arc<skill::SkillRegistry>,
     memory_repository: Arc<MemoryRepository>,
     command_sessions: Arc<CommandSessionManager>,
+    subagent_runner: StdRwLock<Option<Weak<crate::agent::SubagentRunner>>>,
 }
 
 pub fn tool_definition_from_args<T>(
@@ -307,6 +337,7 @@ impl ToolRegistry {
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
             memory_repository: Arc::new(MemoryRepository::new(workspace_root.into())),
             command_sessions: Arc::new(CommandSessionManager::new()),
+            subagent_runner: StdRwLock::new(None),
         }
     }
 
@@ -441,6 +472,14 @@ impl ToolRegistry {
             &self.command_sessions,
         ))))
         .await;
+        let subagent_runner = self
+            .subagent_runner
+            .read()
+            .expect("subagent runner lock should not be poisoned")
+            .clone();
+        if let Some(subagent_runner) = subagent_runner {
+            subagent::register_subagent_tools(self, subagent_runner).await;
+        }
         if !self.toolset_registered("browser").await {
             browser::register_browser_toolset(self).await?;
         }
@@ -702,6 +741,14 @@ impl ToolRegistry {
     /// ```
     pub fn command_session_manager(&self) -> Arc<CommandSessionManager> {
         Arc::clone(&self.command_sessions)
+    }
+
+    /// Install the subagent runner used by builtin subagent tools.
+    pub fn install_subagent_runner(&self, runner: &Arc<crate::agent::SubagentRunner>) {
+        *self
+            .subagent_runner
+            .write()
+            .expect("subagent runner lock should not be poisoned") = Some(Arc::downgrade(runner));
     }
 
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
