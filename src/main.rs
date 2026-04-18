@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 use openjarvis::{
-    agent::AgentWorker,
+    agent::{AgentWorker, SkillRegistry},
     cli::OpenJarvisCli,
     cli_command::CliCommandRegistry,
     command::CommandRegistry,
@@ -30,6 +30,12 @@ async fn main() -> Result<()> {
         log_color = cli.log_color,
         "applied cli logging overrides"
     );
+    if std::env::var_os("OPENJARVIS_CONFIG").is_none() {
+        // Keep the hidden `--load-skill` smoke path fail-fast when startup is resolving the
+        // workspace default config. An explicitly supplied config file should still be loaded so
+        // logging and config-side effects remain observable in tests and manual verification.
+        validate_startup_load_skills(&cli.load_skills).await?;
+    }
     let mut config = AppConfig::load()?;
     if cli.builtin_mcp {
         let executable = std::env::current_exe()?;
@@ -101,6 +107,25 @@ async fn main() -> Result<()> {
     );
 
     router.run_until_shutdown(shutdown_signal()).await
+}
+
+async fn validate_startup_load_skills(load_skills: &[String]) -> Result<()> {
+    if load_skills.is_empty() {
+        return Ok(());
+    }
+
+    debug!(skills = ?load_skills, "validating startup local skills before app config load");
+    let registry = SkillRegistry::new();
+    let enabled_skills = registry.restrict_to(load_skills).await?;
+    let enabled_skill_names = enabled_skills
+        .iter()
+        .map(|manifest| manifest.name.as_str())
+        .collect::<Vec<_>>();
+    info!(
+        skills = ?enabled_skill_names,
+        "validated startup local skills before app config load"
+    );
+    Ok(())
 }
 
 async fn shutdown_signal() {
