@@ -22,6 +22,23 @@ pub enum ThreadAgentKind {
     Browser,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubagentCatalogEntry {
+    pub kind: ThreadAgentKind,
+    pub subagent_key: &'static str,
+    pub role_summary: &'static str,
+    pub when_to_use: &'static str,
+    pub when_not_to_use: &'static str,
+}
+
+const AVAILABLE_SUBAGENT_CATALOG: [SubagentCatalogEntry; 1] = [SubagentCatalogEntry {
+    kind: ThreadAgentKind::Browser,
+    subagent_key: "browser",
+    role_summary: "负责浏览器观察与页面交互，在独立 child thread 中完成多步网页操作。",
+    when_to_use: "任务明确需要打开页面、观察网页状态、执行连续页面动作，或者希望复用浏览器 child thread 的上下文。",
+    when_not_to_use: "主线程已经能直接完成任务，或者只需要一次简单工具调用时，不要额外启动 browser subagent。",
+}];
+
 impl ThreadAgentKind {
     /// Return the stable label used by logs and persisted thread state.
     ///
@@ -52,21 +69,28 @@ impl ThreadAgentKind {
     /// assert_eq!(ThreadAgentKind::from_subagent_key("unknown"), None);
     /// ```
     pub fn from_subagent_key(value: &str) -> Option<Self> {
-        match value.trim() {
-            "browser" => Some(Self::Browser),
-            _ => None,
-        }
+        let value = value.trim();
+        Self::available_subagent_catalog()
+            .iter()
+            .find(|entry| entry.subagent_key == value)
+            .map(|entry| entry.kind)
     }
 
+    /// Return the stable subagent profile key owned by this thread-agent kind.
     pub fn subagent_key(self) -> Option<&'static str> {
-        match self {
-            Self::Main => None,
-            Self::Browser => Some("browser"),
-        }
+        Self::available_subagent_catalog()
+            .iter()
+            .find(|entry| entry.kind == self)
+            .map(|entry| entry.subagent_key)
     }
 
+    /// Return whether this thread-agent kind is one subagent profile.
     pub fn is_subagent(self) -> bool {
         self.subagent_key().is_some()
+    }
+
+    pub(crate) fn available_subagent_catalog() -> &'static [SubagentCatalogEntry] {
+        &AVAILABLE_SUBAGENT_CATALOG
     }
 
     /// Return the bundled system prompt template bound to this thread agent kind.

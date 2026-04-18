@@ -1,4 +1,5 @@
-//! Subagent runtime that reuses `AgentLoop` behind one dedicated internal worker queue.
+//! Subagent runtime that reuses `AgentLoop`
+//! behind one dedicated internal worker queue.
 
 use super::{
     agent_loop::{AgentCommittedMessageHandler, AgentDispatchEvent, AgentEventSender, AgentLoop},
@@ -68,13 +69,15 @@ impl AgentCommittedMessageHandler for SubagentCommittedMessageCollector {
     }
 }
 
-/// Dedicated runtime queue used by subagent tool calls.
+/// Dedicated runtime queue
+/// used by subagent tool calls.
 pub struct SubagentRunner {
     request_tx: mpsc::Sender<QueuedSubagentRequest>,
 }
 
 impl SubagentRunner {
-    /// Build one dedicated subagent runner with its own internal worker queue.
+    /// Build one dedicated subagent runner
+    /// with its own internal worker queue.
     ///
     /// # 示例
     /// ```rust,no_run
@@ -102,7 +105,8 @@ impl SubagentRunner {
         compact_config: AgentCompactConfig,
     ) -> Self {
         let (request_tx, request_rx) = mpsc::channel(64);
-        let agent_loop = AgentLoop::with_compact_config(llm, runtime, llm_config, compact_config);
+        let agent_loop =
+            AgentLoop::with_compact_config(llm, runtime, llm_config, compact_config);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 run_subagent_worker(agent_loop, request_rx).await;
@@ -131,7 +135,9 @@ impl SubagentRunner {
             .map_err(|error| anyhow!("failed to enqueue subagent request: {error}"))?;
         response_rx
             .await
-            .map_err(|error| anyhow!("subagent worker dropped response channel: {error}"))?
+            .map_err(|error| {
+                anyhow!("subagent worker dropped response channel: {error}")
+            })?
     }
 }
 
@@ -159,6 +165,8 @@ async fn handle_subagent_request(
 ) -> Result<SubagentRunOutput> {
     let hooks = agent_loop.runtime().hooks();
     let subagent_key = request.subagent_key().unwrap_or("unknown");
+    let event_sender =
+        AgentEventSender::for_subagent_thread(&request.parent_locator, &request.child_locator);
     info!(
         parent_thread_id = %request.parent_locator.thread_id,
         child_thread_id = %request.child_locator.thread_id,
@@ -196,7 +204,7 @@ async fn handle_subagent_request(
     };
     let output = agent_loop
         .run_locked_thread(
-            AgentEventSender::for_subagent_thread(&request.parent_locator, &request.child_locator),
+            event_sender,
             &incoming,
             &mut thread_context,
             &mut collector,

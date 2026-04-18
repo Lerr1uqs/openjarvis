@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+pub(crate) use agent::SubagentCatalogEntry;
 pub use agent::{
     DEFAULT_ASSISTANT_SYSTEM_PROMPT, DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT, ThreadAgent,
     ThreadAgentKind,
@@ -167,7 +168,8 @@ where
 }
 
 fn build_default_feature_resolver(compact_config: &AgentCompactConfig) -> FeatureResolver {
-    let mut available_features = Features::from_iter([Feature::Memory, Feature::Skill]);
+    let mut available_features =
+        Features::from_iter([Feature::Memory, Feature::Skill, Feature::Subagent]);
     if feature::init::auto_compact::is_available(compact_config) {
         available_features.insert(Feature::AutoCompact);
     }
@@ -190,6 +192,7 @@ fn build_default_feature_resolver(compact_config: &AgentCompactConfig) -> Featur
 pub enum Feature {
     Memory,
     Skill,
+    Subagent,
     AutoCompact,
 }
 
@@ -201,11 +204,13 @@ impl Feature {
     /// use openjarvis::thread::Feature;
     ///
     /// assert_eq!(Feature::Memory.as_str(), "memory");
+    /// assert_eq!(Feature::Subagent.as_str(), "subagent");
     /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Memory => "memory",
             Self::Skill => "skill",
+            Self::Subagent => "subagent",
             Self::AutoCompact => "auto_compact",
         }
     }
@@ -228,10 +233,16 @@ impl Features {
     /// let features = Features::all();
     /// assert!(features.contains(Feature::Memory));
     /// assert!(features.contains(Feature::Skill));
+    /// assert!(features.contains(Feature::Subagent));
     /// assert!(features.contains(Feature::AutoCompact));
     /// ```
     pub fn all() -> Self {
-        Self::from_iter([Feature::Memory, Feature::Skill, Feature::AutoCompact])
+        Self::from_iter([
+            Feature::Memory,
+            Feature::Skill,
+            Feature::Subagent,
+            Feature::AutoCompact,
+        ])
     }
 
     /// Return whether the target feature is enabled in this set.
@@ -618,7 +629,30 @@ impl ThreadRuntime {
         self.tool_registry.register_builtin_tools().await
     }
 
-    fn resolve_enabled_features(&self, thread_context: &Thread) -> Features {
+    fn filter_enabled_features_for_thread(
+        &self,
+        thread_context: &Thread,
+        thread_agent: &ThreadAgent,
+        mut features: Features,
+    ) -> Features {
+        if (thread_context.child_thread_identity().is_some() || thread_agent.kind.is_subagent())
+            && features.remove(Feature::Subagent)
+        {
+            info!(
+                thread_id = %thread_context.locator.thread_id,
+                thread_agent_kind = thread_agent.kind.as_str(),
+                enabled_features = ?features.names(),
+                "removed parent-only subagent feature from child thread feature snapshot"
+            );
+        }
+        features
+    }
+
+    fn resolve_enabled_features(
+        &self,
+        thread_context: &Thread,
+        thread_agent: &ThreadAgent,
+    ) -> Features {
         let persisted_features = thread_context.enabled_features();
         if !persisted_features.is_empty() {
             info!(
@@ -626,7 +660,11 @@ impl ThreadRuntime {
                 enabled_features = ?persisted_features.names(),
                 "using persisted thread feature snapshot"
             );
-            return persisted_features;
+            return self.filter_enabled_features_for_thread(
+                thread_context,
+                thread_agent,
+                persisted_features,
+            );
         }
 
         let resolved = self
@@ -637,7 +675,7 @@ impl ThreadRuntime {
             enabled_features = ?resolved.names(),
             "resolved thread feature snapshot for initialization"
         );
-        resolved
+        self.filter_enabled_features_for_thread(thread_context, thread_agent, resolved)
     }
 
     fn resolve_thread_agent(
@@ -666,7 +704,7 @@ impl ThreadRuntime {
         for feature in features.iter() {
             match feature {
                 Feature::Memory => toolsets.extend(feature::init::memory::toolsets()),
-                Feature::Skill | Feature::AutoCompact => {}
+                Feature::Skill | Feature::Subagent | Feature::AutoCompact => {}
             }
         }
         toolsets.sort();
@@ -751,7 +789,8 @@ impl ThreadRuntime {
 
         let resolved_thread_agent =
             self.resolve_thread_agent(thread_context, requested_thread_agent_kind);
-        let resolved_features = self.resolve_enabled_features(thread_context);
+        let resolved_features =
+            self.resolve_enabled_features(thread_context, &resolved_thread_agent);
         let preloaded_toolsets =
             self.preloaded_toolsets(&resolved_thread_agent, &resolved_features);
 
@@ -836,6 +875,20 @@ impl ThreadRuntime {
             && let Some(prompt) =
                 feature::init::skill::usage(&thread_context.locator.thread_id, &self.tool_registry)
                     .await
+        {
+            initialized_messages.push(ChatMessage::new(
+                ChatMessageRole::System,
+                prompt,
+                initialized_at,
+            ));
+        }
+
+        if thread_context.is_enabled(Feature::Subagent)
+            && let Some(prompt) = feature::init::subagent::usage(
+                &thread_context.locator.thread_id,
+                &self.tool_registry,
+            )
+            .await
         {
             initialized_messages.push(ChatMessage::new(
                 ChatMessageRole::System,
@@ -1814,9 +1867,10 @@ impl Thread {
 
     fn tool_allowed_by_feature_state(&self, tool_name: &str) -> bool {
         match tool_name {
-            "spawn_subagent" | "send_subagent" | "close_subagent" | "list_subagent" => {
+            _ if feature::init::subagent::owns_always_visible_tool(tool_name) => {
                 self.child_thread_identity().is_none()
                     && self.thread_agent_kind() == ThreadAgentKind::Main
+                    && self.is_enabled(Feature::Subagent)
             }
             _ if feature::init::skill::owns_always_visible_tool(tool_name) => {
                 self.is_enabled(Feature::Skill)

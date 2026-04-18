@@ -2,14 +2,15 @@ use chrono::Utc;
 use openjarvis::{
     agent::{
         AgentRuntime, FeatureResolver, HookRegistry, MemoryType, MemoryWriteRequest, ShellEnv,
-        ToolRegistry,
+        SubagentRunner, ToolRegistry,
     },
-    config::AppConfig,
+    config::{AppConfig, LLMConfig},
+    llm::MockLLMProvider,
     model::{IncomingMessage, ReplyTarget},
     session::{MemorySessionStore, SessionManager, SessionStore},
     thread::{
-        DEFAULT_ASSISTANT_SYSTEM_PROMPT, Feature, Features, Thread, ThreadAgentKind,
-        ThreadContextLocator, ThreadRuntime,
+        ChildThreadIdentity, DEFAULT_ASSISTANT_SYSTEM_PROMPT, Feature, Features, SubagentSpawnMode,
+        Thread, ThreadAgentKind, ThreadContextLocator, ThreadRuntime, derive_child_thread_id,
     },
 };
 use serde_json::json;
@@ -109,6 +110,25 @@ fn build_thread_runtime(
     ))
 }
 
+async fn install_mock_subagent_runner(
+    registry: &Arc<ToolRegistry>,
+    compact_config: openjarvis::config::AgentCompactConfig,
+) -> Arc<SubagentRunner> {
+    let runtime = AgentRuntime::with_parts(Arc::new(HookRegistry::new()), Arc::clone(registry));
+    let runner = Arc::new(SubagentRunner::new(
+        Arc::new(MockLLMProvider::new("feature-runtime-subagent")),
+        runtime,
+        LLMConfig::default(),
+        compact_config,
+    ));
+    registry.install_subagent_runner(&runner);
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register after subagent runner install");
+    runner
+}
+
 #[test]
 fn feishu_user_feature_override_is_parsed_and_resolved() {
     // 测试场景: channel + user 显式配置的 feature 集合应被 resolver 直接命中；未配置用户走默认全开。
@@ -143,7 +163,7 @@ llm:
     );
     assert_eq!(
         resolver.resolve("feishu", "ou_missing").names(),
-        vec!["memory", "skill", "auto_compact"]
+        vec!["memory", "skill", "subagent", "auto_compact"]
     );
 }
 
@@ -385,6 +405,161 @@ async fn browser_thread_agent_preloads_browser_toolset_and_prompt() {
     assert_eq!(thread.thread_agent_kind(), ThreadAgentKind::Browser);
     assert_eq!(thread.load_toolsets(), vec!["browser".to_string()]);
     assert_eq!(thread.messages()[0].content, expected_browser_prompt.trim());
+}
+
+#[tokio::test]
+async fn subagent_feature_prompt_is_only_injected_for_main_threads() {
+    // 测试场景: 启用 subagent feature 后，主线程要看到基于当前 catalog 的稳定 prompt；
+    // child thread 不继承这段父线程管理说明，也不暴露 subagent 管理工具。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-subagent");
+    let registry = fixture.registry();
+    let compact_config = AppConfig::default().agent_config().compact_config().clone();
+    let _runner = install_mock_subagent_runner(&registry, compact_config.clone()).await;
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        compact_config,
+        FeatureResolver::development_default(Features::from_iter([Feature::Subagent])),
+    );
+
+    let mut main_thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_subagent_feature",
+            "thread_subagent_main",
+            "thread_subagent_main",
+        ),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut main_thread, ThreadAgentKind::Main)
+        .await
+        .expect("main thread should initialize");
+
+    let main_messages = main_thread.messages();
+    let subagent_prompt = main_messages
+        .iter()
+        .find(|message| message.content.contains("当前可用 subagent 数量:"))
+        .expect("main thread should receive subagent feature prompt");
+    assert!(
+        subagent_prompt
+            .content
+            .contains("当前可用 subagent 数量: 1")
+    );
+    assert!(subagent_prompt.content.contains("subagent_key: browser"));
+    assert!(subagent_prompt.content.contains("when_to_use:"));
+    assert!(
+        subagent_prompt
+            .content
+            .contains("简单直接的工具调用不应默认升级成 subagent 调用")
+    );
+    assert!(main_thread.enabled_features().contains(Feature::Subagent));
+
+    let main_tools = registry
+        .list_for_context(&main_thread)
+        .await
+        .expect("main thread tools should list");
+    assert!(main_tools.iter().any(|tool| tool.name == "spawn_subagent"));
+    assert!(main_tools.iter().any(|tool| tool.name == "send_subagent"));
+
+    let mut child_thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_subagent_feature",
+            "thread_subagent_main",
+            derive_child_thread_id("thread_subagent_main", "browser").to_string(),
+        )
+        .with_child_thread(ChildThreadIdentity::new(
+            "thread_subagent_main",
+            "browser",
+            SubagentSpawnMode::Persist,
+        )),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut child_thread, ThreadAgentKind::Browser)
+        .await
+        .expect("child thread should initialize");
+
+    assert!(
+        !child_thread.enabled_features().contains(Feature::Subagent),
+        "child thread must not inherit parent-only subagent feature"
+    );
+    assert!(child_thread.messages().iter().all(|message| {
+        !message.content.contains("当前可用 subagent 数量:")
+            && !message
+                .content
+                .contains("简单直接的工具调用不应默认升级成 subagent 调用")
+    }));
+    let child_tools = registry
+        .list_for_context(&child_thread)
+        .await
+        .expect("child thread tools should list");
+    assert!(!child_tools.iter().any(|tool| tool.name == "spawn_subagent"));
+    assert!(!child_tools.iter().any(|tool| tool.name == "send_subagent"));
+}
+
+#[tokio::test]
+async fn subagent_feature_disabled_hides_prompt_and_tools_on_main_thread() {
+    // 测试场景: feature 关闭时，即使 runtime 注册了 subagent 工具，主线程也不能看到 subagent prompt 或管理工具。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-subagent-off");
+    let registry = fixture.registry();
+    let compact_config = AppConfig::default().agent_config().compact_config().clone();
+    let _runner = install_mock_subagent_runner(&registry, compact_config.clone()).await;
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        compact_config,
+        FeatureResolver::development_default(Features::default()),
+    );
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_subagent_feature_off",
+            "thread_subagent_off",
+            "thread_subagent_off",
+        ),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut thread, ThreadAgentKind::Main)
+        .await
+        .expect("main thread should initialize");
+
+    assert!(
+        thread
+            .messages()
+            .iter()
+            .all(|message| !message.content.contains("当前可用 subagent 数量:")),
+        "main thread should not receive subagent feature prompt when feature is disabled"
+    );
+    let visible_tools = registry
+        .list_for_context(&thread)
+        .await
+        .expect("visible tools should list");
+    assert!(
+        !visible_tools
+            .iter()
+            .any(|tool| tool.name == "spawn_subagent")
+    );
+    assert!(
+        !visible_tools
+            .iter()
+            .any(|tool| tool.name == "send_subagent")
+    );
+    assert!(
+        !visible_tools
+            .iter()
+            .any(|tool| tool.name == "close_subagent")
+    );
+    assert!(
+        !visible_tools
+            .iter()
+            .any(|tool| tool.name == "list_subagent")
+    );
 }
 
 #[tokio::test]

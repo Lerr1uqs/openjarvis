@@ -572,6 +572,13 @@ impl ToolRegistry {
             .cloned()
     }
 
+    pub(crate) async fn subagent_tools_available(&self) -> bool {
+        let handlers = self.always_visible_handlers.read().await;
+        crate::agent::feature::init::subagent::managed_tool_names()
+            .iter()
+            .all(|tool_name| handlers.contains_key(*tool_name))
+    }
+
     pub(crate) async fn toolset_definitions(
         &self,
         toolset_name: &str,
