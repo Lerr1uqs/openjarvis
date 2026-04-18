@@ -7,6 +7,7 @@ use openjarvis::{
     model::{IncomingMessage, OutgoingMessage, ReplyTarget},
     router::ChannelRouter,
     session::SessionManager,
+    thread::ThreadAgentKind,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -156,13 +157,14 @@ async fn router_executes_clear_command_without_agent_dispatch() {
 
     let seed = build_incoming("msg_seed", "hello");
     let locator = sessions
-        .load_or_create_thread(&seed)
+        .create_thread(&seed, ThreadAgentKind::Main)
         .await
         .expect("thread should resolve");
     {
         let mut thread = sessions
-            .lock_thread_context(&locator, seed.received_at)
+            .lock_thread(&locator, seed.received_at)
             .await
+            .expect("thread lock result should resolve")
             .expect("thread should lock");
         thread
             .push_message(openjarvis::context::ChatMessage::new(
@@ -204,7 +206,7 @@ async fn router_executes_clear_command_without_agent_dispatch() {
         "clear command should not dispatch to agent worker"
     );
     let thread = sessions
-        .load_thread_context(&locator)
+        .load_thread(&locator)
         .await
         .expect("thread should load")
         .expect("thread should exist");

@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use openjarvis::{
-    config::{AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig},
+    config::{AppConfig, LLMConfig},
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMRequest, build_provider},
+    thread::DEFAULT_ASSISTANT_SYSTEM_PROMPT,
 };
 use std::{env, path::PathBuf};
 

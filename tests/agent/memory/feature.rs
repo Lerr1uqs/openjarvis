@@ -138,7 +138,6 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
                 Vec::new(),
             ),
         ])),
-        "system prompt",
         runtime.clone(),
     );
     let mut writer_handle = writer_worker.spawn();
@@ -172,7 +171,6 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         Arc::new(RecordingProvider {
             requests: Arc::clone(&requests),
         }),
-        "system prompt",
         runtime,
     );
     let mut reader_handle = reader_worker.spawn();
@@ -206,8 +204,9 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
     let reinit_incoming = build_incoming("notion 细节是什么");
     {
         let mut cleared_thread = sessions
-            .lock_thread_context(&locator, reinit_incoming.received_at)
+            .lock_thread(&locator, reinit_incoming.received_at)
             .await
+            .expect("cleared thread lock result should resolve")
             .expect("cleared thread should lock");
         cleared_thread.clear_to_initial_state(Utc::now());
         sessions

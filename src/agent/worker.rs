@@ -9,9 +9,7 @@ use super::{
     sandbox::DummySandboxContainer,
 };
 use crate::compact::CompactProvider;
-use crate::config::{
-    AgentCompactConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig, global_config,
-};
+use crate::config::{AgentCompactConfig, AppConfig, LLMConfig, global_config};
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
@@ -103,7 +101,6 @@ impl AgentCommittedMessageHandler for WorkerCommittedMessageHandler {
 ///
 /// let worker = AgentWorker::builder()
 ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-///     .system_prompt("system")
 ///     .build()
 ///     .expect("worker should build");
 ///
@@ -112,7 +109,6 @@ impl AgentCommittedMessageHandler for WorkerCommittedMessageHandler {
 pub struct AgentWorkerBuilder {
     llm: Option<Arc<dyn LLMProvider>>,
     runtime: AgentRuntime,
-    system_prompt: String,
     llm_config: LLMConfig,
     compact_config: AgentCompactConfig,
     compact_provider: Option<Arc<dyn CompactProvider>>,
@@ -123,7 +119,6 @@ impl Default for AgentWorkerBuilder {
         Self {
             llm: None,
             runtime: AgentRuntime::new(),
-            system_prompt: DEFAULT_ASSISTANT_SYSTEM_PROMPT.to_string(),
             llm_config: LLMConfig::default(),
             compact_config: AgentCompactConfig::default(),
             compact_provider: None,
@@ -146,12 +141,6 @@ impl AgentWorkerBuilder {
     /// Replace the runtime container used by the worker.
     pub fn runtime(mut self, runtime: AgentRuntime) -> Self {
         self.runtime = runtime;
-        self
-    }
-
-    /// Override the system prompt injected into every turn.
-    pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
-        self.system_prompt = system_prompt.into();
         self
     }
 
@@ -178,7 +167,6 @@ impl AgentWorkerBuilder {
         let Self {
             llm,
             runtime,
-            system_prompt,
             llm_config,
             compact_config,
             compact_provider,
@@ -190,7 +178,6 @@ impl AgentWorkerBuilder {
         let thread_runtime = Arc::new(ThreadRuntime::new(
             Arc::clone(&tool_registry),
             tool_registry.memory_repository(),
-            system_prompt.clone(),
             compact_config.clone(),
         ));
         let agent_loop = match compact_provider {
@@ -229,28 +216,21 @@ impl AgentWorker {
     ///
     /// let _worker = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// ```
-    pub fn new(llm: Arc<dyn LLMProvider>, system_prompt: impl Into<String>) -> Self {
+    pub fn new(llm: Arc<dyn LLMProvider>) -> Self {
         Self::builder()
             .llm(llm)
-            .system_prompt(system_prompt)
             .build()
             .expect("agent worker new should always have the required llm provider")
     }
 
     /// Create a worker with an explicitly provided runtime.
-    pub fn with_runtime(
-        llm: Arc<dyn LLMProvider>,
-        system_prompt: impl Into<String>,
-        runtime: AgentRuntime,
-    ) -> Self {
+    pub fn with_runtime(llm: Arc<dyn LLMProvider>, runtime: AgentRuntime) -> Self {
         Self::builder()
             .llm(llm)
             .runtime(runtime)
-            .system_prompt(system_prompt)
             .build()
             .expect("agent worker with_runtime should always have the required llm provider")
     }
@@ -258,7 +238,6 @@ impl AgentWorker {
     /// Create a worker with explicit runtime, LLM budget config, and compact config.
     pub fn with_runtime_and_compact_config(
         llm: Arc<dyn LLMProvider>,
-        system_prompt: impl Into<String>,
         runtime: AgentRuntime,
         llm_config: LLMConfig,
         compact_config: AgentCompactConfig,
@@ -266,7 +245,6 @@ impl AgentWorker {
         Self::builder()
             .llm(llm)
             .runtime(runtime)
-            .system_prompt(system_prompt)
             .llm_config(llm_config)
             .compact_config(compact_config)
             .build()
@@ -289,7 +267,6 @@ impl AgentWorker {
         Self::builder()
             .llm(build_provider(config.llm_config())?)
             .runtime(AgentRuntime::from_config(config.agent_config()).await?)
-            .system_prompt(config.llm_config().effective_system_prompt())
             .llm_config(config.llm_config().clone())
             .compact_config(config.agent_config().compact_config().clone())
             .build()
@@ -318,7 +295,6 @@ impl AgentWorker {
         Self::builder()
             .llm(build_provider_from_global_config()?)
             .runtime(AgentRuntime::from_global_config().await?)
-            .system_prompt(config.llm_config().effective_system_prompt())
             .llm_config(config.llm_config().clone())
             .compact_config(config.agent_config().compact_config().clone())
             .build()
@@ -343,7 +319,6 @@ impl AgentWorker {
     ///
     /// let worker = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// assert!(worker.sandbox().is_placeholder());
@@ -361,7 +336,6 @@ impl AgentWorker {
     ///
     /// let worker = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// let handle = worker.spawn();
@@ -401,10 +375,16 @@ impl AgentWorker {
         request: AgentRequest,
         event_tx: mpsc::Sender<AgentWorkerEvent>,
     ) -> Result<AgentLoopOutput> {
-        let mut thread_context = request
+        let thread_context = request
             .sessions
-            .lock_thread_context(&request.locator, request.incoming.received_at)
+            .lock_thread(&request.locator, request.incoming.received_at)
             .await?;
+        let mut thread_context = thread_context.ok_or_else(|| {
+            anyhow::anyhow!(
+                "thread `{}` was not found before worker handling",
+                request.locator.thread_id
+            )
+        })?;
 
         let mut committed_message_handler = WorkerCommittedMessageHandler {
             locator: request.locator.clone(),

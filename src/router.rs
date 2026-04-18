@@ -11,6 +11,7 @@ use crate::command::{CommandRegistry, CommandReply};
 use crate::config::ChannelConfig;
 use crate::model::{IncomingMessage, OutgoingMessage};
 use crate::session::{SessionManager, ThreadLocator};
+use crate::thread::ThreadAgentKind;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -42,7 +43,6 @@ pub struct ChannelRouter {
 ///
 /// let agent = AgentWorker::builder()
 ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-///     .system_prompt("system")
 ///     .build()
 ///     .expect("worker should build");
 /// let router = ChannelRouter::builder()
@@ -140,7 +140,6 @@ impl ChannelRouter {
     ///
     /// let agent = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// let _router = ChannelRouter::builder()
@@ -216,7 +215,6 @@ impl ChannelRouter {
     ///
     /// let agent = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// let _router = ChannelRouter::builder()
@@ -242,7 +240,6 @@ impl ChannelRouter {
     ///
     /// let agent = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// let _router = ChannelRouter::builder()
@@ -302,7 +299,6 @@ impl ChannelRouter {
     ///
     /// let agent = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// let mut router = ChannelRouter::builder()
@@ -333,7 +329,6 @@ impl ChannelRouter {
     ///
     /// let agent = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .system_prompt("system")
     ///     .build()
     ///     .expect("worker should build");
     /// let mut router = ChannelRouter::builder()
@@ -396,7 +391,10 @@ impl ChannelRouter {
             "router accepted incoming message"
         );
 
-        let locator = self.sessions.load_or_create_thread(&message).await?;
+        let locator = self
+            .sessions
+            .create_thread(&message, ThreadAgentKind::Main)
+            .await?;
 
         if self.commands.is_command(&message)? {
             if self.is_thread_pending(&locator).await {
@@ -411,10 +409,16 @@ impl ChannelRouter {
                     return Ok(());
                 }
             }
-            let mut thread_context = self
+            let thread_context = self
                 .sessions
-                .lock_thread_context(&locator, message.received_at)
+                .lock_thread(&locator, message.received_at)
                 .await?;
+            let mut thread_context = thread_context.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "thread `{}` disappeared before command execution",
+                    locator.thread_id
+                )
+            })?;
             if let Some(reply) = self
                 .commands
                 .try_execute_with_thread_context(&message, &mut thread_context)

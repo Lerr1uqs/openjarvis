@@ -12,7 +12,6 @@ use std::{
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str = "你是 OpenJarvis，一个有帮助、可靠、简洁的 AI 助手。请直接回答用户问题；如需要工具，基于上下文发起工具调用。当你需要回复图片时，必须在回复中使用 `#!openjarvis[image:/绝对路径/图片.png]` 语法传递图片绝对路径，可以与普通文本同时输出；不要改写该语法，不要输出相对路径，也不要解释这个协议本身。";
 pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
 const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 8_192;
@@ -1547,10 +1546,6 @@ fn default_llm_tokenizer() -> String {
     "chars_div4".to_string()
 }
 
-fn default_llm_system_prompt() -> String {
-    DEFAULT_ASSISTANT_SYSTEM_PROMPT.to_string()
-}
-
 fn default_llm_headers() -> HashMap<String, String> {
     HashMap::new()
 }
@@ -1890,7 +1885,6 @@ pub struct LLMConfig {
     pub context_window_tokens: Option<usize>,
     pub max_output_tokens: Option<usize>,
     pub tokenizer: String,
-    pub system_prompt: String,
     pub active_provider: Option<String>,
     pub providers: HashMap<String, LLMProviderProfileConfig>,
     #[doc(hidden)]
@@ -1910,7 +1904,6 @@ impl Default for LLMConfig {
             context_window_tokens: default_llm_context_window_tokens(),
             max_output_tokens: default_llm_max_output_tokens(),
             tokenizer: default_llm_tokenizer(),
-            system_prompt: default_llm_system_prompt(),
             active_provider: None,
             providers: HashMap::new(),
             legacy_fields_explicit: false,
@@ -1959,6 +1952,11 @@ impl<'de> Deserialize<'de> for LLMConfig {
             .providers
             .into_profiles(&provider_defaults)
             .map_err(serde::de::Error::custom)?;
+        if raw.system_prompt.is_some() {
+            return Err(serde::de::Error::custom(
+                "llm.system_prompt is no longer supported; thread system prompts are loaded from bundled markdown templates",
+            ));
+        }
         let active_provider = if providers_from_list {
             match (
                 raw.active_provider
@@ -2050,7 +2048,6 @@ impl<'de> Deserialize<'de> for LLMConfig {
             } else {
                 raw.tokenizer.unwrap_or_else(default_llm_tokenizer)
             },
-            system_prompt: raw.system_prompt.unwrap_or_else(default_llm_system_prompt),
             active_provider,
             providers,
             legacy_fields_explicit,
@@ -2119,25 +2116,6 @@ impl LLMConfig {
         }
 
         self.tokenizer.clone()
-    }
-
-    /// Return the effective assistant system prompt configured for worker initialization.
-    ///
-    /// # 示例
-    /// ```rust
-    /// use openjarvis::config::LLMConfig;
-    ///
-    /// let config = LLMConfig::default();
-    ///
-    /// assert!(!config.effective_system_prompt().trim().is_empty());
-    /// ```
-    pub fn effective_system_prompt(&self) -> &str {
-        let prompt = self.system_prompt.trim();
-        if prompt.is_empty() {
-            DEFAULT_ASSISTANT_SYSTEM_PROMPT
-        } else {
-            prompt
-        }
     }
 
     /// Resolve the active provider into one stable runtime view.

@@ -7,7 +7,8 @@ pub mod store;
 
 use crate::model::IncomingMessage;
 use crate::thread::{
-    Thread, ThreadContextLocator, ThreadRuntime, ThreadSnapshotStore, derive_internal_thread_id,
+    Thread, ThreadAgentKind, ThreadContextLocator, ThreadRuntime, ThreadSnapshotStore,
+    derive_internal_thread_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -305,7 +306,7 @@ impl SessionManager {
         })
     }
 
-    /// Install the thread runtime used to initialize freshly resolved thread handles.
+    /// Install the thread runtime used by explicit create/reinitialize paths.
     pub fn install_thread_runtime(&self, thread_runtime: Arc<ThreadRuntime>) {
         let mut runtime = self
             .inner
@@ -315,14 +316,23 @@ impl SessionManager {
         *runtime = Some(thread_runtime);
     }
 
-    /// Resolve the external thread id on one incoming message and create the thread on first
-    /// sight.
+    fn resolve_thread_locator(&self, incoming: &IncomingMessage) -> ThreadLocator {
+        let session_key = SessionKey::from_incoming(incoming);
+        let external_thread_id = incoming.resolved_external_thread_id();
+        let session_id = session_key.derive_session_id();
+        let thread_id = session_key.derive_thread_id(&external_thread_id);
+        ThreadLocator::new(session_id, incoming, external_thread_id, thread_id)
+    }
+
+    /// Resolve the external thread id on one incoming message and prepare a directly serviceable
+    /// thread via the explicit create path.
     ///
     /// # 示例
     /// ```rust
     /// use chrono::Utc;
     /// use openjarvis::model::{IncomingMessage, ReplyTarget};
     /// use openjarvis::session::SessionManager;
+    /// use openjarvis::thread::ThreadAgentKind;
     /// use serde_json::json;
     /// use uuid::Uuid;
     ///
@@ -344,18 +354,16 @@ impl SessionManager {
     ///     },
     /// };
     ///
-    /// let _future = manager.load_or_create_thread(&incoming);
+    /// let _future = manager.create_thread(&incoming, ThreadAgentKind::Main);
     /// ```
-    pub async fn load_or_create_thread(
+    pub async fn create_thread(
         &self,
         incoming: &IncomingMessage,
+        thread_agent_kind: ThreadAgentKind,
     ) -> SessionStoreResult<ThreadLocator> {
         let session_key = SessionKey::from_incoming(incoming);
-        let external_thread_id = incoming.resolved_external_thread_id();
-        let thread_key = session_key.thread_key(&external_thread_id);
-        let session_id = session_key.derive_session_id();
-        let thread_id = session_key.derive_thread_id(&external_thread_id);
-        let locator = ThreadLocator::new(session_id, incoming, external_thread_id, thread_id);
+        let locator = self.resolve_thread_locator(incoming);
+        let thread_key = locator.thread_key();
 
         info!(
             session_id = %locator.session_id,
@@ -364,17 +372,20 @@ impl SessionManager {
             external_thread_id = %locator.external_thread_id,
             thread_key = %thread_key,
             thread_id = %locator.thread_id,
-            "resolved incoming thread identity"
+            thread_agent_kind = thread_agent_kind.as_str(),
+            "resolved incoming thread identity for create_thread"
         );
 
-        let _ = self
-            .ensure_thread_handle(&locator, incoming.received_at)
+        let handle = self
+            .create_or_restore_thread_handle(&locator, incoming.received_at)
+            .await?;
+        self.initialize_thread_handle(&handle, thread_agent_kind)
             .await?;
         let mut sessions = self.inner.sessions.lock().await;
         let session = sessions
             .entry(session_key.clone())
             .or_insert_with(|| CachedSession {
-                id: session_id,
+                id: locator.session_id,
                 key: session_key,
                 threads: HashMap::new(),
                 created_at: incoming.received_at,
@@ -386,24 +397,48 @@ impl SessionManager {
     }
 
     /// Load the current thread context snapshot for one channel/user/thread tuple.
-    pub async fn load_thread_context(
-        &self,
-        locator: &ThreadLocator,
-    ) -> SessionStoreResult<Option<Thread>> {
-        let handle = self.ensure_thread_handle(locator, Utc::now()).await?;
+    pub async fn load_thread(&self, locator: &ThreadLocator) -> SessionStoreResult<Option<Thread>> {
+        let Some(handle) = self
+            .load_existing_thread_handle(locator, Utc::now())
+            .await?
+        else {
+            info!(
+                session_id = %locator.session_id,
+                thread_id = %locator.thread_id,
+                "load_thread did not find an existing thread"
+            );
+            return Ok(None);
+        };
+        info!(
+            session_id = %locator.session_id,
+            thread_id = %locator.thread_id,
+            "loaded existing thread snapshot"
+        );
         Ok(Some(handle.lock().await.clone()))
     }
 
     /// Lock one live thread context for in-process mutation.
     ///
-    /// Cache miss 会先从 store 恢复；store miss 会创建一个新的空线程上下文。
-    pub async fn lock_thread_context(
+    /// Cache miss 会先从 store 恢复；store miss 会显式返回缺失。
+    pub async fn lock_thread(
         &self,
         locator: &ThreadLocator,
         now: DateTime<Utc>,
-    ) -> SessionStoreResult<OwnedMutexGuard<Thread>> {
-        let handle = self.ensure_thread_handle(locator, now).await?;
-        Ok(handle.lock_owned().await)
+    ) -> SessionStoreResult<Option<OwnedMutexGuard<Thread>>> {
+        let Some(handle) = self.load_existing_thread_handle(locator, now).await? else {
+            info!(
+                session_id = %locator.session_id,
+                thread_id = %locator.thread_id,
+                "lock_thread did not find an existing thread"
+            );
+            return Ok(None);
+        };
+        info!(
+            session_id = %locator.session_id,
+            thread_id = %locator.thread_id,
+            "locked existing thread for mutation"
+        );
+        Ok(Some(handle.lock_owned().await))
     }
 
     /// Return a cloned session snapshot for debugging or tests.
@@ -433,34 +468,62 @@ impl SessionManager {
             .cloned()
     }
 
-    async fn ensure_thread_handle(
+    async fn load_existing_thread_handle(
         &self,
         locator: &ThreadLocator,
         now: DateTime<Utc>,
-    ) -> SessionStoreResult<SharedThreadContext> {
+    ) -> SessionStoreResult<Option<SharedThreadContext>> {
         if let Some(handle) = self.cached_thread_handle(locator).await {
-            self.initialize_thread_handle_if_needed(&handle).await?;
-            return Ok(handle);
+            info!(
+                session_id = %locator.session_id,
+                thread_id = %locator.thread_id,
+                "reused cached thread handle"
+            );
+            return Ok(Some(handle));
         }
 
         let restored = self.inner.store.load_thread_context(locator).await?;
-        let restored_from_store = restored.is_some();
-        let mut thread_context = if let Some(record) = restored {
-            Thread::from_persisted(record.locator, record.snapshot, record.revision)
-        } else {
-            Thread::new(ThreadContextLocator::from(locator), now)
+        let Some(record) = restored else {
+            info!(
+                session_id = %locator.session_id,
+                thread_id = %locator.thread_id,
+                "thread was not found in cache or store"
+            );
+            return Ok(None);
         };
+        let mut thread_context =
+            Thread::from_persisted(record.locator, record.snapshot, record.revision);
         thread_context.rebind_locator(ThreadContextLocator::from(locator));
         thread_context.bind_store(Arc::clone(&self.inner.bound_store));
         let handle = self
             .cache_thread_handle_if_absent(locator, Arc::new(Mutex::new(thread_context)), now)
             .await;
-        self.initialize_thread_handle_if_needed(&handle).await?;
         info!(
             session_id = %locator.session_id,
             thread_id = %locator.thread_id,
-            restored_from_store,
-            "ensured thread context handle in session cache"
+            "restored existing thread handle from store into session cache"
+        );
+        Ok(Some(handle))
+    }
+
+    async fn create_or_restore_thread_handle(
+        &self,
+        locator: &ThreadLocator,
+        now: DateTime<Utc>,
+    ) -> SessionStoreResult<SharedThreadContext> {
+        if let Some(handle) = self.load_existing_thread_handle(locator, now).await? {
+            return Ok(handle);
+        }
+
+        let mut thread_context = Thread::new(ThreadContextLocator::from(locator), now);
+        thread_context.bind_store(Arc::clone(&self.inner.bound_store));
+        let handle = self
+            .cache_thread_handle_if_absent(locator, Arc::new(Mutex::new(thread_context)), now)
+            .await;
+        info!(
+            session_id = %locator.session_id,
+            thread_id = %locator.thread_id,
+            "created new empty thread handle before initialization"
         );
         Ok(handle)
     }
@@ -491,9 +554,10 @@ impl SessionManager {
         )
     }
 
-    async fn initialize_thread_handle_if_needed(
+    async fn initialize_thread_handle(
         &self,
         handle: &SharedThreadContext,
+        thread_agent_kind: ThreadAgentKind,
     ) -> SessionStoreResult<()> {
         let thread_runtime = self
             .inner
@@ -506,7 +570,9 @@ impl SessionManager {
         };
 
         let mut thread_context = handle.lock().await;
-        thread_runtime.initialize_thread(&mut thread_context).await?;
+        thread_runtime
+            .initialize_thread(&mut thread_context, thread_agent_kind)
+            .await?;
         Ok(())
     }
 }

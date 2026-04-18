@@ -7,12 +7,15 @@ use openjarvis::{
     config::AppConfig,
     model::{IncomingMessage, ReplyTarget},
     session::{MemorySessionStore, SessionManager, SessionStore},
-    thread::{Feature, Features, Thread, ThreadContextLocator, ThreadRuntime},
+    thread::{
+        DEFAULT_ASSISTANT_SYSTEM_PROMPT, Feature, Features, Thread, ThreadAgentKind,
+        ThreadContextLocator, ThreadRuntime,
+    },
 };
 use serde_json::json;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -94,7 +97,6 @@ fn build_incoming(user_id: &str, external_thread_id: &str) -> IncomingMessage {
 
 fn build_thread_runtime(
     registry: Arc<ToolRegistry>,
-    system_prompt: &str,
     compact_config: openjarvis::config::AgentCompactConfig,
     feature_resolver: FeatureResolver,
 ) -> Arc<ThreadRuntime> {
@@ -102,7 +104,6 @@ fn build_thread_runtime(
     Arc::new(ThreadRuntime::with_feature_resolver(
         registry,
         memory_repository,
-        system_prompt,
         compact_config,
         feature_resolver,
     ))
@@ -181,7 +182,10 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
         })
         .expect("active memory fixture should be written");
 
-    let compact_config = compact_enabled_config().agent_config().compact_config().clone();
+    let compact_config = compact_enabled_config()
+        .agent_config()
+        .compact_config()
+        .clone();
     let resolver = FeatureResolver::development_default(Features::from_iter([
         Feature::Memory,
         Feature::Skill,
@@ -190,7 +194,6 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
     let runtime = ThreadRuntime::with_feature_resolver(
         Arc::clone(&registry),
         registry.memory_repository(),
-        "worker system prompt",
         compact_config,
         resolver,
     );
@@ -199,7 +202,7 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
         Utc::now(),
     );
     runtime
-        .initialize_thread(&mut thread)
+        .initialize_thread(&mut thread, ThreadAgentKind::Main)
         .await
         .expect("thread should initialize");
 
@@ -212,11 +215,19 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
     let messages = thread.messages();
     let environment_index = messages
         .iter()
-        .position(|message| message.content.contains("Runtime environment for this thread"))
+        .position(|message| {
+            message
+                .content
+                .contains("Runtime environment for this thread")
+        })
         .expect("environment perception prompt should exist");
     let memory_index = messages
         .iter()
-        .position(|message| message.content.contains("notion, workflow -> workflow/notion.md"))
+        .position(|message| {
+            message
+                .content
+                .contains("notion, workflow -> workflow/notion.md")
+        })
         .expect("memory prompt should exist");
     let skill_index = messages
         .iter()
@@ -227,7 +238,7 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
         .position(|message| message.content.contains("Auto-compact 已开启"))
         .expect("auto-compact prompt should exist");
 
-    assert_eq!(messages[0].content, "worker system prompt");
+    assert_eq!(messages[0].content, DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim());
     assert!(environment_index < memory_index);
     assert!(environment_index < skill_index);
     assert!(environment_index < auto_compact_index);
@@ -265,18 +276,17 @@ async fn thread_runtime_persists_features_and_preserves_them_across_restore() {
         .expect("session manager a should build");
     manager_a.install_thread_runtime(build_thread_runtime(
         Arc::clone(&registry),
-        "worker system prompt",
         AppConfig::default().agent_config().compact_config().clone(),
         FeatureResolver::development_default(Features::from_iter([Feature::Memory])),
     ));
 
     let incoming = build_incoming("ou_feature_runtime", "chat_feature_runtime");
     let locator = manager_a
-        .load_or_create_thread(&incoming)
+        .create_thread(&incoming, ThreadAgentKind::Main)
         .await
         .expect("thread should resolve");
     let initialized = manager_a
-        .load_thread_context(&locator)
+        .load_thread(&locator)
         .await
         .expect("thread should load")
         .expect("thread should exist");
@@ -293,8 +303,9 @@ async fn thread_runtime_persists_features_and_preserves_them_across_restore() {
 
     {
         let mut locked_thread = manager_a
-            .lock_thread_context(&locator, incoming.received_at)
+            .lock_thread(&locator, incoming.received_at)
             .await
+            .expect("live thread lock result should resolve")
             .expect("live thread should lock");
         assert!(
             locked_thread
@@ -315,12 +326,14 @@ async fn thread_runtime_persists_features_and_preserves_them_across_restore() {
         .expect("session manager b should build");
     manager_b.install_thread_runtime(build_thread_runtime(
         Arc::clone(&registry),
-        "worker system prompt changed",
-        compact_enabled_config().agent_config().compact_config().clone(),
+        compact_enabled_config()
+            .agent_config()
+            .compact_config()
+            .clone(),
         FeatureResolver::development_default(Features::from_iter([Feature::Skill])),
     ));
     let restored = manager_b
-        .load_thread_context(&locator)
+        .load_thread(&locator)
         .await
         .expect("restored thread should load")
         .expect("restored thread should exist");
@@ -331,4 +344,79 @@ async fn thread_runtime_persists_features_and_preserves_them_across_restore() {
         !restored.enabled_features().contains(Feature::Skill),
         "恢复后的线程不能被新的默认 resolver 覆盖成 skill"
     );
+}
+
+#[tokio::test]
+async fn browser_thread_agent_preloads_browser_toolset_and_prompt() {
+    // 测试场景: Browser thread agent 要在唯一 initialize_thread 入口中注入浏览器角色 prompt，并预绑定 browser toolset。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-browser");
+    let registry = fixture.registry();
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register");
+
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        AppConfig::default().agent_config().compact_config().clone(),
+        FeatureResolver::development_default(Features::default()),
+    );
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_browser",
+            "thread_browser",
+            "thread_browser",
+        ),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut thread, ThreadAgentKind::Browser)
+        .await
+        .expect("browser thread should initialize");
+
+    let expected_browser_prompt = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/prompts/thread_agent/browser.md"),
+    )
+    .expect("browser prompt markdown should load");
+
+    assert_eq!(thread.thread_agent_kind(), ThreadAgentKind::Browser);
+    assert_eq!(thread.load_toolsets(), vec!["browser".to_string()]);
+    assert_eq!(thread.messages()[0].content, expected_browser_prompt.trim());
+}
+
+#[tokio::test]
+async fn main_thread_agent_uses_bundled_markdown_prompt() {
+    // 测试场景: Main thread 的稳定 system prompt 只来自随程序打包的 markdown 模板。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-main-md");
+    let registry = fixture.registry();
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register");
+
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        AppConfig::default().agent_config().compact_config().clone(),
+        FeatureResolver::development_default(Features::default()),
+    );
+    let mut thread = Thread::new(
+        ThreadContextLocator::new(None, "feishu", "ou_main", "thread_main", "thread_main"),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut thread, ThreadAgentKind::Main)
+        .await
+        .expect("main thread should initialize");
+
+    let expected_main_prompt = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/prompts/thread_agent/main.md"),
+    )
+    .expect("main prompt markdown should load");
+
+    assert_eq!(thread.thread_agent_kind(), ThreadAgentKind::Main);
+    assert_eq!(thread.messages()[0].content, expected_main_prompt.trim());
 }

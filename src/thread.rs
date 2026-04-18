@@ -1,5 +1,7 @@
 //! Thread-first aggregate model and atomic thread-owned persistence helpers.
 
+mod agent;
+
 use crate::agent::{
     FeatureResolver, MemoryRepository, ShellEnv, ToolCallRequest, ToolCallResult, ToolDefinition,
     ToolRegistry, feature,
@@ -15,8 +17,13 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+pub use agent::{
+    DEFAULT_ASSISTANT_SYSTEM_PROMPT, DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT, ThreadAgent,
+    ThreadAgentKind,
+};
 
 const OPENJARVIS_THREAD_ID_NAMESPACE: Uuid =
     Uuid::from_u128(0x7f4b2e8d_5d33_4f51_9c27_9c5d7d76c1a1);
@@ -317,6 +324,8 @@ pub struct ThreadState {
     #[serde(default)]
     pub lifecycle: ThreadLifecycleState,
     #[serde(default)]
+    pub agent: ThreadAgent,
+    #[serde(default)]
     pub features: ThreadFeatureState,
     #[serde(default)]
     pub tools: ThreadToolState,
@@ -399,7 +408,6 @@ pub trait ThreadSnapshotStore: Send + Sync + fmt::Debug {
 pub struct ThreadRuntime {
     tool_registry: Arc<ToolRegistry>,
     memory_repository: Arc<MemoryRepository>,
-    system_prompt: String,
     compact_config: AgentCompactConfig,
     feature_resolver: FeatureResolver,
 }
@@ -418,20 +426,17 @@ impl ThreadRuntime {
     ///
     /// let tool_registry = Arc::new(ToolRegistry::new());
     /// let memory_repository = Arc::new(MemoryRepository::new("."));
-    /// let _runtime =
-    ///     ThreadRuntime::new(tool_registry, memory_repository, "", AgentCompactConfig::default());
+    /// let _runtime = ThreadRuntime::new(tool_registry, memory_repository, AgentCompactConfig::default());
     /// ```
     pub fn new(
         tool_registry: Arc<ToolRegistry>,
         memory_repository: Arc<MemoryRepository>,
-        system_prompt: impl Into<String>,
         compact_config: AgentCompactConfig,
     ) -> Self {
         let feature_resolver = build_default_feature_resolver(&compact_config);
         Self::with_feature_resolver(
             tool_registry,
             memory_repository,
-            system_prompt,
             compact_config,
             feature_resolver,
         )
@@ -441,14 +446,12 @@ impl ThreadRuntime {
     pub fn with_feature_resolver(
         tool_registry: Arc<ToolRegistry>,
         memory_repository: Arc<MemoryRepository>,
-        system_prompt: impl Into<String>,
         compact_config: AgentCompactConfig,
         feature_resolver: FeatureResolver,
     ) -> Self {
         Self {
             tool_registry,
             memory_repository,
-            system_prompt: system_prompt.into(),
             compact_config,
             feature_resolver,
         }
@@ -491,8 +494,29 @@ impl ThreadRuntime {
         resolved
     }
 
-    fn preloaded_toolsets(&self, features: &Features) -> Vec<String> {
-        let mut toolsets = Vec::new();
+    fn resolve_thread_agent(
+        &self,
+        thread_context: &Thread,
+        requested_kind: ThreadAgentKind,
+    ) -> ThreadAgent {
+        let persisted_agent = thread_context.thread_agent();
+        if thread_context.is_initialized() {
+            if persisted_agent.kind != requested_kind {
+                warn!(
+                    thread_id = %thread_context.locator.thread_id,
+                    persisted_thread_agent_kind = persisted_agent.kind.as_str(),
+                    requested_thread_agent_kind = requested_kind.as_str(),
+                    "initialized thread already owns a persisted thread agent; ignoring requested kind"
+                );
+            }
+            return persisted_agent;
+        }
+
+        ThreadAgent::from_kind(requested_kind)
+    }
+
+    fn preloaded_toolsets(&self, thread_agent: &ThreadAgent, features: &Features) -> Vec<String> {
+        let mut toolsets = thread_agent.bound_toolsets.clone();
         for feature in features.iter() {
             match feature {
                 Feature::Memory => toolsets.extend(feature::init::memory::toolsets()),
@@ -506,11 +530,12 @@ impl ThreadRuntime {
 
     async fn build_predefined_role_messages(
         &self,
+        thread_agent: &ThreadAgent,
         preloaded_toolsets: &[String],
         initialized_at: DateTime<Utc>,
     ) -> Result<Vec<ChatMessage>> {
         let mut messages = Vec::new();
-        let system_prompt = self.system_prompt.trim();
+        let system_prompt = thread_agent.system_prompt().trim();
         if !system_prompt.is_empty() {
             messages.push(ChatMessage::new(
                 ChatMessageRole::System,
@@ -555,7 +580,6 @@ impl ThreadRuntime {
     /// let runtime = ThreadRuntime::new(
     ///     tool_registry,
     ///     memory_repository,
-    ///     "system",
     ///     AgentCompactConfig::default(),
     /// );
     /// let mut thread = Thread::new(
@@ -563,24 +587,40 @@ impl ThreadRuntime {
     ///     Utc::now(),
     /// );
     ///
-    /// runtime.initialize_thread(&mut thread).await?;
+    /// use openjarvis::thread::ThreadAgentKind;
+    ///
+    /// runtime
+    ///     .initialize_thread(&mut thread, ThreadAgentKind::Main)
+    ///     .await?;
     /// assert!(thread.is_initialized());
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn initialize_thread(&self, thread_context: &mut Thread) -> Result<bool> {
+    pub async fn initialize_thread(
+        &self,
+        thread_context: &mut Thread,
+        requested_thread_agent_kind: ThreadAgentKind,
+    ) -> Result<bool> {
         self.ensure_tool_registry_ready().await?;
 
+        let resolved_thread_agent =
+            self.resolve_thread_agent(thread_context, requested_thread_agent_kind);
         let resolved_features = self.resolve_enabled_features(thread_context);
-        let preloaded_toolsets = self.preloaded_toolsets(&resolved_features);
+        let preloaded_toolsets =
+            self.preloaded_toolsets(&resolved_thread_agent, &resolved_features);
 
         if thread_context.is_initialized() {
             let backfilled = thread_context
-                .reconcile_initialized_feature_state(resolved_features, preloaded_toolsets)
+                .reconcile_initialized_feature_state(
+                    resolved_thread_agent.clone(),
+                    resolved_features,
+                    preloaded_toolsets,
+                )
                 .await?;
             if backfilled {
                 info!(
                     thread_id = %thread_context.locator.thread_id,
+                    thread_agent_kind = thread_context.thread_agent_kind().as_str(),
                     enabled_features = ?thread_context.enabled_features().names(),
                     "backfilled persisted thread feature state for initialized thread"
                 );
@@ -596,11 +636,17 @@ impl ThreadRuntime {
             .map(|message| message.created_at);
         if let Some(initialized_at) = existing_system_prefix_at {
             thread_context
-                .mark_initialized_with_state(initialized_at, resolved_features, preloaded_toolsets)
+                .mark_initialized_with_state(
+                    initialized_at,
+                    resolved_thread_agent.clone(),
+                    resolved_features,
+                    preloaded_toolsets,
+                )
                 .await?;
             info!(
                 thread_id = %thread_context.locator.thread_id,
                 external_thread_id = %thread_context.locator.external_thread_id,
+                thread_agent_kind = resolved_thread_agent.kind.as_str(),
                 initialized_at = %initialized_at,
                 "marked existing thread as initialized from persisted system prefix"
             );
@@ -609,7 +655,11 @@ impl ThreadRuntime {
 
         let initialized_at = Utc::now();
         let mut initialized_messages = self
-            .build_predefined_role_messages(&preloaded_toolsets, initialized_at)
+            .build_predefined_role_messages(
+                &resolved_thread_agent,
+                &preloaded_toolsets,
+                initialized_at,
+            )
             .await?;
         initialized_messages.push(ChatMessage::new(
             ChatMessageRole::System,
@@ -617,6 +667,7 @@ impl ThreadRuntime {
             initialized_at,
         ));
 
+        thread_context.replace_thread_agent(resolved_thread_agent.clone());
         thread_context.replace_enabled_features(Features::default());
         for feature in &resolved_features {
             thread_context.enable_feature(feature);
@@ -671,6 +722,7 @@ impl ThreadRuntime {
             .initialize_with_messages(
                 initialized_messages,
                 initialized_at,
+                resolved_thread_agent,
                 resolved_features,
                 preloaded_toolsets,
             )
@@ -678,6 +730,7 @@ impl ThreadRuntime {
         info!(
             thread_id = %thread_context.locator.thread_id,
             external_thread_id = %thread_context.locator.external_thread_id,
+            thread_agent_kind = thread_context.thread_agent_kind().as_str(),
             initialized_message_count = thread_context
                 .thread
                 .messages
@@ -696,7 +749,6 @@ impl fmt::Debug for ThreadRuntime {
         f.debug_struct("ThreadRuntime")
             .field("tool_registry", &"Arc<ToolRegistry>")
             .field("memory_repository", &"Arc<MemoryRepository>")
-            .field("system_prompt", &self.system_prompt)
             .field("compact_config", &self.compact_config)
             .field("feature_resolver", &self.feature_resolver)
             .finish()
@@ -807,6 +859,16 @@ impl Thread {
     /// Return whether this thread already owns a persisted initialized prefix.
     pub fn is_initialized(&self) -> bool {
         self.state.lifecycle.initialized
+    }
+
+    /// Return the persisted thread agent profile for the current thread.
+    pub fn thread_agent(&self) -> ThreadAgent {
+        self.state.agent.clone()
+    }
+
+    /// Return the persisted thread agent kind for the current thread.
+    pub fn thread_agent_kind(&self) -> ThreadAgentKind {
+        self.state.agent.kind
     }
 
     /// Return the persisted enabled feature set for the current thread.
@@ -934,11 +996,13 @@ impl Thread {
     pub(crate) async fn mark_initialized_with_state(
         &mut self,
         initialized_at: DateTime<Utc>,
+        thread_agent: ThreadAgent,
         enabled_features: Features,
         preloaded_toolsets: Vec<String>,
     ) -> Result<()> {
         self.apply_persisted_mutation("mark_initialized_with_state", |snapshot| {
             snapshot.state.lifecycle.initialized = true;
+            snapshot.state.agent = thread_agent.clone();
             snapshot.state.features.enabled_features = enabled_features.clone();
             let mut merged_toolsets = snapshot.state.tools.loaded_toolsets.clone();
             merged_toolsets.extend(preloaded_toolsets.clone());
@@ -958,6 +1022,7 @@ impl Thread {
         &mut self,
         initialized_messages: Vec<ChatMessage>,
         initialized_at: DateTime<Utc>,
+        thread_agent: ThreadAgent,
         enabled_features: Features,
         preloaded_toolsets: Vec<String>,
     ) -> Result<()> {
@@ -968,6 +1033,7 @@ impl Thread {
                 snapshot.thread.updated_at = initialized_at;
             }
             snapshot.state.lifecycle.initialized = true;
+            snapshot.state.agent = thread_agent.clone();
             snapshot.state.features.enabled_features = enabled_features.clone();
             snapshot.state.tools.loaded_toolsets = normalize_loaded_toolsets(preloaded_toolsets);
             Ok(())
@@ -977,12 +1043,17 @@ impl Thread {
 
     pub(crate) async fn reconcile_initialized_feature_state(
         &mut self,
+        thread_agent: ThreadAgent,
         enabled_features: Features,
         preloaded_toolsets: Vec<String>,
     ) -> Result<bool> {
         let now = Utc::now();
         self.apply_persisted_mutation("reconcile_initialized_feature_state", |snapshot| {
             let mut changed = false;
+            if snapshot.state.agent != thread_agent {
+                snapshot.state.agent = thread_agent.clone();
+                changed = true;
+            }
             if snapshot.state.features.enabled_features != enabled_features {
                 snapshot.state.features.enabled_features = enabled_features.clone();
                 changed = true;
@@ -1132,6 +1203,11 @@ impl Thread {
     /// Replace the enabled feature state with one explicit snapshot in memory only.
     pub fn replace_enabled_features(&mut self, enabled_features: Features) {
         self.state.features.enabled_features = enabled_features;
+    }
+
+    /// Replace the thread agent profile with one explicit snapshot in memory only.
+    pub fn replace_thread_agent(&mut self, thread_agent: ThreadAgent) {
+        self.state.agent = thread_agent;
     }
 
     /// Persist one explicit feature snapshot immediately.

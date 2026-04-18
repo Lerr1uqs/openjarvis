@@ -1,7 +1,8 @@
 use openjarvis::config::{
-    AgentMcpServerTransportConfig, AppConfig, DEFAULT_ASSISTANT_SYSTEM_PROMPT, LLMConfig,
-    LogRotation, SessionStoreBackend, global_config, install_global_config, try_global_config,
+    AgentMcpServerTransportConfig, AppConfig, LLMConfig, LogRotation, SessionStoreBackend,
+    global_config, install_global_config, try_global_config,
 };
+use openjarvis::thread::DEFAULT_ASSISTANT_SYSTEM_PROMPT;
 use serde_json::json;
 use std::{
     any::Any,
@@ -228,7 +229,6 @@ llm:
       model: "qwen3.6-plus"
       base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/responses"
       api_key_path: "~/.qwen.apikey"
-  system_prompt: "custom system prompt"
   context_window_tokens: 262144
   max_output_tokens: 32768
   tokenizer: "chars_div4"
@@ -249,10 +249,6 @@ llm:
     assert_eq!(resolved.effective_protocol(), "openai_responses");
     assert_eq!(resolved.context_window_tokens(), 262144);
     assert_eq!(resolved.max_output_tokens(), 32768);
-    assert_eq!(
-        config.llm_config().effective_system_prompt(),
-        "custom system prompt"
-    );
     assert_eq!(providers["zai"].effective_protocol(), "openai_compatible");
 }
 
@@ -276,6 +272,25 @@ llm:
     assert_eq!(resolved.name, "mock_llm");
     assert_eq!(resolved.effective_protocol(), "mock");
     assert_eq!(resolved.mock_response, "normalized");
+}
+
+#[test]
+fn llm_system_prompt_override_is_rejected() {
+    let error = AppConfig::from_yaml_str(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "mock"
+  system_prompt: "custom thread prompt"
+"#,
+    )
+    .expect_err("llm.system_prompt should be rejected");
+
+    let error_text = format!("{error:#}");
+    assert!(
+        error_text.contains("llm.system_prompt is no longer supported"),
+        "unexpected error: {error_text}"
+    );
 }
 
 #[test]
@@ -619,6 +634,15 @@ fn default_assistant_system_prompt_is_not_empty() {
     assert!(!DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim().is_empty());
     assert!(DEFAULT_ASSISTANT_SYSTEM_PROMPT.contains("#!openjarvis[image:"));
     assert!(DEFAULT_ASSISTANT_SYSTEM_PROMPT.contains("绝对路径"));
+}
+
+#[test]
+fn default_assistant_system_prompt_is_loaded_from_bundled_markdown() {
+    let prompt_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/prompts/thread_agent/main.md");
+    let expected = fs::read_to_string(&prompt_path).expect("main prompt markdown should load");
+
+    assert_eq!(DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim(), expected.trim());
 }
 
 #[test]

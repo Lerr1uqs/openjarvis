@@ -7,6 +7,7 @@ use openjarvis::{
     llm::{LLMProvider, LLMRequest, LLMResponse, MockLLMProvider},
     model::{IncomingMessage, ReplyTarget},
     session::SessionManager,
+    thread::ThreadAgentKind,
 };
 use serde_json::json;
 use tokio::time::{Duration, timeout};
@@ -46,14 +47,13 @@ async fn worker_emits_dispatch_then_request_completed() {
     let sessions = SessionManager::new();
     let worker = AgentWorker::builder()
         .llm(std::sync::Arc::new(MockLLMProvider::new("mock-reply")))
-        .system_prompt("system prompt")
         .build()
         .expect("worker should build");
     sessions.install_thread_runtime(worker.thread_runtime());
     let mut handle = worker.spawn();
     let incoming = build_incoming("hello");
     let locator = sessions
-        .load_or_create_thread(&incoming)
+        .create_thread(&incoming, ThreadAgentKind::Main)
         .await
         .expect("thread should resolve");
 
@@ -100,14 +100,13 @@ async fn worker_reports_failed_request_completion_after_fallback_message() {
     let sessions = SessionManager::new();
     let worker = AgentWorker::builder()
         .llm(std::sync::Arc::new(FailingProvider))
-        .system_prompt("system prompt")
         .build()
         .expect("worker should build");
     sessions.install_thread_runtime(worker.thread_runtime());
     let mut handle = worker.spawn();
     let incoming = build_incoming("hello");
     let locator = sessions
-        .load_or_create_thread(&incoming)
+        .create_thread(&incoming, ThreadAgentKind::Main)
         .await
         .expect("thread should resolve");
 
@@ -146,7 +145,7 @@ async fn worker_reports_failed_request_completion_after_fallback_message() {
     }
 
     let thread = sessions
-        .load_thread_context(&locator)
+        .load_thread(&locator)
         .await
         .expect("thread should load")
         .expect("thread should exist");
