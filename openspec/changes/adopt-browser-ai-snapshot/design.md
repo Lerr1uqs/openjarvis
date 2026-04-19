@@ -1,6 +1,6 @@
 ## Context
 
-当前 browser sidecar 已经提供一套面向动作续接的扁平 `snapshot/ref/act` 协议，同时在 service / session 层保留了一条 `aria_snapshot` 语义观测路径。但这条语义路径目前仍然基于 `locator('body').ariaSnapshot()`，输出更偏断言和辅助功能视角，缺少对 agent 友好的 `ref`、iframe 递归展开和状态位表达；而本地 Playwright 1.55.1 已经内置 `_snapshotForAI`，官方后续文档也把同类能力收敛为 `ariaSnapshot({ mode: "ai" })`，说明 AI snapshot 已经成为更合理的页面语义载体。
+当前 browser sidecar 已经提供一套面向动作续接的扁平 `snapshot/ref/act` 协议，同时在 service / session 层保留了一条 `aria_snapshot` 语义观测路径。但这条语义路径目前仍然基于 `locator('body').ariaSnapshot()`，输出更偏断言和辅助功能视角，缺少对 agent 友好的 `ref`、iframe 递归展开和状态位表达；而 Playwright 对外已经把这类能力表述为 `page.ariaSnapshot({ mode: "ai" })` / `locator.ariaSnapshot({ mode: "ai" })`，说明 AI snapshot 已经成为更合理的页面语义载体。
 
 同时，AI snapshot 虽然本质上是 YAML 风格文本，但 role、name、属性和子树都编码在 plain scalar 里，直接拿文本做后处理会很脆弱，因此需要一个独立 helper 先把它规整成稳定 YAML 结构。
 
@@ -24,21 +24,22 @@
 当前扁平 `browser__snapshot` 的价值在于给后续 `click_ref` / `type_ref` 提供紧凑元素表，而 AI snapshot 的价值在于提供层级语义树。这两者解决的问题不同，直接把一个替掉另一个会让 ref 续接链路和模型使用习惯一起变化，回归面过大。
 
 因此本次设计选择是：
-- 用 `_snapshotForAI` 替换现有 `aria_snapshot` 采集路径
+- 用 `ariaSnapshot({ mode: "ai" })` 语义替换现有 `aria_snapshot` 采集路径
 - 把这条路径定义为 browser 的语义原子 snapshot 能力
 - 暂不改变现有扁平 snapshot 的默认动作续接语义
 
 备选方案：
 - 直接让 `browser__snapshot` 改成返回 AI snapshot。Rejected，因为这会同时改变模型观察形式、ref 解析方式和历史 prompt 习惯，风险过高。
 
-### 2. 采集层优先使用 `_snapshotForAI`，并把公开 `mode="ai"` 视为升级兼容路径
+### 2. 对外以公开 `mode="ai"` 语义建模，内部保留兼容适配层
 
-当前项目锁定的 Playwright 版本是 1.55.1，本地已存在 `page._snapshotForAI()` 私有接口；官方文档后续把同类能力外显为 `ariaSnapshot({ mode: "ai" })`。基于用户当前需求，本次设计优先使用 `_snapshotForAI`，但在 sidecar 中收敛为一层内部适配函数，避免上层直接依赖某个具体调用写法。
+当前项目锁定的 Playwright 版本是 1.55.1，而用户确认的公开语义名应为 `page.ariaSnapshot({ mode: "ai" })`。因此本次设计以公开 `mode="ai"` 语义作为规范主名，但在 sidecar 中收敛为一层内部适配函数，避免上层直接依赖某个具体实现入口；对当前依赖版本，如果公开入口不可用，则允许在适配层中使用等价内部实现。
 
 这样做的原因：
-- 能在当前依赖版本中立即落地
+- 规范层直接贴齐 Playwright 的公开 API 语义，后续沟通成本更低
+- 当前依赖版本仍然可以通过内部适配层立即落地
 - 未来升级 Playwright 时，只需要在 sidecar 适配层切换实现
-- Rust 协议与 parser 脚本都围绕“AI snapshot 文本契约”而不是某个具体私有 API
+- Rust 协议与 parser 脚本都围绕“AI snapshot 文本契约”而不是某个具体内部函数名
 
 备选方案：
 - 等待升级到公开 `mode="ai"` 后再做。Rejected，因为当前就已经有可用能力，而且需求已明确。
@@ -59,7 +60,7 @@ AI snapshot 文本虽然是 YAML 风格，但单行 key 里混合了 role、name
 
 ## Risks / Trade-offs
 
-- [私有 `_snapshotForAI` 接口未来变化] → 在 sidecar 内收敛调用点，失败时返回显式错误，不让上层静默得到旧格式。
+- [当前依赖版本的 AI snapshot 实现入口可能变化] → 在 sidecar 内收敛调用点，失败时返回显式错误，不让上层静默得到旧格式。
 - [AI snapshot 输出格式存在版本漂移] → parser 采用宽松的属性解析和保守的 YAML AST，尽量保留未知属性而不是硬编码丢弃。
 - [iframe 递归或属性节点解析不完整] → 在脚本测试里加入 iframe、`/url`、`text`、状态位等代表性样例。
 - [两类 snapshot 并存导致调用方困惑] → 在 spec 中明确“扁平 snapshot 用于动作续接，AI snapshot 用于语义观察与后处理”。
@@ -74,4 +75,4 @@ AI snapshot 文本虽然是 YAML 风格，但单行 key 里混合了 role、name
 ## Open Questions
 
 - 最终是否要把这条语义原子能力直接提升为新的模型可见 browser tool，还是先停留在 session / helper 层。
-- 当项目未来升级到官方公开 `mode="ai"` 接口后，是否要彻底移除对 `_snapshotForAI` 的直接调用。
+- 当项目未来升级后，是否要彻底移除兼容适配层里对等价内部实现的兜底调用。
