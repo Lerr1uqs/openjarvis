@@ -96,6 +96,8 @@ async function handleRequest(request) {
       return errorDiagnostics(request);
     case 'requests':
       return requestDiagnosticsQuery(request);
+    case 'aria_snapshot':
+      return ariaSnapshot();
     case 'snapshot':
       return snapshot(request.max_elements);
     case 'click_ref':
@@ -533,6 +535,16 @@ async function snapshot(maxElements) {
     elements: observed.elements,
     total_candidate_count: observed.totalCandidateCount,
     truncated: observed.truncated,
+  };
+}
+
+async function ariaSnapshot() {
+  const currentPage = await ensurePage();
+  return {
+    action: 'aria_snapshot',
+    url: currentPage.url(),
+    title: await currentPage.title(),
+    aria_snapshot: await currentPage.locator('body').ariaSnapshot({ mode: 'ai' }),
   };
 }
 

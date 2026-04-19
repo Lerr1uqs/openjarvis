@@ -1,0 +1,121 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - generic:
+      - generic [ref=e6]:
+        - link "新闻" [ref=e7] [cursor=pointer]:
+          - /url: http://news.baidu.com
+        - link "hao123" [ref=e8] [cursor=pointer]:
+          - /url: https://www.hao123.com?src=from_pc
+        - link "地图" [ref=e9] [cursor=pointer]:
+          - /url: http://map.baidu.com
+        - link "贴吧" [ref=e10] [cursor=pointer]:
+          - /url: http://tieba.baidu.com/
+        - link "视频" [ref=e11] [cursor=pointer]:
+          - /url: https://haokan.baidu.com/?sfrom=baidu-top
+        - link "图片" [ref=e12] [cursor=pointer]:
+          - /url: http://image.baidu.com/
+        - link "网盘" [ref=e13] [cursor=pointer]:
+          - /url: https://pan.baidu.com?from=1026962h
+        - link "文库" [ref=e14] [cursor=pointer]:
+          - /url: https://wenku.baidu.com/?fr=bdpcindex
+        - link "文心" [ref=e15] [cursor=pointer]:
+          - /url: https://chat.baidu.com/search?isShowHello=1&pd=csaitab&setype=csaitab&extParamsJson=%7B%22enter_type%22%3A%22home_tab%22%7D
+        - link "搭子DuMate" [ref=e16] [cursor=pointer]:
+          - /url: https://cloud.baidu.com/product/dumate.html?track=bdsy
+        - link "更多" [ref=e18] [cursor=pointer]:
+          - /url: http://www.baidu.com/more/
+      - generic [ref=e19]:
+        - generic [ref=e20] [cursor=pointer]: 设置
+        - link "登录" [ref=e21] [cursor=pointer]:
+          - /url: https://passport.baidu.com/v2/?login&tpl=mn&u=http%3A%2F%2Fwww.baidu.com%2F&sms=5
+    - generic [ref=e24]:
+      - generic [ref=e25]:
+        - img [ref=e26]
+        - generic:
+          - link "点击一下，了解更多":
+            - /url: //www.baidu.com/s?wd=%E7%99%BE%E5%BA%A6%E7%83%AD%E6%90%9C&sa=ire_dl_gh_logo_texing&rsv_dl=igh_logo_pcs
+      - generic [ref=e31]:
+        - generic [ref=e34]:
+          - textbox "54岁女子参与卖淫被捕" [active] [ref=e36]
+          - generic [ref=e38]:
+            - generic [ref=e39]:
+              - img [ref=e47] [cursor=pointer]
+              - generic [ref=e50]:
+                - img [ref=e54] [cursor=pointer]
+                - img [ref=e59] [cursor=pointer]
+            - button "百度一下" [ref=e63] [cursor=pointer]
+        - link "复杂问题就找文心助手，深入思考回答更优 " [ref=e67] [cursor=pointer]:
+          - /url: https://chat.baidu.com/search?extParams=%7B%22enter_type%22%3A%22home_operate%22%7D&isShowHello=1
+          - img [ref=e68]
+          - generic [ref=e69]:
+            - generic [ref=e70]: 复杂问题就找文心助手，深入思考回答更优
+            - generic [ref=e71]: 
+      - generic [ref=e74]:
+        - generic [ref=e75]:
+          - link "百度热搜":
+            - /url: https://top.baidu.com/board?platform=pc&sa=pcindex_entry
+            - generic "百度热搜" [ref=e76] [cursor=pointer]: 
+          - generic [ref=e77] [cursor=pointer]:
+            - generic [ref=e78]: 
+            - text: 换一换
+        - list:
+          - listitem [ref=e79]:
+            - link " 让互联网更好造福人民、造福世界" [ref=e80] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E8%AE%A9%E4%BA%92%E8%81%94%E7%BD%91%E6%9B%B4%E5%A5%BD%E9%80%A0%E7%A6%8F%E4%BA%BA%E6%B0%91%E3%80%81%E9%80%A0%E7%A6%8F%E4%B8%96%E7%95%8C&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e81]: 
+              - text: 让互联网更好造福人民、造福世界
+          - listitem [ref=e83]:
+            - link "5 网友称酒店回访电话致其家庭破碎" [ref=e84] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E7%BD%91%E5%8F%8B%E7%A7%B0%E9%85%92%E5%BA%97%E5%9B%9E%E8%AE%BF%E7%94%B5%E8%AF%9D%E8%87%B4%E5%85%B6%E5%AE%B6%E5%BA%AD%E7%A0%B4%E7%A2%8E&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e85]: "5"
+              - text: 网友称酒店回访电话致其家庭破碎
+          - listitem [ref=e87]:
+            - link "1 价格暴涨650%！国产光纤全球爆单" [ref=e88] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E4%BB%B7%E6%A0%BC%E6%9A%B4%E6%B6%A8650%25%EF%BC%81%E5%9B%BD%E4%BA%A7%E5%85%89%E7%BA%A4%E5%85%A8%E7%90%83%E7%88%86%E5%8D%95&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e89]: "1"
+              - text: 价格暴涨650%！国产光纤全球爆单
+            - generic [ref=e90]: 热
+          - listitem [ref=e91]:
+            - link "6 宇树称打破人类1500米世界纪录" [ref=e92] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E5%AE%87%E6%A0%91%E7%A7%B0%E6%89%93%E7%A0%B4%E4%BA%BA%E7%B1%BB1500%E7%B1%B3%E4%B8%96%E7%95%8C%E7%BA%AA%E5%BD%95&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e93]: "6"
+              - text: 宇树称打破人类1500米世界纪录
+          - listitem [ref=e95]:
+            - link "2 日本野心彻底暴露" [ref=e96] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E6%97%A5%E6%9C%AC%E9%87%8E%E5%BF%83%E5%BD%BB%E5%BA%95%E6%9A%B4%E9%9C%B2&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e97]: "2"
+              - text: 日本野心彻底暴露
+            - generic [ref=e98]: 热
+          - listitem [ref=e99]:
+            - link "7 荣耀机器人包揽半马冠亚季军" [ref=e100] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E8%8D%A3%E8%80%80%E6%9C%BA%E5%99%A8%E4%BA%BA%E5%8C%85%E6%8F%BD%E5%8D%8A%E9%A9%AC%E5%86%A0%E4%BA%9A%E5%AD%A3%E5%86%9B&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e101]: "7"
+              - text: 荣耀机器人包揽半马冠亚季军
+            - generic [ref=e102]: 新
+          - listitem [ref=e103]:
+            - link "3 从“买东西”到“享生活”" [ref=e104] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E4%BB%8E%E2%80%9C%E4%B9%B0%E4%B8%9C%E8%A5%BF%E2%80%9D%E5%88%B0%E2%80%9C%E4%BA%AB%E7%94%9F%E6%B4%BB%E2%80%9D&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e105]: "3"
+              - text: 从“买东西”到“享生活”
+          - listitem [ref=e107]:
+            - link "8 女子机场两次拒绝帮陌生人带行李" [ref=e108] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E5%A5%B3%E5%AD%90%E6%9C%BA%E5%9C%BA%E4%B8%A4%E6%AC%A1%E6%8B%92%E7%BB%9D%E5%B8%AE%E9%99%8C%E7%94%9F%E4%BA%BA%E5%B8%A6%E8%A1%8C%E6%9D%8E&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e109]: "8"
+              - text: 女子机场两次拒绝帮陌生人带行李
+          - listitem [ref=e111]:
+            - link "4 “程序员们从未想过会有这么一天”" [ref=e112] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E2%80%9C%E7%A8%8B%E5%BA%8F%E5%91%98%E4%BB%AC%E4%BB%8E%E6%9C%AA%E6%83%B3%E8%BF%87%E4%BC%9A%E6%9C%89%E8%BF%99%E4%B9%88%E4%B8%80%E5%A4%A9%E2%80%9D&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e113]: "4"
+              - text: “程序员们从未想过会有这么一天”
+            - generic [ref=e114]: 新
+          - listitem [ref=e115]:
+            - link "9 “半夜醒来不要看时间”" [ref=e116] [cursor=pointer]:
+              - /url: https://www.baidu.com/s?wd=%E2%80%9C%E5%8D%8A%E5%A4%9C%E9%86%92%E6%9D%A5%E4%B8%8D%E8%A6%81%E7%9C%8B%E6%97%B6%E9%97%B4%E2%80%9D&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+              - generic [ref=e117]: "9"
+              - text: “半夜醒来不要看时间”
+  - generic [ref=e119]:
+    - generic:
+      - generic:
+        - generic:
+          - img
+    - img [ref=e124] [cursor=pointer]

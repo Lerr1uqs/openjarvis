@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.59.0",
-    "playwright": "^1.55.1"
+    "playwright": "^1.59.1"
   }
 }

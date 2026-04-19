@@ -1,0 +1,12 @@
+{
+  "target_url": "https://www.baidu.com/",
+  "final_url": "https://www.baidu.com/",
+  "title": "百度一下，你就知道",
+  "captured_at": "2026-04-19T03:39:42.401Z",
+  "snapshot_mode": "ai",
+  "snapshot_api": "locator('body').ariaSnapshot({ mode: 'ai' })",
+  "playwright_version": "1.59.1",
+  "ai_snapshot": "ai-snapshot.yaml",
+  "structured_snapshot": "ai-snapshot-structured.yaml",
+  "screenshot": "baidu-homepage.png"
+}

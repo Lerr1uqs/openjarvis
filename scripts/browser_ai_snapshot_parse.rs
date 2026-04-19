@@ -395,28 +395,23 @@ fn parse_quoted_string(input: &str, start: usize) -> Result<(String, usize)> {
         bail!("quoted string must start with `\"`");
     }
 
-    let mut position = start + 1;
     let mut output = String::new();
     let mut escaped = false;
-    while position < bytes.len() {
-        let ch = bytes[position] as char;
+    for (offset, ch) in input[start + 1..].char_indices() {
         if escaped {
             output.push(ch);
             escaped = false;
-            position += 1;
             continue;
         }
         match ch {
             '\\' => {
                 escaped = true;
-                position += 1;
             }
             '"' => {
-                return Ok((output, position + 1));
+                return Ok((output, start + 1 + offset + ch.len_utf8()));
             }
             _ => {
                 output.push(ch);
-                position += 1;
             }
         }
     }
@@ -620,6 +615,18 @@ mod tests {
             parsed.attributes.get("ref"),
             Some(&Value::String("e4".to_string()))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_role_descriptor_preserves_utf8_names() -> Result<()> {
+        // 测试场景: AI snapshot 中的中文名称不能被按字节拆坏，必须完整保留 UTF-8 文本。
+        let parsed = parse_role_descriptor(r#"textbox "百度一下，你就知道" [active]"#)?;
+
+        assert_eq!(parsed.role, "textbox");
+        assert_eq!(parsed.name.as_deref(), Some("百度一下，你就知道"));
+        assert_eq!(parsed.attributes.get("active"), Some(&Value::Bool(true)));
 
         Ok(())
     }
