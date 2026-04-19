@@ -1,6 +1,7 @@
 use super::BrowserFixture;
 use openjarvis::agent::tool::browser::{
-    BrowserOpenRequest, BrowserRuntimeOptions, BrowserSessionManager, BrowserSessionMode,
+    BrowserDiagnosticsQuery, BrowserOpenRequest, BrowserRequestDiagnosticsQuery,
+    BrowserRuntimeOptions, BrowserSessionManager, BrowserSessionMode,
 };
 use std::path::PathBuf;
 
@@ -127,4 +128,41 @@ async fn browser_session_manager_exports_cookies_and_reports_auto_export_on_clos
     );
     assert_eq!(close.exported_cookie_count, Some(0));
     assert!(auto_export_path.exists());
+}
+
+#[tokio::test]
+async fn browser_session_manager_returns_recent_diagnostics_without_reopening_session() {
+    // 测试场景: 诊断查询应复用当前 session，并在 close 后返回空结果而不是重建新会话。
+    let fixture = BrowserFixture::new("openjarvis-browser-session-diagnostics");
+    let manager = BrowserSessionManager::new(fixture.manager_config(true));
+
+    let _ = manager
+        .navigate("thread-diagnostics", "https://example.com/fail")
+        .await
+        .expect("navigate should succeed");
+    let console = manager
+        .console("thread-diagnostics", BrowserDiagnosticsQuery::new(Some(5)))
+        .await
+        .expect("console query should succeed");
+    let failed_requests = manager
+        .requests(
+            "thread-diagnostics",
+            BrowserRequestDiagnosticsQuery::new(Some(5), true),
+        )
+        .await
+        .expect("failed requests query should succeed");
+
+    assert!(!console.entries.is_empty());
+    assert!(!failed_requests.entries.is_empty());
+
+    let _ = manager
+        .close("thread-diagnostics")
+        .await
+        .expect("close should succeed");
+    let after_close = manager
+        .errors("thread-diagnostics", BrowserDiagnosticsQuery::new(Some(5)))
+        .await
+        .expect("errors query after close should succeed");
+
+    assert!(after_close.entries.is_empty());
 }

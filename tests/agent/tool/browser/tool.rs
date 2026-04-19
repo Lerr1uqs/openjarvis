@@ -56,6 +56,21 @@ async fn browser_toolset_exposes_thread_loaded_tools_and_runs_mock_actions() {
             .any(|definition| definition.name == "browser__snapshot")
     );
     assert!(
+        loaded_tools
+            .iter()
+            .any(|definition| definition.name == "browser__console")
+    );
+    assert!(
+        loaded_tools
+            .iter()
+            .any(|definition| definition.name == "browser__errors")
+    );
+    assert!(
+        loaded_tools
+            .iter()
+            .any(|definition| definition.name == "browser__requests")
+    );
+    assert!(
         !loaded_tools
             .iter()
             .any(|definition| definition.name == "browser__export_cookies")
@@ -169,6 +184,74 @@ async fn browser_toolset_match_tools_resolve_elements_without_stable_refs() {
     assert_eq!(click.metadata["matched_element"]["ref"], "1");
     assert_eq!(typed.metadata["matched_element"]["ref"], "2");
     assert_eq!(typed.metadata["submitted"], true);
+}
+
+#[tokio::test]
+async fn browser_toolset_diagnostic_tools_query_recent_records() {
+    // 测试场景: browser 诊断工具应返回结构化记录，并支持 failed_only 过滤。
+    let fixture = BrowserFixture::new("openjarvis-browser-toolset-diagnostics");
+    let registry = ToolRegistry::new();
+    let mut thread_context = build_thread("thread-browser-diagnostics");
+    register_browser_toolset_with_config(&registry, fixture.manager_config(true))
+        .await
+        .expect("browser toolset should register");
+
+    call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "load_toolset".to_string(),
+            arguments: json!({ "name": "browser" }),
+        },
+    )
+    .await
+    .expect("browser toolset should load");
+    let _ = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "browser__navigate".to_string(),
+            arguments: json!({ "url": "https://example.com/error" }),
+        },
+    )
+    .await
+    .expect("navigate should succeed");
+
+    let console = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "browser__console".to_string(),
+            arguments: json!({ "limit": 1 }),
+        },
+    )
+    .await
+    .expect("console query should succeed");
+    let errors = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "browser__errors".to_string(),
+            arguments: json!({ "limit": 5 }),
+        },
+    )
+    .await
+    .expect("errors query should succeed");
+    let failed_requests = call_tool(
+        &registry,
+        &mut thread_context,
+        ToolCallRequest {
+            name: "browser__requests".to_string(),
+            arguments: json!({ "failed_only": true, "limit": 5 }),
+        },
+    )
+    .await
+    .expect("requests query should succeed");
+
+    assert_eq!(console.metadata["entry_count"], 1);
+    assert!(console.content.contains("Navigated"));
+    assert!(errors.content.contains("page_error"));
+    assert_eq!(failed_requests.metadata["entries"][0]["result"], "failed");
 }
 
 #[tokio::test]

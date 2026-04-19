@@ -1,5 +1,7 @@
 use openjarvis::agent::tool::browser::{
-    BrowserCloseResult, BrowserOpenRequest, BrowserSessionMode, BrowserSidecarRequest,
+    BrowserCloseResult, BrowserConsoleEntry, BrowserConsoleLevel, BrowserConsoleResult,
+    BrowserOpenRequest, BrowserRequestDiagnosticsQuery, BrowserRequestEntry,
+    BrowserRequestResultKind, BrowserRequestsResult, BrowserSessionMode, BrowserSidecarRequest,
     BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
     BrowserSnapshotElement, BrowserSnapshotResult,
 };
@@ -51,6 +53,27 @@ fn browser_protocol_round_trips_open_request() {
 }
 
 #[test]
+fn browser_protocol_round_trips_requests_query_request() {
+    // 验证 requests 诊断查询参数可以完整编解码。
+    let encoded = serde_json::to_string(&BrowserSidecarRequest::new(
+        "req-requests",
+        BrowserSidecarRequestPayload::Requests(BrowserRequestDiagnosticsQuery::new(Some(3), true)),
+    ))
+    .expect("requests query should serialize");
+    let decoded: BrowserSidecarRequest =
+        serde_json::from_str(&encoded).expect("requests query should deserialize");
+
+    assert_eq!(decoded.id, "req-requests");
+    match decoded.payload {
+        BrowserSidecarRequestPayload::Requests(query) => {
+            assert_eq!(query.limit, Some(3));
+            assert!(query.failed_only);
+        }
+        other => panic!("unexpected request payload: {other:?}"),
+    }
+}
+
+#[test]
 fn browser_protocol_round_trips_snapshot_response_payload() {
     // 验证 richer snapshot 结果中的新增字段不会在协议编解码时丢失。
     let encoded = serde_json::to_string(&BrowserSidecarResponse::success(
@@ -93,6 +116,70 @@ fn browser_protocol_round_trips_snapshot_response_payload() {
             );
             assert_eq!(snapshot.total_candidate_count, 1);
             assert!(!snapshot.truncated);
+        }
+        other => panic!("unexpected response payload: {other:?}"),
+    }
+}
+
+#[test]
+fn browser_protocol_round_trips_console_response_payload() {
+    // 验证 console 诊断结果中的规范化字段不会在协议编解码时丢失。
+    let encoded = serde_json::to_string(&BrowserSidecarResponse::success(
+        "req-console-result",
+        BrowserSidecarResponsePayload::Console(BrowserConsoleResult {
+            entries: vec![BrowserConsoleEntry {
+                timestamp: "2026-04-19T12:00:00Z".to_string(),
+                level: BrowserConsoleLevel::Warn,
+                text: "mock warning".to_string(),
+                page_url: "https://example.com".to_string(),
+                location: None,
+            }],
+        }),
+    ))
+    .expect("console response should serialize");
+    let decoded: BrowserSidecarResponse =
+        serde_json::from_str(&encoded).expect("console response should deserialize");
+
+    assert!(decoded.ok);
+    match decoded.result.expect("result should exist") {
+        BrowserSidecarResponsePayload::Console(result) => {
+            assert_eq!(result.entries.len(), 1);
+            assert_eq!(result.entries[0].page_url, "https://example.com");
+            assert_eq!(result.entries[0].level, BrowserConsoleLevel::Warn);
+        }
+        other => panic!("unexpected response payload: {other:?}"),
+    }
+}
+
+#[test]
+fn browser_protocol_round_trips_requests_response_payload() {
+    // 验证 requests 诊断结果中的状态字段不会在协议编解码时丢失。
+    let encoded = serde_json::to_string(&BrowserSidecarResponse::success(
+        "req-requests-result",
+        BrowserSidecarResponsePayload::Requests(BrowserRequestsResult {
+            entries: vec![BrowserRequestEntry {
+                timestamp: "2026-04-19T12:00:00Z".to_string(),
+                method: "GET".to_string(),
+                url: "https://example.com/api".to_string(),
+                resource_type: "xhr".to_string(),
+                status: Some(500),
+                result: BrowserRequestResultKind::HttpError,
+            }],
+        }),
+    ))
+    .expect("requests response should serialize");
+    let decoded: BrowserSidecarResponse =
+        serde_json::from_str(&encoded).expect("requests response should deserialize");
+
+    assert!(decoded.ok);
+    match decoded.result.expect("result should exist") {
+        BrowserSidecarResponsePayload::Requests(result) => {
+            assert_eq!(result.entries.len(), 1);
+            assert_eq!(result.entries[0].status, Some(500));
+            assert_eq!(
+                result.entries[0].result,
+                BrowserRequestResultKind::HttpError
+            );
         }
         other => panic!("unexpected response payload: {other:?}"),
     }

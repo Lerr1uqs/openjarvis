@@ -94,6 +94,55 @@ impl BrowserOpenRequest {
     }
 }
 
+/// Shared diagnostics query parameters used by the browser sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserDiagnosticsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl BrowserDiagnosticsQuery {
+    /// Create one diagnostics query with an optional record limit.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::tool::browser::BrowserDiagnosticsQuery;
+    ///
+    /// let query = BrowserDiagnosticsQuery::new(Some(5));
+    /// assert_eq!(query.limit, Some(5));
+    /// ```
+    pub fn new(limit: Option<usize>) -> Self {
+        Self { limit }
+    }
+}
+
+/// Diagnostics query parameters specific to network requests.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserRequestDiagnosticsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub failed_only: bool,
+}
+
+impl BrowserRequestDiagnosticsQuery {
+    /// Create one requests diagnostics query.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::tool::browser::BrowserRequestDiagnosticsQuery;
+    ///
+    /// let query = BrowserRequestDiagnosticsQuery::new(Some(10), true);
+    /// assert_eq!(query.limit, Some(10));
+    /// assert!(query.failed_only);
+    /// ```
+    pub fn new(limit: Option<usize>, failed_only: bool) -> Self {
+        Self { limit, failed_only }
+    }
+}
+
 /// One browser action request sent to the sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -102,6 +151,9 @@ pub enum BrowserSidecarRequestPayload {
     Navigate {
         url: String,
     },
+    Console(BrowserDiagnosticsQuery),
+    Errors(BrowserDiagnosticsQuery),
+    Requests(BrowserRequestDiagnosticsQuery),
     Snapshot {
         max_elements: Option<usize>,
     },
@@ -188,6 +240,9 @@ impl BrowserSidecarResponse {
 pub enum BrowserSidecarResponsePayload {
     Open(BrowserOpenResult),
     Navigate(BrowserNavigateResult),
+    Console(BrowserConsoleResult),
+    Errors(BrowserErrorsResult),
+    Requests(BrowserRequestsResult),
     Snapshot(BrowserSnapshotResult),
     ClickRef(BrowserActionResult),
     TypeRef(BrowserTypeResult),
@@ -238,6 +293,101 @@ pub struct BrowserOpenResult {
     pub url: String,
     pub title: String,
     pub cookies_loaded: usize,
+}
+
+/// Supported console levels returned by browser diagnostics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserConsoleLevel {
+    Log,
+    Info,
+    Warn,
+    Error,
+    Debug,
+}
+
+/// Optional source location attached to one console entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserConsoleLocation {
+    pub url: String,
+    pub line_number: usize,
+    pub column_number: usize,
+}
+
+/// One normalized console record collected from the current browser session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserConsoleEntry {
+    pub timestamp: String,
+    pub level: BrowserConsoleLevel,
+    pub text: String,
+    pub page_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<BrowserConsoleLocation>,
+}
+
+/// Result returned after querying recent console diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BrowserConsoleResult {
+    #[serde(default)]
+    pub entries: Vec<BrowserConsoleEntry>,
+}
+
+/// Supported browser diagnostics error categories.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserErrorKind {
+    PageError,
+    RequestFailed,
+}
+
+/// One normalized browser error record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserErrorEntry {
+    pub timestamp: String,
+    pub kind: BrowserErrorKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result returned after querying recent browser errors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BrowserErrorsResult {
+    #[serde(default)]
+    pub entries: Vec<BrowserErrorEntry>,
+}
+
+/// Supported network request outcomes returned by browser diagnostics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRequestResultKind {
+    Pending,
+    Ok,
+    HttpError,
+    Failed,
+}
+
+/// One normalized network request record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserRequestEntry {
+    pub timestamp: String,
+    pub method: String,
+    pub url: String,
+    pub resource_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub result: BrowserRequestResultKind,
+}
+
+/// Result returned after querying recent request diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BrowserRequestsResult {
+    #[serde(default)]
+    pub entries: Vec<BrowserRequestEntry>,
 }
 
 /// Result returned after a successful `snapshot`.

@@ -5,6 +5,7 @@ import readline from 'node:readline';
 import { chromium } from 'playwright';
 
 const headless = readBoolEnv('OPENJARVIS_BROWSER_HEADLESS', true);
+const keepArtifacts = readBoolEnv('OPENJARVIS_BROWSER_KEEP_ARTIFACTS', false);
 const sessionDir = process.env.OPENJARVIS_BROWSER_SESSION_DIR ?? '';
 const userDataDir = process.env.OPENJARVIS_BROWSER_USER_DATA_DIR ?? '';
 const chromePathOverride = process.env.OPENJARVIS_BROWSER_CHROME_PATH ?? '';
@@ -19,12 +20,26 @@ const snapshotElementDefaultLimit = Number.parseInt(
   process.env.OPENJARVIS_BROWSER_SNAPSHOT_MAX_ELEMENTS ?? '200',
   10,
 );
+const diagnosticsBufferLimit = normalizeBoundedLimit(
+  process.env.OPENJARVIS_BROWSER_DIAGNOSTICS_BUFFER_LIMIT,
+  200,
+  1,
+  1000,
+);
+const diagnosticsQueryDefaultLimit = 20;
 
 let browserContext = null;
 let page = null;
 let attachedBrowser = null;
 let sessionMode = null;
 let refIndex = new Map();
+let consoleRecords = [];
+let errorRecords = [];
+let requestRecords = new Map();
+let configuredPages = new WeakSet();
+let configuredContexts = new WeakSet();
+let diagnosticWriteQueue = Promise.resolve();
+let diagnosticWriteError = null;
 
 process.on('SIGINT', async () => {
   await closeBrowser();
@@ -75,6 +90,12 @@ async function handleRequest(request) {
       return openSession(request);
     case 'navigate':
       return navigate(request.url);
+    case 'console':
+      return consoleDiagnostics(request);
+    case 'errors':
+      return errorDiagnostics(request);
+    case 'requests':
+      return requestDiagnosticsQuery(request);
     case 'snapshot':
       return snapshot(request.max_elements);
     case 'click_ref':
@@ -135,6 +156,7 @@ async function openSession(request) {
   try {
     if (openRequest.mode === 'launch') {
       await openLaunchSession();
+      await ensureDiagnosticArtifactFiles();
       const cookiesLoaded = await maybeAutoLoadCookies();
       const currentPage = await ensurePageFromCurrentContext();
       refIndex.clear();
@@ -148,15 +170,16 @@ async function openSession(request) {
     }
 
     await openAttachSession(openRequest.cdp_endpoint);
+    await ensureDiagnosticArtifactFiles();
     const currentPage = await ensurePageFromCurrentContext();
     refIndex.clear();
     return {
-        action: 'open',
-        mode: sessionMode,
-        url: currentPage.url(),
-        title: await currentPage.title(),
-        cookies_loaded: 0,
-      };
+      action: 'open',
+      mode: sessionMode,
+      url: currentPage.url(),
+      title: await currentPage.title(),
+      cookies_loaded: 0,
+    };
   } catch (error) {
     await hardResetSession();
     throw error;
@@ -182,6 +205,7 @@ async function openLaunchSession() {
     ],
   });
   sessionMode = 'launch';
+  configureBrowserContext(browserContext);
 }
 
 async function openAttachSession(cdpEndpoint) {
@@ -196,6 +220,7 @@ async function openAttachSession(cdpEndpoint) {
   if (existingPages.length > 0) {
     page = existingPages[existingPages.length - 1];
     browserContext = page.context();
+    configureBrowserContext(browserContext);
     configurePage(page);
     sessionMode = 'attach';
     return;
@@ -208,6 +233,7 @@ async function openAttachSession(cdpEndpoint) {
     browserContext = await attachedBrowser.newContext();
     page = await browserContext.newPage();
   }
+  configureBrowserContext(browserContext);
   configurePage(page);
   sessionMode = 'attach';
 }
@@ -229,6 +255,27 @@ async function navigate(url) {
     action: 'navigate',
     url: currentPage.url(),
     title: await currentPage.title(),
+  };
+}
+
+async function consoleDiagnostics(request) {
+  return {
+    action: 'console',
+    entries: selectRecentRecords(consoleRecords, request?.limit),
+  };
+}
+
+async function errorDiagnostics(request) {
+  return {
+    action: 'errors',
+    entries: selectRecentRecords(errorRecords, request?.limit),
+  };
+}
+
+async function requestDiagnosticsQuery(request) {
+  return {
+    action: 'requests',
+    entries: selectRecentRequestRecords(request?.limit, Boolean(request?.failed_only)),
   };
 }
 
@@ -625,9 +672,43 @@ function resolveRef(reference) {
   return selector;
 }
 
+function configureBrowserContext(nextContext) {
+  if (!nextContext || configuredContexts.has(nextContext)) {
+    return;
+  }
+
+  configuredContexts.add(nextContext);
+  for (const existingPage of collectContextPages(nextContext)) {
+    configurePage(existingPage);
+  }
+  nextContext.on('page', (nextPage) => {
+    configurePage(nextPage);
+  });
+  nextContext.on('request', (request) => {
+    recordRequestStarted(request);
+  });
+  nextContext.on('response', (response) => {
+    recordRequestFinished(response);
+  });
+  nextContext.on('requestfailed', (request) => {
+    recordRequestFailed(request);
+  });
+}
+
 function configurePage(nextPage) {
+  if (!nextPage || configuredPages.has(nextPage)) {
+    return;
+  }
+
+  configuredPages.add(nextPage);
   nextPage.setDefaultTimeout(launchTimeoutMs);
   nextPage.setDefaultNavigationTimeout(launchTimeoutMs);
+  nextPage.on('console', (message) => {
+    recordConsoleMessage(nextPage, message);
+  });
+  nextPage.on('pageerror', (error) => {
+    recordPageError(nextPage, error);
+  });
 }
 
 function normalizeSnapshotLimit(maxElements) {
@@ -636,6 +717,197 @@ function normalizeSnapshotLimit(maxElements) {
     return snapshotElementDefaultLimit;
   }
   return Math.min(Math.max(candidate, 1), 500);
+}
+
+function normalizeDiagnosticLimit(limit) {
+  const candidate = Number.parseInt(String(limit ?? diagnosticsQueryDefaultLimit), 10);
+  if (!Number.isFinite(candidate)) {
+    return diagnosticsQueryDefaultLimit;
+  }
+  return Math.min(Math.max(candidate, 1), diagnosticsBufferLimit);
+}
+
+function normalizeBoundedLimit(rawValue, fallback, min, max) {
+  const candidate = Number.parseInt(String(rawValue ?? fallback), 10);
+  if (!Number.isFinite(candidate)) {
+    return fallback;
+  }
+  return Math.min(Math.max(candidate, min), max);
+}
+
+function selectRecentRecords(records, limit) {
+  const resolvedLimit = normalizeDiagnosticLimit(limit);
+  return records.slice(-resolvedLimit).reverse();
+}
+
+function selectRecentRequestRecords(limit, failedOnly) {
+  const resolvedLimit = normalizeDiagnosticLimit(limit);
+  const filtered = Array.from(requestRecords.values())
+    .map((entry) => entry.record)
+    .filter((record) => !failedOnly || isFailedRequestRecord(record));
+  return filtered.slice(-resolvedLimit).reverse();
+}
+
+function isFailedRequestRecord(record) {
+  return record.result === 'http_error' || record.result === 'failed';
+}
+
+function recordConsoleMessage(nextPage, message) {
+  const location = typeof message.location === 'function' ? message.location() : null;
+  const record = {
+    timestamp: new Date().toISOString(),
+    level: normalizeConsoleLevel(message.type?.() ?? 'log'),
+    text: message.text?.() ?? '',
+    page_url: nextPage.url(),
+    location: normalizeConsoleLocation(location),
+  };
+  pushConsoleRecord(record);
+}
+
+function recordPageError(nextPage, error) {
+  const record = {
+    timestamp: new Date().toISOString(),
+    kind: 'page_error',
+    message: error?.message ?? String(error),
+    page_url: nextPage.url(),
+    request_url: null,
+    reason: null,
+  };
+  pushErrorRecord(record);
+}
+
+function recordRequestStarted(request) {
+  const record = {
+    timestamp: new Date().toISOString(),
+    method: request.method(),
+    url: request.url(),
+    resource_type: request.resourceType(),
+    status: null,
+    result: 'pending',
+  };
+  requestRecords.set(request, {
+    record,
+    finalWritten: false,
+  });
+  trimRequestRecords();
+}
+
+function recordRequestFinished(response) {
+  const request = response.request();
+  const entry = requestRecords.get(request) ?? createDetachedRequestEntry(request);
+  entry.record.status = response.status();
+  entry.record.result = response.ok() ? 'ok' : 'http_error';
+  queueRequestArtifactWrite(entry);
+}
+
+function recordRequestFailed(request) {
+  const entry = requestRecords.get(request) ?? createDetachedRequestEntry(request);
+  const failureReason = request.failure()?.errorText ?? null;
+  entry.record.result = 'failed';
+  const record = {
+    timestamp: new Date().toISOString(),
+    kind: 'request_failed',
+    message: failureReason ?? 'request failed',
+    page_url: safePageUrlFromRequest(request),
+    request_url: request.url(),
+    reason: failureReason,
+  };
+  pushErrorRecord(record);
+  queueRequestArtifactWrite(entry);
+}
+
+function createDetachedRequestEntry(request) {
+  const entry = {
+    record: {
+      timestamp: new Date().toISOString(),
+      method: request.method(),
+      url: request.url(),
+      resource_type: request.resourceType(),
+      status: null,
+      result: 'pending',
+    },
+    finalWritten: false,
+  };
+  requestRecords.set(request, entry);
+  trimRequestRecords();
+  return entry;
+}
+
+function trimRequestRecords() {
+  while (requestRecords.size > diagnosticsBufferLimit) {
+    const oldestRequest = requestRecords.keys().next().value;
+    const oldestEntry = requestRecords.get(oldestRequest);
+    if (oldestEntry) {
+      queueRequestArtifactWrite(oldestEntry);
+    }
+    requestRecords.delete(oldestRequest);
+  }
+}
+
+function pushConsoleRecord(record) {
+  consoleRecords.push(record);
+  trimRecordBuffer(consoleRecords);
+  queueDiagnosticArtifactWrite('console.jsonl', record);
+}
+
+function pushErrorRecord(record) {
+  errorRecords.push(record);
+  trimRecordBuffer(errorRecords);
+  queueDiagnosticArtifactWrite('errors.jsonl', record);
+}
+
+function trimRecordBuffer(records) {
+  while (records.length > diagnosticsBufferLimit) {
+    records.shift();
+  }
+}
+
+function queueRequestArtifactWrite(entry) {
+  if (!keepArtifacts || entry.finalWritten) {
+    return;
+  }
+
+  entry.finalWritten = true;
+  queueDiagnosticArtifactWrite('requests.jsonl', entry.record);
+}
+
+function normalizeConsoleLevel(level) {
+  switch (String(level ?? 'log').toLowerCase()) {
+    case 'info':
+      return 'info';
+    case 'warning':
+    case 'warn':
+      return 'warn';
+    case 'error':
+      return 'error';
+    case 'debug':
+      return 'debug';
+    case 'log':
+    default:
+      return 'log';
+  }
+}
+
+function normalizeConsoleLocation(location) {
+  if (!location || typeof location !== 'object' || !location.url) {
+    return null;
+  }
+
+  return {
+    url: location.url,
+    line_number: Number.isFinite(location.lineNumber) ? location.lineNumber : 0,
+    column_number: Number.isFinite(location.columnNumber) ? location.columnNumber : 0,
+  };
+}
+
+function safePageUrlFromRequest(request) {
+  try {
+    const frame = typeof request.frame === 'function' ? request.frame() : null;
+    const ownerPage = frame && typeof frame.page === 'function' ? frame.page() : null;
+    return ownerPage ? ownerPage.url() : null;
+  } catch {
+    return null;
+  }
 }
 
 async function resolveChromeExecutable() {
@@ -826,6 +1098,57 @@ function normalizeSameSite(value) {
   }
 }
 
+async function ensureDiagnosticArtifactFiles() {
+  if (!keepArtifacts || !sessionDir) {
+    return;
+  }
+
+  await fs.mkdir(sessionDir, { recursive: true });
+  await Promise.all([
+    fs.appendFile(path.join(sessionDir, 'console.jsonl'), '', 'utf8'),
+    fs.appendFile(path.join(sessionDir, 'errors.jsonl'), '', 'utf8'),
+    fs.appendFile(path.join(sessionDir, 'requests.jsonl'), '', 'utf8'),
+  ]);
+}
+
+function queueDiagnosticArtifactWrite(fileName, record) {
+  if (!keepArtifacts || !sessionDir) {
+    return;
+  }
+
+  const payload = `${JSON.stringify(record)}\n`;
+  diagnosticWriteQueue = diagnosticWriteQueue
+    .catch(() => {})
+    .then(async () => {
+      try {
+        await fs.appendFile(path.join(sessionDir, fileName), payload, 'utf8');
+      } catch (error) {
+        diagnosticWriteError ??= error;
+        throw error;
+      }
+    });
+}
+
+async function flushPendingRequestArtifacts() {
+  for (const entry of requestRecords.values()) {
+    queueRequestArtifactWrite(entry);
+  }
+}
+
+async function flushDiagnosticArtifactWrites() {
+  try {
+    await diagnosticWriteQueue;
+  } catch {
+    // The first write failure is reported below.
+  }
+  if (diagnosticWriteError) {
+    throw sidecarError(
+      'diagnostic_artifact_write_failed',
+      `failed to write browser diagnostic artifacts: ${diagnosticWriteError.message ?? diagnosticWriteError}`,
+    );
+  }
+}
+
 async function disposeCurrentSession() {
   const closeResult = {
     action: 'close',
@@ -838,6 +1161,9 @@ async function disposeCurrentSession() {
   if (!sessionMode) {
     return closeResult;
   }
+
+  await flushPendingRequestArtifacts();
+  await flushDiagnosticArtifactWrites();
 
   if (sessionMode === 'launch' && saveCookiesOnClose && cookiesStateFile && browserContext) {
     const exportResult = await exportCookiesToPath(cookiesStateFile);
@@ -858,6 +1184,8 @@ async function disposeCurrentSession() {
 
 async function hardResetSession() {
   try {
+    await flushPendingRequestArtifacts().catch(() => {});
+    await flushDiagnosticArtifactWrites().catch(() => {});
     if (browserContext && sessionMode === 'launch') {
       await browserContext.close().catch(() => {});
     }
@@ -875,6 +1203,13 @@ function resetSessionState() {
   page = null;
   sessionMode = null;
   refIndex.clear();
+  consoleRecords = [];
+  errorRecords = [];
+  requestRecords = new Map();
+  configuredPages = new WeakSet();
+  configuredContexts = new WeakSet();
+  diagnosticWriteQueue = Promise.resolve();
+  diagnosticWriteError = null;
 }
 
 function chromeCandidates() {

@@ -1,10 +1,12 @@
 //! Sidecar process management and JSON-line transport for browser automation.
 
 use super::protocol::{
-    BrowserActionResult, BrowserCloseResult, BrowserCookiesExportResult, BrowserNavigateResult,
-    BrowserOpenRequest, BrowserOpenResult, BrowserScreenshotResult, BrowserSessionMode,
-    BrowserSidecarRequest, BrowserSidecarRequestPayload, BrowserSidecarResponse,
-    BrowserSidecarResponsePayload, BrowserSnapshotResult, BrowserTypeResult,
+    BrowserActionResult, BrowserCloseResult, BrowserConsoleResult, BrowserCookiesExportResult,
+    BrowserDiagnosticsQuery, BrowserErrorsResult, BrowserNavigateResult, BrowserOpenRequest,
+    BrowserOpenResult, BrowserRequestDiagnosticsQuery, BrowserRequestsResult,
+    BrowserScreenshotResult, BrowserSessionMode, BrowserSidecarRequest,
+    BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
+    BrowserSnapshotResult, BrowserTypeResult,
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -216,6 +218,104 @@ impl BrowserSidecarService {
             BrowserSidecarResponsePayload::Navigate(result) => Ok(result),
             other => bail!(
                 "browser sidecar returned `{}` for navigate",
+                response_action_name(&other)
+            ),
+        }
+    }
+
+    /// Query recent console diagnostics from the current browser session.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::agent::tool::browser::{
+    ///     BrowserDiagnosticsQuery, BrowserProcessCommandSpec, BrowserRuntimeOptions,
+    ///     BrowserSidecarService, BrowserSidecarServiceConfig,
+    /// };
+    /// use std::path::PathBuf;
+    ///
+    /// let mut service = BrowserSidecarService::new(BrowserSidecarServiceConfig::new(
+    ///     BrowserProcessCommandSpec::node_sidecar("scripts/browser_sidecar.mjs"),
+    ///     BrowserRuntimeOptions::default(),
+    ///     PathBuf::from("tmp/browser"),
+    ///     PathBuf::from("tmp/browser/user-data"),
+    /// ));
+    /// let query = BrowserDiagnosticsQuery::new(Some(5));
+    /// assert_eq!(query.limit, Some(5));
+    /// assert!(!service.is_started());
+    /// ```
+    pub async fn console(
+        &mut self,
+        query: BrowserDiagnosticsQuery,
+    ) -> Result<BrowserConsoleResult> {
+        if !self.is_started() || !self.session_opened {
+            return Ok(BrowserConsoleResult::default());
+        }
+        match self
+            .call(BrowserSidecarRequestPayload::Console(query.clone()))
+            .await?
+        {
+            BrowserSidecarResponsePayload::Console(result) => {
+                debug!(
+                    limit = ?query.limit,
+                    entry_count = result.entries.len(),
+                    "queried browser console diagnostics"
+                );
+                Ok(result)
+            }
+            other => bail!(
+                "browser sidecar returned `{}` for console",
+                response_action_name(&other)
+            ),
+        }
+    }
+
+    /// Query recent page errors and request failures from the current browser session.
+    pub async fn errors(&mut self, query: BrowserDiagnosticsQuery) -> Result<BrowserErrorsResult> {
+        if !self.is_started() || !self.session_opened {
+            return Ok(BrowserErrorsResult::default());
+        }
+        match self
+            .call(BrowserSidecarRequestPayload::Errors(query.clone()))
+            .await?
+        {
+            BrowserSidecarResponsePayload::Errors(result) => {
+                debug!(
+                    limit = ?query.limit,
+                    entry_count = result.entries.len(),
+                    "queried browser error diagnostics"
+                );
+                Ok(result)
+            }
+            other => bail!(
+                "browser sidecar returned `{}` for errors",
+                response_action_name(&other)
+            ),
+        }
+    }
+
+    /// Query recent network request summaries from the current browser session.
+    pub async fn requests(
+        &mut self,
+        query: BrowserRequestDiagnosticsQuery,
+    ) -> Result<BrowserRequestsResult> {
+        if !self.is_started() || !self.session_opened {
+            return Ok(BrowserRequestsResult::default());
+        }
+        match self
+            .call(BrowserSidecarRequestPayload::Requests(query.clone()))
+            .await?
+        {
+            BrowserSidecarResponsePayload::Requests(result) => {
+                debug!(
+                    limit = ?query.limit,
+                    failed_only = query.failed_only,
+                    entry_count = result.entries.len(),
+                    "queried browser request diagnostics"
+                );
+                Ok(result)
+            }
+            other => bail!(
+                "browser sidecar returned `{}` for requests",
                 response_action_name(&other)
             ),
         }
@@ -559,6 +659,9 @@ fn response_action_name(payload: &BrowserSidecarResponsePayload) -> &'static str
     match payload {
         BrowserSidecarResponsePayload::Open(_) => "open",
         BrowserSidecarResponsePayload::Navigate(_) => "navigate",
+        BrowserSidecarResponsePayload::Console(_) => "console",
+        BrowserSidecarResponsePayload::Errors(_) => "errors",
+        BrowserSidecarResponsePayload::Requests(_) => "requests",
         BrowserSidecarResponsePayload::Snapshot(_) => "snapshot",
         BrowserSidecarResponsePayload::ClickRef(_) => "click_ref",
         BrowserSidecarResponsePayload::TypeRef(_) => "type_ref",
@@ -572,6 +675,9 @@ fn request_action_name(payload: &BrowserSidecarRequestPayload) -> &'static str {
     match payload {
         BrowserSidecarRequestPayload::Open(_) => "open",
         BrowserSidecarRequestPayload::Navigate { .. } => "navigate",
+        BrowserSidecarRequestPayload::Console(_) => "console",
+        BrowserSidecarRequestPayload::Errors(_) => "errors",
+        BrowserSidecarRequestPayload::Requests(_) => "requests",
         BrowserSidecarRequestPayload::Snapshot { .. } => "snapshot",
         BrowserSidecarRequestPayload::ClickRef { .. } => "click_ref",
         BrowserSidecarRequestPayload::TypeRef { .. } => "type_ref",

@@ -1,7 +1,9 @@
 use super::BrowserFixture;
 use openjarvis::agent::tool::browser::{
-    BrowserOpenRequest, BrowserProcessCommandSpec, BrowserRuntimeOptions, BrowserSessionMode,
-    BrowserSidecarService, BrowserSidecarServiceConfig, default_sidecar_script_path,
+    BrowserDiagnosticsQuery, BrowserErrorKind, BrowserOpenRequest, BrowserProcessCommandSpec,
+    BrowserRequestDiagnosticsQuery, BrowserRequestResultKind, BrowserRuntimeOptions,
+    BrowserSessionMode, BrowserSidecarService, BrowserSidecarServiceConfig,
+    default_sidecar_script_path,
 };
 
 #[tokio::test]
@@ -35,6 +37,53 @@ async fn browser_sidecar_service_executes_mock_flow_and_writes_screenshot() {
 }
 
 #[tokio::test]
+async fn browser_sidecar_service_queries_recent_diagnostics_and_filters_failed_requests() {
+    // 测试场景: service 应能查询 console/errors/requests，并支持 failed_only 过滤。
+    let fixture = BrowserFixture::new("openjarvis-browser-service-diagnostics");
+    let mut service = BrowserSidecarService::new(fixture.service_config(true));
+
+    let _ = service
+        .navigate("https://example.com/error")
+        .await
+        .expect("navigate should succeed");
+
+    let console = service
+        .console(BrowserDiagnosticsQuery::new(Some(1)))
+        .await
+        .expect("console query should succeed");
+    let errors = service
+        .errors(BrowserDiagnosticsQuery::new(Some(5)))
+        .await
+        .expect("errors query should succeed");
+    let failed_requests = service
+        .requests(BrowserRequestDiagnosticsQuery::new(Some(5), true))
+        .await
+        .expect("failed requests query should succeed");
+
+    assert_eq!(console.entries.len(), 1);
+    assert!(console.entries[0].text.contains("Navigated"));
+    assert!(
+        errors
+            .entries
+            .iter()
+            .any(|entry| entry.kind == BrowserErrorKind::PageError)
+    );
+    assert!(
+        errors
+            .entries
+            .iter()
+            .any(|entry| entry.kind == BrowserErrorKind::RequestFailed)
+    );
+    assert!(!failed_requests.entries.is_empty());
+    assert!(
+        failed_requests
+            .entries
+            .iter()
+            .all(|entry| entry.result == BrowserRequestResultKind::Failed)
+    );
+}
+
+#[tokio::test]
 async fn browser_sidecar_service_reports_mock_protocol_errors() {
     // 验证 sidecar 返回 missing_ref 时 service 会把错误向上传递。
     let fixture = BrowserFixture::new("openjarvis-browser-service-error");
@@ -54,6 +103,42 @@ async fn browser_sidecar_service_reports_mock_protocol_errors() {
         .expect_err("unknown ref should fail");
 
     assert!(error.to_string().contains("missing_ref"));
+}
+
+#[tokio::test]
+async fn browser_sidecar_service_keeps_diagnostic_artifacts_when_enabled() {
+    // 测试场景: keep_artifacts 打开时，diagnostic 文件应在 session 目录中生成并保留。
+    let fixture = BrowserFixture::new("openjarvis-browser-service-diagnostic-artifacts");
+    let session_root = fixture.root().join("diagnostic-artifacts-session");
+    let user_data_dir = session_root.join("user-data");
+    std::fs::create_dir_all(&user_data_dir).expect("user data dir should exist");
+    let mut service = BrowserSidecarService::new(BrowserSidecarServiceConfig::new(
+        super::mock_process_spec(),
+        BrowserRuntimeOptions {
+            headless: true,
+            keep_artifacts: true,
+            ..Default::default()
+        },
+        session_root.clone(),
+        user_data_dir,
+    ));
+
+    let _ = service
+        .navigate("https://example.com/fail")
+        .await
+        .expect("navigate should succeed");
+    let _ = service.close().await.expect("close should succeed");
+
+    let console_lines = std::fs::read_to_string(session_root.join("console.jsonl"))
+        .expect("console artifact should exist");
+    let error_lines = std::fs::read_to_string(session_root.join("errors.jsonl"))
+        .expect("errors artifact should exist");
+    let request_lines = std::fs::read_to_string(session_root.join("requests.jsonl"))
+        .expect("requests artifact should exist");
+
+    assert!(console_lines.lines().count() >= 1);
+    assert!(error_lines.lines().count() >= 1);
+    assert!(request_lines.lines().count() >= 2);
 }
 
 #[tokio::test]

@@ -3,9 +3,10 @@
 use super::{
     default_sidecar_script_path,
     protocol::{
-        BrowserActionResult, BrowserCloseResult, BrowserCookiesExportResult, BrowserNavigateResult,
-        BrowserOpenRequest, BrowserOpenResult, BrowserScreenshotResult, BrowserSessionMode,
-        BrowserSnapshotResult, BrowserTypeResult,
+        BrowserActionResult, BrowserCloseResult, BrowserConsoleResult, BrowserCookiesExportResult,
+        BrowserDiagnosticsQuery, BrowserErrorsResult, BrowserNavigateResult, BrowserOpenRequest,
+        BrowserOpenResult, BrowserRequestDiagnosticsQuery, BrowserRequestsResult,
+        BrowserScreenshotResult, BrowserSessionMode, BrowserSnapshotResult, BrowserTypeResult,
     },
     service::{
         BrowserProcessCommandSpec, BrowserRuntimeOptions, BrowserSidecarService,
@@ -142,6 +143,45 @@ impl BrowserSessionManager {
         let session = self.session_for_thread(thread_id).await?;
         let mut session = session.lock().await;
         session.service.navigate(url).await
+    }
+
+    /// Query recent console diagnostics for the target thread without forcing a new browser open.
+    pub async fn console(
+        &self,
+        thread_id: &str,
+        query: BrowserDiagnosticsQuery,
+    ) -> Result<BrowserConsoleResult> {
+        let Some(session) = self.sessions.read().await.get(thread_id).cloned() else {
+            return Ok(BrowserConsoleResult::default());
+        };
+        let mut session = session.lock().await;
+        session.service.console(query).await
+    }
+
+    /// Query recent browser errors for the target thread without forcing a new browser open.
+    pub async fn errors(
+        &self,
+        thread_id: &str,
+        query: BrowserDiagnosticsQuery,
+    ) -> Result<BrowserErrorsResult> {
+        let Some(session) = self.sessions.read().await.get(thread_id).cloned() else {
+            return Ok(BrowserErrorsResult::default());
+        };
+        let mut session = session.lock().await;
+        session.service.errors(query).await
+    }
+
+    /// Query recent request diagnostics for the target thread without forcing a new browser open.
+    pub async fn requests(
+        &self,
+        thread_id: &str,
+        query: BrowserRequestDiagnosticsQuery,
+    ) -> Result<BrowserRequestsResult> {
+        let Some(session) = self.sessions.read().await.get(thread_id).cloned() else {
+            return Ok(BrowserRequestsResult::default());
+        };
+        let mut session = session.lock().await;
+        session.service.requests(query).await
     }
 
     /// Capture a browser snapshot for the target thread.
