@@ -21,7 +21,7 @@ const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
 const DEFAULT_COMMAND_THREAD_ID: &str = "__standalone_command_thread__";
 
 /// One command execution request accepted by the command session runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandExecutionRequest {
     pub cmd: String,
     pub workdir: Option<std::path::PathBuf>,
@@ -55,7 +55,7 @@ impl CommandExecutionRequest {
 }
 
 /// One follow-up stdin write request for an existing command session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandWriteRequest {
     pub session_id: String,
     pub chars: String,
@@ -120,7 +120,7 @@ impl CommandTaskStatus {
 }
 
 /// One normalized execution summary returned by `exec_command` and `write_stdin`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommandExecutionResult {
     pub command: String,
     pub chunk_id: u64,

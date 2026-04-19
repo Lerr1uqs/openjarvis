@@ -1,0 +1,14 @@
+sandbox:
+  backend: "bubblewrap"
+  workspace_sync_dir: "."
+  restricted_host_paths:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "/etc"
+    - "/proc"
+    - "/sys"
+    - "/dev"
+  allow_parent_access: false
+  bubblewrap:
+    executable: "bwrap"
+  docker: {}

@@ -84,20 +84,22 @@ impl ToolHandler for ExecCommandTool {
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: ExecCommandArguments = parse_tool_arguments(request, "exec_command")?;
-        let result = self
-            .sessions
-            .exec_command_from_context(
-                context.thread_id(),
-                CommandExecutionRequest {
-                    cmd: args.cmd,
-                    workdir: args.workdir,
-                    shell: args.shell,
-                    tty: args.tty,
-                    yield_time_ms: args.yield_time_ms.unwrap_or(1_000),
-                    max_output_tokens: args.max_output_tokens,
-                },
-            )
-            .await?;
+        let request = CommandExecutionRequest {
+            cmd: args.cmd,
+            workdir: args.workdir,
+            shell: args.shell,
+            tty: args.tty,
+            yield_time_ms: args.yield_time_ms.unwrap_or(1_000),
+            max_output_tokens: args.max_output_tokens,
+        };
+        let result = match context.active_sandbox() {
+            Some(sandbox) => sandbox.exec_command(context.thread_id(), request)?,
+            None => {
+                self.sessions
+                    .exec_command_from_context(context.thread_id(), request)
+                    .await?
+            }
+        };
         Ok(result.into_tool_result("exec_command"))
     }
 }
@@ -145,18 +147,20 @@ impl ToolHandler for WriteStdinTool {
         request: ToolCallRequest,
     ) -> Result<ToolCallResult> {
         let args: WriteStdinArguments = parse_tool_arguments(request, "write_stdin")?;
-        let result = self
-            .sessions
-            .write_stdin_from_context(
-                context.thread_id(),
-                CommandWriteRequest {
-                    session_id: args.session_id,
-                    chars: args.chars,
-                    yield_time_ms: args.yield_time_ms.unwrap_or(1_000),
-                    max_output_tokens: args.max_output_tokens,
-                },
-            )
-            .await?;
+        let request = CommandWriteRequest {
+            session_id: args.session_id,
+            chars: args.chars,
+            yield_time_ms: args.yield_time_ms.unwrap_or(1_000),
+            max_output_tokens: args.max_output_tokens,
+        };
+        let result = match context.active_sandbox() {
+            Some(sandbox) => sandbox.write_command_stdin(context.thread_id(), request)?,
+            None => {
+                self.sessions
+                    .write_stdin_from_context(context.thread_id(), request)
+                    .await?
+            }
+        };
         Ok(result.into_tool_result("write_stdin"))
     }
 }
@@ -210,10 +214,14 @@ impl ToolHandler for ListUnreadCommandTasksTool {
         let started_at = Instant::now();
         let _: ListUnreadCommandTasksArguments =
             parse_tool_arguments(request, "list_unread_command_tasks")?;
-        let tasks = self
-            .sessions
-            .list_unread_tasks_from_context(context.thread_id())
-            .await;
+        let tasks = match context.active_sandbox() {
+            Some(sandbox) => sandbox.list_unread_command_tasks(context.thread_id())?,
+            None => {
+                self.sessions
+                    .list_unread_tasks_from_context(context.thread_id())
+                    .await
+            }
+        };
         Ok(ToolCallResult {
             content: format_task_listing(&tasks),
             metadata: json!({

@@ -1,8 +1,8 @@
 use clap::{Parser, error::ErrorKind};
 use openjarvis::{
     cli::{
-        InternalBrowserCommand, InternalBrowserMode, InternalMcpCommand, OpenJarvisCli,
-        SkillCommand,
+        InternalBrowserCommand, InternalBrowserMode, InternalMcpCommand, InternalSandboxCommand,
+        OpenJarvisCli, SkillCommand,
     },
     config::{AgentMcpServerTransportConfig, AppConfig, BUILTIN_MCP_SERVER_NAME},
 };
@@ -192,6 +192,43 @@ fn cli_parses_internal_browser_mock_sidecar_command() {
         cli.internal_browser_command(),
         Some(InternalBrowserCommand::MockSidecar)
     ));
+}
+
+#[test]
+fn cli_parses_internal_sandbox_proxy_command() {
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-sandbox",
+        "proxy",
+        "--workspace-root",
+        "/tmp/openjarvis-workspace",
+        "--restricted-host-path",
+        "/etc",
+        "--restricted-host-path",
+        "/proc",
+    ]);
+
+    match cli.internal_sandbox_command() {
+        Some(InternalSandboxCommand::Proxy {
+            workspace_root,
+            restricted_host_paths,
+            allow_parent_access,
+        }) => {
+            assert_eq!(
+                workspace_root,
+                &std::path::PathBuf::from("/tmp/openjarvis-workspace")
+            );
+            assert_eq!(
+                restricted_host_paths,
+                &[
+                    std::path::PathBuf::from("/etc"),
+                    std::path::PathBuf::from("/proc"),
+                ]
+            );
+            assert!(!allow_parent_access);
+        }
+        other => panic!("unexpected parsed sandbox command: {other:?}"),
+    }
 }
 
 #[test]
