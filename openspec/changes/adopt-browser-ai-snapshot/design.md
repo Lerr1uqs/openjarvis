@@ -15,7 +15,7 @@
 **Non-Goals:**
 - 本次不直接废弃现有面向动作的扁平 `browser__snapshot` 输出。
 - 本次不引入新的模型组件文档或新的长期运行服务。
-- 本次不承诺对 Playwright 私有接口做跨版本稳定兼容，只在当前项目依赖边界内提供明确失败语义与升级路径。
+- 本次不为私有或历史 AI snapshot 入口提供兼容层。
 
 ## Decisions
 
@@ -31,18 +31,17 @@
 备选方案：
 - 直接让 `browser__snapshot` 改成返回 AI snapshot。Rejected，因为这会同时改变模型观察形式、ref 解析方式和历史 prompt 习惯，风险过高。
 
-### 2. 对外以公开 `mode="ai"` 语义建模，内部保留兼容适配层
+### 2. 采集层只使用公开 `mode="ai"` 语义
 
-当前项目锁定的 Playwright 版本是 1.55.1，而用户确认的公开语义名应为 `page.ariaSnapshot({ mode: "ai" })`。因此本次设计以公开 `mode="ai"` 语义作为规范主名，但在 sidecar 中收敛为一层内部适配函数，避免上层直接依赖某个具体实现入口；对当前依赖版本，如果公开入口不可用，则允许在适配层中使用等价内部实现。
+用户已经确认目标接口应为 `page.ariaSnapshot({ mode: "ai" })` / `locator.ariaSnapshot({ mode: "ai" })`。因此本次设计直接以公开 `mode="ai"` 语义作为唯一采集入口，而不是再为历史或私有实现保留兼容分支。
 
 这样做的原因：
 - 规范层直接贴齐 Playwright 的公开 API 语义，后续沟通成本更低
-- 当前依赖版本仍然可以通过内部适配层立即落地
-- 未来升级 Playwright 时，只需要在 sidecar 适配层切换实现
-- Rust 协议与 parser 脚本都围绕“AI snapshot 文本契约”而不是某个具体内部函数名
+- 可以避免把私有入口继续固化进项目约束
+- Rust 协议与 parser 脚本都围绕“AI snapshot 文本契约”而不是某个历史实现名
 
 备选方案：
-- 等待升级到公开 `mode="ai"` 后再做。Rejected，因为当前就已经有可用能力，而且需求已明确。
+- 保留私有或历史入口作为 fallback。Rejected，因为用户已经明确不再支持这条路径。
 
 ### 3. 解析脚本输出“稳定 AST 风格 YAML”，而不是原样转存文本
 
@@ -60,14 +59,14 @@ AI snapshot 文本虽然是 YAML 风格，但单行 key 里混合了 role、name
 
 ## Risks / Trade-offs
 
-- [当前依赖版本的 AI snapshot 实现入口可能变化] → 在 sidecar 内收敛调用点，失败时返回显式错误，不让上层静默得到旧格式。
+- [当前项目依赖版本如果尚未支持 `mode="ai"`] → 在实现前先对齐 Playwright 版本或调用方式，不静默回退到旧输出。
 - [AI snapshot 输出格式存在版本漂移] → parser 采用宽松的属性解析和保守的 YAML AST，尽量保留未知属性而不是硬编码丢弃。
 - [iframe 递归或属性节点解析不完整] → 在脚本测试里加入 iframe、`/url`、`text`、状态位等代表性样例。
 - [两类 snapshot 并存导致调用方困惑] → 在 spec 中明确“扁平 snapshot 用于动作续接，AI snapshot 用于语义观察与后处理”。
 
 ## Migration Plan
 
-1. 在 sidecar 中增加 AI snapshot 采集适配层，并让现有 `aria_snapshot` 路径改走该实现。
+1. 在 sidecar 中增加基于 `ariaSnapshot({ mode: "ai" })` 的 AI snapshot 采集实现，并让现有 `aria_snapshot` 路径改走该实现。
 2. 在 Rust 协议 / service / session 层把结果类型与命名更新为 AI snapshot 语义。
 3. 增加独立解析脚本，先用于 observation、调试与后处理验证。
 4. 完成测试与 observation 验证后，再决定是否把这条语义能力提升到新的公开 browser tool。
@@ -75,4 +74,4 @@ AI snapshot 文本虽然是 YAML 风格，但单行 key 里混合了 role、name
 ## Open Questions
 
 - 最终是否要把这条语义原子能力直接提升为新的模型可见 browser tool，还是先停留在 session / helper 层。
-- 当项目未来升级后，是否要彻底移除兼容适配层里对等价内部实现的兜底调用。
+- 当前项目依赖版本是否已经完整支持 `ariaSnapshot({ mode: "ai" })`，还是需要先升级 Playwright 版本。

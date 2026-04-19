@@ -7,7 +7,7 @@
 - 将 browser sidecar 当前使用的 `ariaSnapshot()` 语义升级为基于 `ariaSnapshot({ mode: 'ai' })` 的 AI snapshot 语义，并把它定义为对外可用的原子页面语义快照能力。
 - 明确 AI snapshot 中的核心概念命名，包括 role、name、text、`ref`、状态属性、属性节点和 iframe 子树等，统一为可解析的契约。
 - 新增一个独立脚本，把 AI snapshot 文本解析成结构化 YAML，供后续规则处理、数据抽取或 diff 使用。
-- 为公开 `mode='ai'` 接口不可用或输出异常的场景补充兼容与失败语义，避免 browser 观察链路静默退化。
+- 为 `ariaSnapshot({ mode: 'ai' })` 调用失败或输出异常的场景补充明确失败语义，避免 browser 观察链路静默退化。
 
 ## Capabilities
 
@@ -20,5 +20,5 @@
 ## Impact
 
 - 受影响代码主要在 `scripts/browser_sidecar.mjs`、`src/agent/tool/browser/*`、`tests/agent/tool/browser/*` 与新增的 `scripts/*` helper。
-- 需要依赖 Playwright 的 AI snapshot 能力，并针对当前项目依赖版本补充必要的兼容适配、输出解析与测试。
+- 需要依赖 Playwright 的 `ariaSnapshot({ mode: 'ai' })` 能力，并补充对其输出格式的解析与测试。
 - browser 相关 observation / 调试脚本会新增一种可结构化消费的 AI snapshot 产物，供后续 agent 规则复用。

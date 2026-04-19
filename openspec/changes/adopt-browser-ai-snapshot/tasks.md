@@ -1,6 +1,6 @@
 ## 1. AI snapshot 语义能力
 
-- [ ] 1.1 在 `scripts/browser_sidecar.mjs` 中新增 AI snapshot 采集适配层，并让现有语义快照路径改用 `ariaSnapshot({ mode: 'ai' })` 或等价 AI snapshot 能力
+- [ ] 1.1 在 `scripts/browser_sidecar.mjs` 中新增 AI snapshot 采集实现，并让现有语义快照路径改用 `ariaSnapshot({ mode: 'ai' })`
 - [ ] 1.2 更新 Rust browser 协议、service、session 与测试，使 AI snapshot 结果、失败语义和 iframe 行为可验证
 
 ## 2. 结构化解析脚本
