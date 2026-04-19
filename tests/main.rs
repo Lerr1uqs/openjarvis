@@ -3,6 +3,7 @@ use openjarvis::{
     config::{AppConfig, install_global_config},
     router::ChannelRouter,
 };
+use serde_json::Value;
 use std::{
     env::temp_dir,
     fs,
@@ -53,6 +54,24 @@ impl Drop for MainConfigFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn write_mock_browser_sidecar_wrapper(root: &Path, extra_env: &[(&str, &str)]) -> PathBuf {
+    let wrapper_path = root.join("mock-browser-sidecar-wrapper.sh");
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    for (key, value) in extra_env {
+        script.push_str(&format!("export {}={}\n", key, shell_quote(value)));
+    }
+    script.push_str(&format!(
+        "exec {} internal-browser mock-sidecar\n",
+        shell_quote(env!("CARGO_BIN_EXE_openjarvis"))
+    ));
+    fs::write(&wrapper_path, script).expect("mock browser wrapper should be written");
+    wrapper_path
 }
 
 fn acpx_skill_resource_path() -> PathBuf {
@@ -225,6 +244,110 @@ fn internal_browser_helper_runs_before_app_config_load_and_reports_spawn_errors(
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failed to spawn browser sidecar executable"));
+}
+
+#[test]
+fn internal_browser_smoke_helper_reuses_exported_cookies_on_next_launch() {
+    // 测试场景: helper smoke 首次 close 自动导出 cookies 后，下一次 launch open 应自动加载并报告 cookies_loaded。
+    let fixture = MainConfigFixture::new("openjarvis-main-browser-smoke-cookie-reuse");
+    let wrapper_path = write_mock_browser_sidecar_wrapper(
+        fixture.root(),
+        &[("OPENJARVIS_BROWSER_MOCK_COOKIE_COUNT", "1")],
+    );
+    let cookies_state_file = fixture.root().join("state/browser-cookies.json");
+    let output_dir = fixture.root().join("artifacts");
+
+    let first_output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("internal-browser")
+        .arg("smoke")
+        .arg("--url")
+        .arg("https://example.com")
+        .arg("--headless")
+        .arg("--node-bin")
+        .arg("sh")
+        .arg("--script-path")
+        .arg(&wrapper_path)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--cookies-state-file")
+        .arg(&cookies_state_file)
+        .arg("--load-cookies-on-open")
+        .arg("--save-cookies-on-close")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("first internal browser smoke should run");
+
+    assert!(first_output.status.success());
+    let first_stdout = String::from_utf8_lossy(&first_output.stdout);
+    assert!(first_stdout.contains("open: mode=Launch"));
+    assert!(first_stdout.contains("cookies_loaded=0"));
+    assert!(cookies_state_file.exists());
+    let first_cookies: Value = serde_json::from_str(
+        &fs::read_to_string(&cookies_state_file).expect("cookies state file should be readable"),
+    )
+    .expect("cookies state file should be valid json");
+    assert_eq!(
+        first_cookies["cookies"]
+            .as_array()
+            .expect("cookies should be an array")
+            .len(),
+        1
+    );
+
+    let second_output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("internal-browser")
+        .arg("smoke")
+        .arg("--url")
+        .arg("https://example.com")
+        .arg("--headless")
+        .arg("--node-bin")
+        .arg("sh")
+        .arg("--script-path")
+        .arg(&wrapper_path)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--cookies-state-file")
+        .arg(&cookies_state_file)
+        .arg("--load-cookies-on-open")
+        .arg("--save-cookies-on-close")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("second internal browser smoke should run");
+
+    assert!(second_output.status.success());
+    let second_stdout = String::from_utf8_lossy(&second_output.stdout);
+    assert!(second_stdout.contains("open: mode=Launch"));
+    assert!(second_stdout.contains("cookies_loaded=1"));
+}
+
+#[test]
+fn internal_browser_smoke_helper_supports_attach_mode_with_explicit_endpoint() {
+    // 测试场景: helper smoke 应能通过统一 open 参数进入 attach 模式，而不是偷偷回退到 launch。
+    let fixture = MainConfigFixture::new("openjarvis-main-browser-smoke-attach");
+    let wrapper_path = write_mock_browser_sidecar_wrapper(fixture.root(), &[]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("internal-browser")
+        .arg("smoke")
+        .arg("--url")
+        .arg("https://example.com")
+        .arg("--mode")
+        .arg("attach")
+        .arg("--cdp-endpoint")
+        .arg("http://127.0.0.1:9222")
+        .arg("--headless")
+        .arg("--node-bin")
+        .arg("sh")
+        .arg("--script-path")
+        .arg(&wrapper_path)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("attach-mode internal browser smoke should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("open: mode=Attach"));
+    assert!(!stdout.contains("open: mode=Launch"));
 }
 
 #[test]

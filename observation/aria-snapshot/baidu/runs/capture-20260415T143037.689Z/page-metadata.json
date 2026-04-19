@@ -1,0 +1,11 @@
+{
+  "aria_snapshot": "aria-snapshot.yaml",
+  "browser_snapshot": "browser-snapshot.txt",
+  "captured_at": "2026-04-15T14:30:37.689802331+00:00",
+  "cookies_loaded": 0,
+  "final_url": "https://www.baidu.com/",
+  "screenshot": "baidu-homepage.png",
+  "session_artifacts": "/home/pc/proj/self-projs/openjarvis-worktrees/browser-automation/observation/aria-snapshot/baidu/runs/capture-20260415T143037.689Z/session-artifacts/session-browser-baidu-aria-observe-9779c039-fa4e-4828-a6c8-82246715bb0c",
+  "target_url": "https://www.baidu.com/",
+  "title": "百度一下，你就知道"
+}

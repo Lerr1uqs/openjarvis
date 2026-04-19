@@ -77,7 +77,8 @@ async fn main() -> Result<()> {
         info!(skills = ?enabled_skill_names, "loaded local skills from startup flags");
     }
 
-    let command_registry = CommandRegistry::with_builtin_commands();
+    let command_registry =
+        CommandRegistry::with_builtin_commands_and_tools(agent.runtime().tools());
 
     let session_store: Arc<dyn SessionStore> =
         match config.session_config().persistence_config().backend() {

@@ -29,8 +29,7 @@ fn build_incoming(content: &str) -> IncomingMessage {
     }
 }
 
-async fn build_parent_thread(
-) -> (
+async fn build_parent_thread() -> (
     AgentWorker,
     SessionManager,
     ThreadLocator,
@@ -73,9 +72,17 @@ async fn subagent_tools_are_visible_only_on_parent_threads() {
         .list_for_context(&parent_thread)
         .await
         .expect("parent tools should list");
-    assert!(parent_tools.iter().any(|tool| tool.name == "spawn_subagent"));
+    assert!(
+        parent_tools
+            .iter()
+            .any(|tool| tool.name == "spawn_subagent")
+    );
     assert!(parent_tools.iter().any(|tool| tool.name == "send_subagent"));
-    assert!(parent_tools.iter().any(|tool| tool.name == "close_subagent"));
+    assert!(
+        parent_tools
+            .iter()
+            .any(|tool| tool.name == "close_subagent")
+    );
     assert!(parent_tools.iter().any(|tool| tool.name == "list_subagent"));
 
     let child_locator =

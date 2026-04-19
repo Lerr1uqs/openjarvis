@@ -3,7 +3,13 @@ mod support;
 
 use chrono::Utc;
 use openjarvis::{
-    agent::{FeatureResolver, MemoryRepository, ToolRegistry},
+    agent::{
+        FeatureResolver, MemoryRepository, ToolCallRequest, ToolRegistry,
+        tool::browser::{
+            BrowserProcessCommandSpec, BrowserRuntimeOptions, BrowserSessionManagerConfig,
+            register_browser_toolset_with_config,
+        },
+    },
     command::{CommandInvocation, CommandRegistry},
     compact::ContextBudgetEstimator,
     config::AppConfig,
@@ -12,12 +18,12 @@ use openjarvis::{
     session::{SessionManager, ThreadLocator},
     thread::{
         ChildThreadIdentity, DEFAULT_ASSISTANT_SYSTEM_PROMPT, DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT,
-        Feature, Features, SubagentSpawnMode, Thread, ThreadAgentKind, ThreadContextLocator,
-        ThreadRuntime, derive_internal_thread_id,
+        Feature, Features, SubagentSpawnMode, Thread, ThreadAgent, ThreadAgentKind,
+        ThreadContextLocator, ThreadRuntime, derive_internal_thread_id,
     },
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{env::temp_dir, fs, sync::Arc};
 use support::ThreadTestExt;
 use uuid::Uuid;
 
@@ -630,6 +636,91 @@ async fn removed_auto_compact_command_returns_unknown_reply_without_mutating_thr
     assert!(!thread_context.auto_compact_enabled(false));
 }
 
+#[tokio::test]
+async fn browser_export_cookies_command_exports_current_session_state() {
+    // 测试场景: `/browser-export-cookies <path>` 在 Browser 子线程中应复用当前 browser session 并导出 cookies 文件。
+    let root = temp_dir().join(format!(
+        "openjarvis-command-browser-export-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).expect("command browser export root should exist");
+    let artifact_root = root.join("artifacts");
+    let export_path = root.join("state/browser-cookies.json");
+    let tools = Arc::new(ToolRegistry::new());
+    register_browser_toolset_with_config(
+        &tools,
+        BrowserSessionManagerConfig {
+            process: BrowserProcessCommandSpec {
+                executable: env!("CARGO_BIN_EXE_openjarvis").to_string(),
+                args: vec!["internal-browser".to_string(), "mock-sidecar".to_string()],
+                env: Default::default(),
+            },
+            runtime: BrowserRuntimeOptions {
+                headless: true,
+                keep_artifacts: true,
+                ..Default::default()
+            },
+            artifact_root,
+        },
+    )
+    .await
+    .expect("browser toolset should register");
+
+    let mut thread_context = build_browser_thread_context();
+    tools
+        .call_for_context(
+            &mut thread_context,
+            ToolCallRequest {
+                name: "browser__navigate".to_string(),
+                arguments: json!({ "url": "https://example.com" }),
+            },
+        )
+        .await
+        .expect("browser navigate should create session");
+
+    let registry = CommandRegistry::with_builtin_commands_and_tools(Arc::clone(&tools));
+    let incoming = build_incoming(&format!(
+        "/browser-export-cookies {}",
+        export_path.display()
+    ));
+
+    let reply = registry
+        .try_execute_with_thread_context(&incoming, &mut thread_context)
+        .await
+        .expect("browser export cookies command should execute")
+        .expect("browser export cookies command should be handled");
+
+    assert_eq!(
+        reply.formatted_content(),
+        format!(
+            "[Command][browser-export-cookies][SUCCESS]: exported 0 cookies to {}",
+            export_path.display()
+        )
+    );
+    assert!(export_path.exists());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn browser_export_cookies_command_rejects_missing_path_argument() {
+    // 测试场景: `/browser-export-cookies` 缺少路径参数时应返回 usage，而不是静默成功。
+    let registry = CommandRegistry::with_builtin_commands_and_tools(Arc::new(ToolRegistry::new()));
+    let incoming = build_incoming("/browser-export-cookies");
+    let mut thread_context = build_thread_context();
+
+    let reply = registry
+        .try_execute_with_thread_context(&incoming, &mut thread_context)
+        .await
+        .expect("browser export cookies usage command should execute")
+        .expect("browser export cookies usage command should be handled");
+
+    assert_eq!(
+        reply.formatted_content(),
+        "[Command][browser-export-cookies][FAILED]: usage: /browser-export-cookies <path>"
+    );
+}
+
 fn build_incoming(content: &str) -> IncomingMessage {
     IncomingMessage {
         id: Uuid::new_v4(),
@@ -661,6 +752,13 @@ fn build_thread_context() -> Thread {
         ),
         Utc::now(),
     )
+}
+
+fn build_browser_thread_context() -> Thread {
+    let mut thread_context = build_thread_context();
+    thread_context.replace_thread_agent(ThreadAgent::from_kind(ThreadAgentKind::Browser));
+    thread_context.replace_loaded_toolsets(vec!["browser".to_string()]);
+    thread_context
 }
 
 fn build_thread_runtime() -> Arc<ThreadRuntime> {

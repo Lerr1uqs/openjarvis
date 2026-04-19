@@ -3,7 +3,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use openjarvis::agent::{
     ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
-    ToolsetCatalogEntry, empty_tool_input_schema, tool::browser::register_browser_toolset_with_config,
+    ToolsetCatalogEntry, empty_tool_input_schema,
+    tool::browser::register_browser_toolset_with_config,
 };
 use openjarvis::thread::{ThreadAgent, ThreadAgentKind};
 use serde_json::json;
@@ -222,7 +223,12 @@ async fn browser_kind_hides_optional_toolset_controls_and_catalog() {
     assert!(!visible_tool_names.contains(&"unload_toolset"));
     assert!(!visible_tool_names.contains(&"demo__echo"));
 
-    assert!(registry.catalog_prompt_for_context(&thread_browser).await.is_none());
+    assert!(
+        registry
+            .catalog_prompt_for_context(&thread_browser)
+            .await
+            .is_none()
+    );
 
     let error = call_tool(
         &registry,

@@ -13,7 +13,9 @@ pub mod subagent;
 pub mod toolset;
 pub mod write;
 
-use crate::config::{AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig};
+use crate::config::{
+    AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig, try_global_config,
+};
 use crate::session::SessionManager;
 use crate::thread::{Thread, ThreadContextLocator};
 use anyhow::{Context, Result, bail};
@@ -241,6 +243,7 @@ pub struct ToolRegistry {
     memory_repository: Arc<MemoryRepository>,
     command_sessions: Arc<CommandSessionManager>,
     subagent_runner: StdRwLock<Option<Weak<crate::agent::SubagentRunner>>>,
+    browser_sessions: RwLock<Option<Arc<browser::BrowserSessionManager>>>,
 }
 
 pub fn tool_definition_from_args<T>(
@@ -338,6 +341,7 @@ impl ToolRegistry {
             memory_repository: Arc::new(MemoryRepository::new(workspace_root.into())),
             command_sessions: Arc::new(CommandSessionManager::new()),
             subagent_runner: StdRwLock::new(None),
+            browser_sessions: RwLock::new(None),
         }
     }
 
@@ -481,7 +485,12 @@ impl ToolRegistry {
             subagent::register_subagent_tools(self, subagent_runner).await;
         }
         if !self.toolset_registered("browser").await {
-            browser::register_browser_toolset(self).await?;
+            let browser_config = try_global_config()
+                .map(|config| {
+                    configured_browser_session_manager_config(config.agent_config().tool_config())
+                })
+                .unwrap_or_default();
+            browser::register_browser_toolset_with_config(self, browser_config).await?;
         }
         if !self.toolset_registered("memory").await {
             register_memory_toolset(self).await?;
@@ -767,6 +776,19 @@ impl ToolRegistry {
             .subagent_runner
             .write()
             .expect("subagent runner lock should not be poisoned") = Some(Arc::downgrade(runner));
+    }
+
+    pub(crate) async fn remember_browser_session_manager(
+        &self,
+        sessions: Arc<browser::BrowserSessionManager>,
+    ) {
+        *self.browser_sessions.write().await = Some(sessions);
+    }
+
+    pub(crate) async fn browser_session_manager(
+        &self,
+    ) -> Option<Arc<browser::BrowserSessionManager>> {
+        self.browser_sessions.read().await.clone()
     }
 
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
@@ -1080,6 +1102,19 @@ fn build_mcp_server_definitions(config: &AgentToolConfig) -> Result<Vec<McpServe
         .collect::<Result<Vec<_>>>()?;
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(definitions)
+}
+
+fn configured_browser_session_manager_config(
+    config: &AgentToolConfig,
+) -> browser::BrowserSessionManagerConfig {
+    let mut manager_config = browser::BrowserSessionManagerConfig::default();
+    let browser_config = config.browser_config();
+    manager_config.runtime.cookies_state_file = browser_config
+        .cookies_state_file()
+        .map(std::path::Path::to_path_buf);
+    manager_config.runtime.load_cookies_on_open = browser_config.load_cookies_on_open();
+    manager_config.runtime.save_cookies_on_close = browser_config.save_cookies_on_close();
+    manager_config
 }
 
 fn build_mcp_server_definition(

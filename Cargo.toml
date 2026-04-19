@@ -45,6 +45,18 @@ name = "browser_bilibili_search_dump"
 path = "scripts/browser_bilibili_search_dump.rs"
 
 [[bin]]
+name = "browser_baidu_aria_observe"
+path = "scripts/browser_baidu_aria_observe.rs"
+
+[[bin]]
+name = "browser_bilibili_persist_observe"
+path = "scripts/browser_bilibili_persist_observe.rs"
+
+[[bin]]
+name = "browser_ai_snapshot_parse"
+path = "scripts/browser_ai_snapshot_parse.rs"
+
+[[bin]]
 name = "tool_schema_dump"
 path = "scripts/tool_schema_dump.rs"
 

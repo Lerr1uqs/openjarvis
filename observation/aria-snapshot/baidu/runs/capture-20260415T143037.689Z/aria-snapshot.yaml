@@ -1,0 +1,79 @@
+- link "新闻":
+  - /url: http://news.baidu.com
+- link "hao123":
+  - /url: https://www.hao123.com?src=from_pc
+- link "地图":
+  - /url: http://map.baidu.com
+- link "贴吧":
+  - /url: http://tieba.baidu.com/
+- link "视频":
+  - /url: https://haokan.baidu.com/?sfrom=baidu-top
+- link "图片":
+  - /url: http://image.baidu.com/
+- link "网盘":
+  - /url: https://pan.baidu.com?from=1026962h
+- link "文库":
+  - /url: https://wenku.baidu.com/?fr=bdpcindex
+- link "文心":
+  - /url: https://chat.baidu.com/search?isShowHello=1&pd=csaitab&setype=csaitab&extParamsJson=%7B%22enter_type%22%3A%22home_tab%22%7D
+- link "更多":
+  - /url: http://www.baidu.com/more/
+- text: 设置
+- link "登录":
+  - /url: https://passport.baidu.com/v2/?login&tpl=mn&u=http%3A%2F%2Fwww.baidu.com%2F&sms=5
+- img
+- link "点击一下，了解更多":
+  - /url: //www.baidu.com/s?wd=%E7%99%BE%E5%BA%A6%E7%83%AD%E6%90%9C&sa=ire_dl_gh_logo_texing&rsv_dl=igh_logo_pcs
+- textbox "王阳被曝曾在剧组被导演霸凌"
+- img
+- img
+- img
+- button "百度一下"
+- link "复杂问题就找文心助手，深入思考回答更优 ":
+  - /url: https://chat.baidu.com/search?extParams=%7B%22enter_type%22%3A%22home_operate%22%7D&isShowHello=1
+  - img
+  - text: 复杂问题就找文心助手，深入思考回答更优 
+- link "百度热搜":
+  - /url: https://top.baidu.com/board?platform=pc&sa=pcindex_entry
+  - text: 
+- text:  换一换
+- list:
+  - listitem:
+    - link " 习近平同苏林共同会见中越青年代表":
+      - /url: https://www.baidu.com/s?wd=%E4%B9%A0%E8%BF%91%E5%B9%B3%E5%90%8C%E8%8B%8F%E6%9E%97%E5%85%B1%E5%90%8C%E4%BC%9A%E8%A7%81%E4%B8%AD%E8%B6%8A%E9%9D%92%E5%B9%B4%E4%BB%A3%E8%A1%A8&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+  - listitem:
+    - link "5 塔克拉玛干沙漠种上了大片苜蓿":
+      - /url: https://www.baidu.com/s?wd=%E5%A1%94%E5%85%8B%E6%8B%89%E7%8E%9B%E5%B9%B2%E6%B2%99%E6%BC%A0%E7%A7%8D%E4%B8%8A%E4%BA%86%E5%A4%A7%E7%89%87%E8%8B%9C%E8%93%BF&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 新
+  - listitem:
+    - link "1 美国将退还超1万亿元关税":
+      - /url: https://www.baidu.com/s?wd=%E7%BE%8E%E5%9B%BD%E5%B0%86%E9%80%80%E8%BF%98%E8%B6%851%E4%B8%87%E4%BA%BF%E5%85%83%E5%85%B3%E7%A8%8E&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 热
+  - listitem:
+    - link "6 美歌手在联合国高唱《我爱你中国》":
+      - /url: https://www.baidu.com/s?wd=%E7%BE%8E%E6%AD%8C%E6%89%8B%E5%9C%A8%E8%81%94%E5%90%88%E5%9B%BD%E9%AB%98%E5%94%B1%E3%80%8A%E6%88%91%E7%88%B1%E4%BD%A0%E4%B8%AD%E5%9B%BD%E3%80%8B&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 热
+  - listitem:
+    - link "2 暴雨、大暴雨要来了":
+      - /url: https://www.baidu.com/s?wd=%E6%9A%B4%E9%9B%A8%E3%80%81%E5%A4%A7%E6%9A%B4%E9%9B%A8%E8%A6%81%E6%9D%A5%E4%BA%86&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 新
+  - listitem:
+    - link "7 姚安娜代言华为新手机":
+      - /url: https://www.baidu.com/s?wd=%E5%A7%9A%E5%AE%89%E5%A8%9C%E4%BB%A3%E8%A8%80%E5%8D%8E%E4%B8%BA%E6%96%B0%E6%89%8B%E6%9C%BA&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 热
+  - listitem:
+    - link "3 新的“之最”不断产生":
+      - /url: https://www.baidu.com/s?wd=%E6%96%B0%E7%9A%84%E2%80%9C%E4%B9%8B%E6%9C%80%E2%80%9D%E4%B8%8D%E6%96%AD%E4%BA%A7%E7%94%9F&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+  - listitem:
+    - link "8 迪拜帆船酒店将停业1年半":
+      - /url: https://www.baidu.com/s?wd=%E8%BF%AA%E6%8B%9C%E5%B8%86%E8%88%B9%E9%85%92%E5%BA%97%E5%B0%86%E5%81%9C%E4%B8%9A1%E5%B9%B4%E5%8D%8A&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 新
+  - listitem:
+    - link "4 机器人切除肿瘤不彻底 医院担主责":
+      - /url: https://www.baidu.com/s?wd=%E6%9C%BA%E5%99%A8%E4%BA%BA%E5%88%87%E9%99%A4%E8%82%BF%E7%98%A4%E4%B8%8D%E5%BD%BB%E5%BA%95+%E5%8C%BB%E9%99%A2%E6%8B%85%E4%B8%BB%E8%B4%A3&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+  - listitem:
+    - link "9 北海舰队、南海舰队、东海舰队公告":
+      - /url: https://www.baidu.com/s?wd=%E5%8C%97%E6%B5%B7%E8%88%B0%E9%98%9F%E3%80%81%E5%8D%97%E6%B5%B7%E8%88%B0%E9%98%9F%E3%80%81%E4%B8%9C%E6%B5%B7%E8%88%B0%E9%98%9F%E5%85%AC%E5%91%8A&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+    - text: 新
+- img
+- img
