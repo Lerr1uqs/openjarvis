@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use std::fs;
+use std::{fs, path::Path};
 
 #[derive(Default)]
 pub struct ReadTool;
@@ -42,9 +42,23 @@ impl ToolHandler for ReadTool {
     }
 
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
+        self.call_with_context(super::ToolCallContext::default(), request)
+            .await
+    }
+
+    async fn call_with_context(
+        &self,
+        context: super::ToolCallContext,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
         let args: ReadToolArguments = parse_tool_arguments(request, "read")?;
-        let content = fs::read_to_string(&args.path)
-            .with_context(|| format!("failed to read file {}", args.path))?;
+        let content = match context.active_sandbox() {
+            Some(sandbox) => sandbox
+                .read_workspace_text(Path::new(&args.path))
+                .with_context(|| format!("failed to read sandbox file {}", args.path))?,
+            None => fs::read_to_string(&args.path)
+                .with_context(|| format!("failed to read file {}", args.path))?,
+        };
         let selected = select_line_range(&content, args.start_line, args.end_line)?;
 
         Ok(ToolCallResult {

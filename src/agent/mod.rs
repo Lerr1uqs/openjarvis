@@ -22,7 +22,11 @@ pub use memory::{
     register_memory_toolset,
 };
 pub use runtime::AgentRuntime;
-pub use sandbox::DummySandboxContainer;
+pub use sandbox::{
+    BubblewrapCapabilityConfig, DEFAULT_CAPABILITIES_CONFIG_PATH, DockerCapabilityConfig, Sandbox,
+    SandboxBackendKind, SandboxCapabilityConfig, SandboxJsonRpcError, SandboxJsonRpcRequest,
+    SandboxJsonRpcResponse, SandboxPolicyConfig, build_sandbox, run_internal_sandbox_command,
+};
 pub use subagent::{SubagentRequest, SubagentRunOutput, SubagentRunner};
 pub use tool::{
     CommandExecutionRequest, CommandExecutionResult, CommandSessionManager, CommandTaskSnapshot,

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use std::fs;
+use std::{fs, path::Path};
 
 #[derive(Default)]
 pub struct EditTool;
@@ -44,13 +44,27 @@ impl ToolHandler for EditTool {
     }
 
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
+        self.call_with_context(super::ToolCallContext::default(), request)
+            .await
+    }
+
+    async fn call_with_context(
+        &self,
+        context: super::ToolCallContext,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
         let args: EditToolArguments = parse_tool_arguments(request, "edit")?;
         if args.old_text.is_empty() {
             bail!("edit tool requires non-empty `old_text`");
         }
 
-        let content = fs::read_to_string(&args.path)
-            .with_context(|| format!("failed to read file {}", args.path))?;
+        let content = match context.active_sandbox() {
+            Some(sandbox) => sandbox
+                .read_workspace_text(Path::new(&args.path))
+                .with_context(|| format!("failed to read sandbox file {}", args.path))?,
+            None => fs::read_to_string(&args.path)
+                .with_context(|| format!("failed to read file {}", args.path))?,
+        };
         let match_count = content.matches(&args.old_text).count();
         if match_count == 0 {
             bail!("edit tool did not find target text in {}", args.path);
@@ -58,8 +72,13 @@ impl ToolHandler for EditTool {
 
         let updated = content.replacen(&args.old_text, &args.new_text, 1);
 
-        fs::write(&args.path, &updated)
-            .with_context(|| format!("failed to write file {}", args.path))?;
+        match context.active_sandbox() {
+            Some(sandbox) => sandbox
+                .write_workspace_text(Path::new(&args.path), &updated)
+                .with_context(|| format!("failed to write sandbox file {}", args.path))?,
+            None => fs::write(&args.path, &updated)
+                .with_context(|| format!("failed to write file {}", args.path))?,
+        };
 
         Ok(ToolCallResult {
             content: "updated 1 occurrence".to_string(),

@@ -6,7 +6,7 @@ use super::{
         AgentLoopOutput,
     },
     runtime::AgentRuntime,
-    sandbox::DummySandboxContainer,
+    sandbox::{Sandbox, SandboxCapabilityConfig, build_sandbox},
     subagent::SubagentRunner,
 };
 use crate::compact::CompactProvider;
@@ -16,7 +16,7 @@ use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config}
 use crate::model::IncomingMessage;
 use crate::session::{SessionManager, ThreadLocator};
 use crate::thread::{Thread, ThreadRuntime};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -60,7 +60,7 @@ pub struct AgentWorker {
     agent_loop: AgentLoop,
     thread_runtime: Arc<ThreadRuntime>,
     subagent_runner: Arc<SubagentRunner>,
-    sandbox: DummySandboxContainer,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 struct WorkerCommittedMessageHandler {
@@ -98,15 +98,21 @@ impl AgentCommittedMessageHandler for WorkerCommittedMessageHandler {
 ///
 /// # 示例
 /// ```rust
-/// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
+/// use openjarvis::{agent::{AgentWorker, SandboxCapabilityConfig}, llm::MockLLMProvider};
 /// use std::sync::Arc;
 ///
+/// let sandbox_capabilities = SandboxCapabilityConfig::from_yaml_str(
+///     "sandbox:\n  backend: disabled\n",
+///     ".",
+/// )
+/// .expect("sandbox capability config should parse");
 /// let worker = AgentWorker::builder()
 ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+///     .sandbox_capabilities(sandbox_capabilities)
 ///     .build()
 ///     .expect("worker should build");
 ///
-/// assert!(worker.sandbox().is_placeholder());
+/// assert_eq!(worker.sandbox().kind(), "disabled");
 /// ```
 pub struct AgentWorkerBuilder {
     llm: Option<Arc<dyn LLMProvider>>,
@@ -114,6 +120,7 @@ pub struct AgentWorkerBuilder {
     llm_config: LLMConfig,
     compact_config: AgentCompactConfig,
     compact_provider: Option<Arc<dyn CompactProvider>>,
+    sandbox_capabilities: Option<SandboxCapabilityConfig>,
 }
 
 impl Default for AgentWorkerBuilder {
@@ -124,6 +131,7 @@ impl Default for AgentWorkerBuilder {
             llm_config: LLMConfig::default(),
             compact_config: AgentCompactConfig::default(),
             compact_provider: None,
+            sandbox_capabilities: None,
         }
     }
 }
@@ -164,6 +172,12 @@ impl AgentWorkerBuilder {
         self
     }
 
+    /// Override the sandbox capability policy used by the worker.
+    pub fn sandbox_capabilities(mut self, sandbox_capabilities: SandboxCapabilityConfig) -> Self {
+        self.sandbox_capabilities = Some(sandbox_capabilities);
+        self
+    }
+
     /// Build the worker from the accumulated fields.
     pub fn build(self) -> Result<AgentWorker> {
         let Self {
@@ -172,6 +186,7 @@ impl AgentWorkerBuilder {
             llm_config,
             compact_config,
             compact_provider,
+            sandbox_capabilities,
         } = self;
         let Some(llm) = llm else {
             bail!("agent worker builder requires an llm provider");
@@ -204,12 +219,20 @@ impl AgentWorkerBuilder {
             compact_config,
         ));
         tool_registry.install_subagent_runner(&subagent_runner);
+        let sandbox_capabilities = match sandbox_capabilities {
+            Some(config) => config,
+            None => SandboxCapabilityConfig::load_for_workspace(std::env::current_dir().context(
+                "failed to resolve current workspace root for sandbox capability config",
+            )?)?,
+        };
+        let sandbox = build_sandbox(sandbox_capabilities)?;
+        tool_registry.install_sandbox(Arc::clone(&sandbox));
 
         Ok(AgentWorker {
             agent_loop,
             thread_runtime,
             subagent_runner,
-            sandbox: DummySandboxContainer::new(),
+            sandbox,
         })
     }
 }
@@ -223,14 +246,11 @@ impl AgentWorker {
     /// Create a worker with a fresh default runtime.
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,no_run
     /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
     /// use std::sync::Arc;
     ///
-    /// let _worker = AgentWorker::builder()
-    ///     .llm(Arc::new(MockLLMProvider::new("pong")))
-    ///     .build()
-    ///     .expect("worker should build");
+    /// let _worker = AgentWorker::new(Arc::new(MockLLMProvider::new("pong")));
     /// ```
     pub fn new(llm: Arc<dyn LLMProvider>) -> Self {
         Self::builder()
@@ -272,7 +292,7 @@ impl AgentWorker {
     /// use openjarvis::{agent::AgentWorker, config::AppConfig};
     ///
     /// let worker = AgentWorker::from_config(&AppConfig::default()).await?;
-    /// assert!(worker.sandbox().is_placeholder());
+    /// assert_eq!(worker.sandbox().kind(), "disabled");
     /// # Ok(())
     /// # }
     /// ```
@@ -299,7 +319,7 @@ impl AgentWorker {
     /// install_global_config(config)?;
     ///
     /// let worker = AgentWorker::from_global_config().await?;
-    /// assert!(worker.sandbox().is_placeholder());
+    /// assert_eq!(worker.sandbox().kind(), "disabled");
     /// # Ok(())
     /// # }
     /// ```
@@ -332,17 +352,23 @@ impl AgentWorker {
     ///
     /// # 示例
     /// ```rust
-    /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
+    /// use openjarvis::{agent::{AgentWorker, SandboxCapabilityConfig}, llm::MockLLMProvider};
     /// use std::sync::Arc;
     ///
+    /// let sandbox_capabilities = SandboxCapabilityConfig::from_yaml_str(
+    ///     "sandbox:\n  backend: disabled\n",
+    ///     ".",
+    /// )
+    /// .expect("sandbox capability config should parse");
     /// let worker = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
+    ///     .sandbox_capabilities(sandbox_capabilities)
     ///     .build()
     ///     .expect("worker should build");
-    /// assert!(worker.sandbox().is_placeholder());
+    /// assert_eq!(worker.sandbox().kind(), "disabled");
     /// ```
-    pub fn sandbox(&self) -> &DummySandboxContainer {
-        &self.sandbox
+    pub fn sandbox(&self) -> &(dyn Sandbox + '_) {
+        self.sandbox.as_ref()
     }
 
     /// Spawn the long-lived agent worker loop and return its router-facing channels.

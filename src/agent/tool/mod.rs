@@ -1,5 +1,6 @@
 //! Shared tool traits, schemas, and registry for the built-in agent tool set.
 
+use super::sandbox::{Sandbox, SandboxBackendKind};
 use crate::agent::memory::{MemoryRepository, register_memory_toolset};
 use crate::skill::{default_skill_roots, default_skill_roots_for_workspace};
 pub mod browser;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    fmt,
     path::PathBuf,
     sync::{Arc, RwLock as StdRwLock, Weak},
     time::Instant,
@@ -141,11 +143,27 @@ pub struct ToolCallResult {
 }
 
 /// Thread-scoped runtime context attached to one tool invocation.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ToolCallContext {
     thread_id: Option<String>,
     locator: Option<ThreadContextLocator>,
     sessions: Option<SessionManager>,
+    sandbox: Option<Arc<dyn Sandbox>>,
+}
+
+impl fmt::Debug for ToolCallContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolCallContext")
+            .field("thread_id", &self.thread_id)
+            .field("locator", &self.locator)
+            .field("sessions", &self.sessions.is_some())
+            .field(
+                "sandbox_kind",
+                &self.sandbox.as_ref().map(|sandbox| sandbox.kind()),
+            )
+            .finish()
+    }
 }
 
 impl ToolCallContext {
@@ -163,6 +181,7 @@ impl ToolCallContext {
             thread_id: Some(thread_id.into()),
             locator: None,
             sessions: None,
+            sandbox: None,
         }
     }
 
@@ -173,6 +192,12 @@ impl ToolCallContext {
 
     pub fn with_sessions(mut self, sessions: SessionManager) -> Self {
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Attach the currently active sandbox runtime to this tool call context.
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -187,6 +212,17 @@ impl ToolCallContext {
 
     pub fn sessions(&self) -> Option<&SessionManager> {
         self.sessions.as_ref()
+    }
+
+    /// Return the installed sandbox runtime when present.
+    pub fn sandbox(&self) -> Option<&(dyn Sandbox + '_)> {
+        self.sandbox.as_deref()
+    }
+
+    /// Return the sandbox runtime only when the backend is not `disabled`.
+    pub fn active_sandbox(&self) -> Option<&(dyn Sandbox + '_)> {
+        self.sandbox()
+            .filter(|sandbox| sandbox.kind() != SandboxBackendKind::Disabled.as_str())
     }
 }
 
@@ -242,6 +278,7 @@ pub struct ToolRegistry {
     skills: Arc<skill::SkillRegistry>,
     memory_repository: Arc<MemoryRepository>,
     command_sessions: Arc<CommandSessionManager>,
+    sandbox: StdRwLock<Option<Arc<dyn Sandbox>>>,
     subagent_runner: StdRwLock<Option<Weak<crate::agent::SubagentRunner>>>,
     browser_sessions: RwLock<Option<Arc<browser::BrowserSessionManager>>>,
 }
@@ -340,6 +377,7 @@ impl ToolRegistry {
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
             memory_repository: Arc::new(MemoryRepository::new(workspace_root.into())),
             command_sessions: Arc::new(CommandSessionManager::new()),
+            sandbox: StdRwLock::new(None),
             subagent_runner: StdRwLock::new(None),
             browser_sessions: RwLock::new(None),
         }
@@ -500,6 +538,21 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Install the active sandbox runtime used by thread-scoped tool calls.
+    pub fn install_sandbox(&self, sandbox: Arc<dyn Sandbox>) {
+        *self
+            .sandbox
+            .write()
+            .expect("tool registry sandbox lock should not be poisoned") = Some(sandbox);
+    }
+
+    pub(crate) fn installed_sandbox(&self) -> Option<Arc<dyn Sandbox>> {
+        self.sandbox
+            .read()
+            .expect("tool registry sandbox lock should not be poisoned")
+            .clone()
+    }
+
     /// Look up a registered tool and execute the request.
     pub async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
         let tool_name = request.name.clone();
@@ -525,9 +578,11 @@ impl ToolRegistry {
             bail!("tool `{}` is not registered", request.name);
         };
 
-        let result = handler
-            .call_with_context(ToolCallContext::default(), request)
-            .await;
+        let mut context = ToolCallContext::default();
+        if let Some(sandbox) = self.installed_sandbox() {
+            context = context.with_sandbox(sandbox);
+        }
+        let result = handler.call_with_context(context, request).await;
         match &result {
             Ok(tool_result) => debug!(
                 tool_name = %tool_name,

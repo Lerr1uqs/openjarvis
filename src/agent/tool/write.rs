@@ -40,17 +40,35 @@ impl ToolHandler for WriteTool {
     }
 
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
+        self.call_with_context(super::ToolCallContext::default(), request)
+            .await
+    }
+
+    async fn call_with_context(
+        &self,
+        context: super::ToolCallContext,
+        request: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
         let args: WriteToolArguments = parse_tool_arguments(request, "write")?;
-        if let Some(parent) = Path::new(&args.path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create parent directories for {}", args.path)
-                })?;
+        match context.active_sandbox() {
+            Some(sandbox) => {
+                sandbox
+                    .write_workspace_text(Path::new(&args.path), &args.content)
+                    .with_context(|| format!("failed to write sandbox file {}", args.path))?;
+            }
+            None => {
+                if let Some(parent) = Path::new(&args.path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("failed to create parent directories for {}", args.path)
+                        })?;
+                    }
+                }
+
+                fs::write(&args.path, &args.content)
+                    .with_context(|| format!("failed to write file {}", args.path))?;
             }
         }
-
-        fs::write(&args.path, &args.content)
-            .with_context(|| format!("failed to write file {}", args.path))?;
 
         Ok(ToolCallResult {
             content: format!("wrote {} bytes", args.content.len()),

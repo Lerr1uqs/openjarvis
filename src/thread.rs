@@ -1964,6 +1964,9 @@ impl Thread {
                 if let Some(request_runtime) = self.request_runtime.as_ref() {
                     context = context.with_sessions(request_runtime.sessions.clone());
                 }
+                if let Some(sandbox) = tool_registry.installed_sandbox() {
+                    context = context.with_sandbox(sandbox);
+                }
                 if let Some(handler) = tool_registry.always_visible_handler(&request.name).await {
                     if !self.tool_allowed_by_runtime_state(&request.name) {
                         bail!(

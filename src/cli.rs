@@ -73,6 +73,14 @@ impl OpenJarvisCli {
         }
     }
 
+    /// Return the parsed internal sandbox command when the binary is running in helper mode.
+    pub fn internal_sandbox_command(&self) -> Option<&InternalSandboxCommand> {
+        match &self.command {
+            Some(OpenJarvisCommand::InternalSandbox(arguments)) => Some(&arguments.command),
+            _ => None,
+        }
+    }
+
     /// Return the parsed top-level skill command when present.
     ///
     /// # 示例
@@ -106,6 +114,9 @@ pub enum OpenJarvisCommand {
     /// Internal browser helpers used by local smoke verification and tests.
     #[command(name = "internal-browser", hide = true)]
     InternalBrowser(InternalBrowserArgs),
+    /// Internal sandbox helpers used by the bubblewrap runtime.
+    #[command(name = "internal-sandbox", hide = true)]
+    InternalSandbox(InternalSandboxArgs),
 }
 
 impl OpenJarvisCommand {
@@ -115,6 +126,7 @@ impl OpenJarvisCommand {
             Self::Skill(_) => "skill",
             Self::InternalMcp(_) => "internal-mcp",
             Self::InternalBrowser(_) => "internal-browser",
+            Self::InternalSandbox(_) => "internal-sandbox",
         }
     }
 }
@@ -180,6 +192,13 @@ impl InternalMcpCommand {
 pub struct InternalBrowserArgs {
     #[command(subcommand)]
     pub command: InternalBrowserCommand,
+}
+
+/// Arguments for the hidden `internal-sandbox` helper namespace.
+#[derive(Debug, Clone, Args)]
+pub struct InternalSandboxArgs {
+    #[command(subcommand)]
+    pub command: InternalSandboxCommand,
 }
 
 /// Browser open mode used by hidden browser helpers.
@@ -269,4 +288,22 @@ pub enum InternalBrowserCommand {
     /// Test-only mock sidecar that speaks the same JSON-line protocol as the Node sidecar.
     #[command(name = "mock-sidecar", hide = true)]
     MockSidecar,
+}
+
+/// Demo-only internal sandbox helper commands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum InternalSandboxCommand {
+    /// Run the JSON-RPC proxy used by the bubblewrap sandbox backend.
+    #[command(name = "proxy")]
+    Proxy {
+        /// Host-visible synchronized workspace root mounted into the sandbox.
+        #[arg(long)]
+        workspace_root: PathBuf,
+        /// Restricted host paths that the proxy must refuse to access.
+        #[arg(long = "restricted-host-path")]
+        restricted_host_paths: Vec<PathBuf>,
+        /// Allow JSON-RPC paths to escape above the synchronized workspace root.
+        #[arg(long, default_value_t = false)]
+        allow_parent_access: bool,
+    },
 }
