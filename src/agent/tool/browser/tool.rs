@@ -4,13 +4,14 @@ use super::super::{parse_tool_arguments, tool_definition_from_args};
 use super::{
     default_sidecar_script_path,
     protocol::{
-        BrowserActionResult, BrowserCloseResult, BrowserConsoleEntry, BrowserConsoleLevel,
-        BrowserConsoleResult, BrowserDiagnosticsQuery, BrowserErrorEntry, BrowserErrorKind,
-        BrowserErrorsResult, BrowserNavigateResult, BrowserOpenRequest, BrowserOpenResult,
-        BrowserRequestDiagnosticsQuery, BrowserRequestEntry, BrowserRequestResultKind,
-        BrowserRequestsResult, BrowserScreenshotResult, BrowserSessionMode, BrowserSidecarRequest,
-        BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
-        BrowserSnapshotElement, BrowserSnapshotResult, BrowserTypeResult,
+        BrowserActionResult, BrowserAriaSnapshotResult, BrowserCloseResult, BrowserConsoleEntry,
+        BrowserConsoleLevel, BrowserConsoleResult, BrowserDiagnosticsQuery, BrowserErrorEntry,
+        BrowserErrorKind, BrowserErrorsResult, BrowserNavigateResult, BrowserOpenRequest,
+        BrowserOpenResult, BrowserRequestDiagnosticsQuery, BrowserRequestEntry,
+        BrowserRequestResultKind, BrowserRequestsResult, BrowserScreenshotResult,
+        BrowserSessionMode, BrowserSidecarRequest, BrowserSidecarRequestPayload,
+        BrowserSidecarResponse, BrowserSidecarResponsePayload, BrowserSnapshotElement,
+        BrowserSnapshotResult, BrowserTypeResult,
     },
     service::{BrowserProcessCommandSpec, BrowserRuntimeOptions},
     session::{BrowserSessionCloseOutcome, BrowserSessionManager, BrowserSessionManagerConfig},
@@ -1737,6 +1738,10 @@ async fn run_mock_sidecar() -> Result<()> {
                 request.id,
                 BrowserSidecarResponsePayload::Requests(state.requests(query)),
             ),
+            BrowserSidecarRequestPayload::AriaSnapshot => BrowserSidecarResponse::success(
+                request.id,
+                BrowserSidecarResponsePayload::AriaSnapshot(state.aria_snapshot()),
+            ),
             BrowserSidecarRequestPayload::Snapshot { max_elements } => {
                 BrowserSidecarResponse::success(
                     request.id,
@@ -2015,6 +2020,17 @@ impl MockBrowserState {
             elements: visible_elements,
             total_candidate_count: self.elements.len(),
             truncated: limit < self.elements.len(),
+        }
+    }
+
+    fn aria_snapshot(&self) -> BrowserAriaSnapshotResult {
+        BrowserAriaSnapshotResult {
+            url: self.current_url_or_blank(),
+            title: self.title_or_blank(),
+            aria_snapshot: format!(
+                "- document:\n  - heading \"{}\"\n  - link \"More information\"\n  - textbox \"Search\"",
+                self.title_or_blank()
+            ),
         }
     }
 

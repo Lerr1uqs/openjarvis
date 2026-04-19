@@ -1,9 +1,8 @@
 //! Thread-first aggregate model and atomic thread-owned persistence helpers.
 
 use crate::agent::{
-    FeatureResolver, MemoryRepository, ShellEnv, ToolCallRequest,
-    ToolCallResult, ToolDefinition, ToolRegistry,
-    feature,
+    FeatureResolver, MemoryRepository, ShellEnv, ToolCallRequest, ToolCallResult, ToolDefinition,
+    ToolRegistry, feature,
 };
 use crate::config::{AgentCompactConfig, try_global_config};
 use crate::context::{ChatMessage, ChatMessageRole};
@@ -102,7 +101,6 @@ impl Feature {
             Self::AutoCompact => "auto_compact",
         }
     }
-
 }
 
 /// Stable ordered thread feature set persisted as thread state truth.
@@ -125,11 +123,7 @@ impl Features {
     /// assert!(features.contains(Feature::AutoCompact));
     /// ```
     pub fn all() -> Self {
-        Self::from_iter([
-            Feature::Memory,
-            Feature::Skill,
-            Feature::AutoCompact,
-        ])
+        Self::from_iter([Feature::Memory, Feature::Skill, Feature::AutoCompact])
     }
 
     /// Return whether the target feature is enabled in this set.
@@ -541,7 +535,9 @@ impl ThreadRuntime {
             return persisted_features;
         }
 
-        let resolved = self.feature_resolver.resolve_for_locator(&thread_context.locator);
+        let resolved = self
+            .feature_resolver
+            .resolve_for_locator(&thread_context.locator);
         info!(
             thread_id = %thread_context.locator.thread_id,
             enabled_features = ?resolved.names(),
@@ -655,11 +651,7 @@ impl ThreadRuntime {
             .map(|message| message.created_at);
         if let Some(initialized_at) = existing_system_prefix_at {
             thread_context
-                .mark_initialized_with_state(
-                    initialized_at,
-                    resolved_features,
-                    preloaded_toolsets,
-                )
+                .mark_initialized_with_state(initialized_at, resolved_features, preloaded_toolsets)
                 .await?;
             info!(
                 thread_id = %thread_context.locator.thread_id,
@@ -686,11 +678,10 @@ impl ThreadRuntime {
         }
 
         if thread_context.is_enabled(Feature::Memory)
-            && let Some(prompt) =
-                feature::init::memory::usage(
-                    &thread_context.locator.thread_id,
-                    &self.memory_repository,
-                )?
+            && let Some(prompt) = feature::init::memory::usage(
+                &thread_context.locator.thread_id,
+                &self.memory_repository,
+            )?
         {
             initialized_messages.push(ChatMessage::new(
                 ChatMessageRole::System,

@@ -3,10 +3,11 @@
 use super::{
     default_sidecar_script_path,
     protocol::{
-        BrowserActionResult, BrowserCloseResult, BrowserConsoleResult, BrowserCookiesExportResult,
-        BrowserDiagnosticsQuery, BrowserErrorsResult, BrowserNavigateResult, BrowserOpenRequest,
-        BrowserOpenResult, BrowserRequestDiagnosticsQuery, BrowserRequestsResult,
-        BrowserScreenshotResult, BrowserSessionMode, BrowserSnapshotResult, BrowserTypeResult,
+        BrowserActionResult, BrowserAriaSnapshotResult, BrowserCloseResult, BrowserConsoleResult,
+        BrowserCookiesExportResult, BrowserDiagnosticsQuery, BrowserErrorsResult,
+        BrowserNavigateResult, BrowserOpenRequest, BrowserOpenResult,
+        BrowserRequestDiagnosticsQuery, BrowserRequestsResult, BrowserScreenshotResult,
+        BrowserSessionMode, BrowserSnapshotResult, BrowserTypeResult,
     },
     service::{
         BrowserProcessCommandSpec, BrowserRuntimeOptions, BrowserSidecarService,
@@ -193,6 +194,13 @@ impl BrowserSessionManager {
         let session = self.session_for_thread(thread_id).await?;
         let mut session = session.lock().await;
         session.service.snapshot(max_elements).await
+    }
+
+    /// Capture one ARIA snapshot for the current page in the target thread.
+    pub async fn aria_snapshot(&self, thread_id: &str) -> Result<BrowserAriaSnapshotResult> {
+        let session = self.session_for_thread(thread_id).await?;
+        let mut session = session.lock().await;
+        session.service.aria_snapshot().await
     }
 
     /// Click one prior snapshot ref inside the target thread.

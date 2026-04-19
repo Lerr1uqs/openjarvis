@@ -14,6 +14,15 @@
 - **THEN** 系统会在释放当前 session 前把 cookies 导出到该显式状态文件
 - **THEN** 返回给调用方的关闭结果可以明确这是一次已执行自动导出的 close
 
+### Requirement: 工作区内的 browser cookies 状态文件 SHOULD 统一放在 `.openjarvis/browser/`
+当项目内的 helper、脚本、手工验证流程或推荐配置需要给 browser cookies 状态文件选择一个工作区路径时，系统约定 SHOULD 优先使用 `.openjarvis/browser/` 作为统一根目录，而不是把 cookies JSON 分散在仓库根目录、 `tmp/` 或观测产物目录中。该目录 SHOULD 被 gitignore，以避免包含登录态的状态文件被误提交。
+
+#### Scenario: helper 与手工验证脚本使用工作区统一目录
+- **WHEN** 项目内新增一个 browser helper 或手工验证脚本需要持久化 cookies
+- **THEN** 默认示例路径会落在 `.openjarvis/browser/` 的某个子目录下
+- **THEN** 文档会明确该目录当前承载的是 cookies-only 状态文件，而不是完整 storage state
+- **THEN** 对应目录会被 gitignore
+
 ### Requirement: 自动注入缺少状态文件时 SHALL 不阻塞首次 launch
 当配置文件开启 cookies 自动注入，但目标状态文件尚不存在时，系统 SHALL 继续创建当前 launch session，而 SHALL NOT 因为“第一次还没有 cookies 文件”直接让 `browser__open` 或默认 launch 初始化失败。首次会话后续若成功登录并执行 close，系统 SHALL 可以按自动导出配置写出该文件，供下一次 launch 复用。
 
@@ -39,3 +48,11 @@
 - **THEN** 系统会把当前 session cookies 写入调用方指定的状态文件
 - **THEN** 返回结果中包含导出文件路径和导出数量
 - **THEN** 该状态文件在 session 关闭后仍然保留，可供后续 launch 自动注入
+
+### Requirement: 首版 cookies 状态文件 SHALL NOT 被描述为完整 storage state
+首版持久化能力导出的状态文件 SHALL 只承诺包含 cookies，而 SHALL NOT 被描述为已经覆盖 localStorage、sessionStorage 或 IndexedDB。系统文档与 helper 说明需要明确这是 cookies-only 的状态文件，避免调用方误以为任意站点都能只靠该文件完整恢复登录态。
+
+#### Scenario: 文档区分 cookies 与其他浏览器存储
+- **WHEN** 调用方查看 browser cookies 持久化相关说明
+- **THEN** 说明中会明确 cookies 与 localStorage、sessionStorage、IndexedDB 不同
+- **THEN** 说明中会明确首版状态文件只覆盖 cookies

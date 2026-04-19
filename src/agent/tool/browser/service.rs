@@ -1,10 +1,10 @@
 //! Sidecar process management and JSON-line transport for browser automation.
 
 use super::protocol::{
-    BrowserActionResult, BrowserCloseResult, BrowserConsoleResult, BrowserCookiesExportResult,
-    BrowserDiagnosticsQuery, BrowserErrorsResult, BrowserNavigateResult, BrowserOpenRequest,
-    BrowserOpenResult, BrowserRequestDiagnosticsQuery, BrowserRequestsResult,
-    BrowserScreenshotResult, BrowserSessionMode, BrowserSidecarRequest,
+    BrowserActionResult, BrowserAriaSnapshotResult, BrowserCloseResult, BrowserConsoleResult,
+    BrowserCookiesExportResult, BrowserDiagnosticsQuery, BrowserErrorsResult,
+    BrowserNavigateResult, BrowserOpenRequest, BrowserOpenResult, BrowserRequestDiagnosticsQuery,
+    BrowserRequestsResult, BrowserScreenshotResult, BrowserSessionMode, BrowserSidecarRequest,
     BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
     BrowserSnapshotResult, BrowserTypeResult,
 };
@@ -316,6 +316,21 @@ impl BrowserSidecarService {
             }
             other => bail!(
                 "browser sidecar returned `{}` for requests",
+                response_action_name(&other)
+            ),
+        }
+    }
+
+    /// Capture the current page accessibility tree as one ARIA snapshot.
+    pub async fn aria_snapshot(&mut self) -> Result<BrowserAriaSnapshotResult> {
+        self.ensure_opened_with_default_launch().await?;
+        match self
+            .call(BrowserSidecarRequestPayload::AriaSnapshot)
+            .await?
+        {
+            BrowserSidecarResponsePayload::AriaSnapshot(result) => Ok(result),
+            other => bail!(
+                "browser sidecar returned `{}` for aria_snapshot",
                 response_action_name(&other)
             ),
         }
@@ -662,6 +677,7 @@ fn response_action_name(payload: &BrowserSidecarResponsePayload) -> &'static str
         BrowserSidecarResponsePayload::Console(_) => "console",
         BrowserSidecarResponsePayload::Errors(_) => "errors",
         BrowserSidecarResponsePayload::Requests(_) => "requests",
+        BrowserSidecarResponsePayload::AriaSnapshot(_) => "aria_snapshot",
         BrowserSidecarResponsePayload::Snapshot(_) => "snapshot",
         BrowserSidecarResponsePayload::ClickRef(_) => "click_ref",
         BrowserSidecarResponsePayload::TypeRef(_) => "type_ref",
@@ -678,6 +694,7 @@ fn request_action_name(payload: &BrowserSidecarRequestPayload) -> &'static str {
         BrowserSidecarRequestPayload::Console(_) => "console",
         BrowserSidecarRequestPayload::Errors(_) => "errors",
         BrowserSidecarRequestPayload::Requests(_) => "requests",
+        BrowserSidecarRequestPayload::AriaSnapshot => "aria_snapshot",
         BrowserSidecarRequestPayload::Snapshot { .. } => "snapshot",
         BrowserSidecarRequestPayload::ClickRef { .. } => "click_ref",
         BrowserSidecarRequestPayload::TypeRef { .. } => "type_ref",

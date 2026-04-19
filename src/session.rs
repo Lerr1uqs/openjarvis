@@ -506,7 +506,9 @@ impl SessionManager {
         };
 
         let mut thread_context = handle.lock().await;
-        thread_runtime.initialize_thread(&mut thread_context).await?;
+        thread_runtime
+            .initialize_thread(&mut thread_context)
+            .await?;
         Ok(())
     }
 }

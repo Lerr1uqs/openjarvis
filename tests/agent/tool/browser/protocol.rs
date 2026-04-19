@@ -1,6 +1,6 @@
 use openjarvis::agent::tool::browser::{
-    BrowserCloseResult, BrowserConsoleEntry, BrowserConsoleLevel, BrowserConsoleResult,
-    BrowserOpenRequest, BrowserRequestDiagnosticsQuery, BrowserRequestEntry,
+    BrowserAriaSnapshotResult, BrowserCloseResult, BrowserConsoleEntry, BrowserConsoleLevel,
+    BrowserConsoleResult, BrowserOpenRequest, BrowserRequestDiagnosticsQuery, BrowserRequestEntry,
     BrowserRequestResultKind, BrowserRequestsResult, BrowserSessionMode, BrowserSidecarRequest,
     BrowserSidecarRequestPayload, BrowserSidecarResponse, BrowserSidecarResponsePayload,
     BrowserSnapshotElement, BrowserSnapshotResult,
@@ -50,6 +50,24 @@ fn browser_protocol_round_trips_open_request() {
         }
         other => panic!("unexpected request payload: {other:?}"),
     }
+}
+
+#[test]
+fn browser_protocol_round_trips_aria_snapshot_request() {
+    // 验证 ARIA snapshot 请求可以完整编解码。
+    let encoded = serde_json::to_string(&BrowserSidecarRequest::new(
+        "req-aria",
+        BrowserSidecarRequestPayload::AriaSnapshot,
+    ))
+    .expect("aria snapshot request should serialize");
+    let decoded: BrowserSidecarRequest =
+        serde_json::from_str(&encoded).expect("aria snapshot request should deserialize");
+
+    assert_eq!(decoded.id, "req-aria");
+    assert!(matches!(
+        decoded.payload,
+        BrowserSidecarRequestPayload::AriaSnapshot
+    ));
 }
 
 #[test]
@@ -180,6 +198,31 @@ fn browser_protocol_round_trips_requests_response_payload() {
                 result.entries[0].result,
                 BrowserRequestResultKind::HttpError
             );
+        }
+        other => panic!("unexpected response payload: {other:?}"),
+    }
+}
+
+#[test]
+fn browser_protocol_round_trips_aria_snapshot_response_payload() {
+    // 验证 ARIA snapshot 结果中的文本负载不会在协议编解码时丢失。
+    let encoded = serde_json::to_string(&BrowserSidecarResponse::success(
+        "req-aria-result",
+        BrowserSidecarResponsePayload::AriaSnapshot(BrowserAriaSnapshotResult {
+            url: "https://example.com".to_string(),
+            title: "Example Domain".to_string(),
+            aria_snapshot: "- document:\n  - heading \"Example Domain\"".to_string(),
+        }),
+    ))
+    .expect("aria snapshot response should serialize");
+    let decoded: BrowserSidecarResponse =
+        serde_json::from_str(&encoded).expect("aria snapshot response should deserialize");
+
+    assert!(decoded.ok);
+    match decoded.result.expect("result should exist") {
+        BrowserSidecarResponsePayload::AriaSnapshot(snapshot) => {
+            assert_eq!(snapshot.url, "https://example.com");
+            assert!(snapshot.aria_snapshot.contains("heading"));
         }
         other => panic!("unexpected response payload: {other:?}"),
     }

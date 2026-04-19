@@ -131,6 +131,26 @@ async fn browser_session_manager_exports_cookies_and_reports_auto_export_on_clos
 }
 
 #[tokio::test]
+async fn browser_session_manager_exposes_aria_snapshot_for_current_page() {
+    // 测试场景: session manager 需要让 Rust 侧脚本直接获取当前页面的 ARIA snapshot。
+    let fixture = BrowserFixture::new("openjarvis-browser-session-aria");
+    let manager = BrowserSessionManager::new(fixture.manager_config(true));
+
+    let navigate = manager
+        .navigate("thread-aria", "https://example.com")
+        .await
+        .expect("navigate should succeed");
+    let aria_snapshot = manager
+        .aria_snapshot("thread-aria")
+        .await
+        .expect("aria snapshot should succeed");
+
+    assert_eq!(aria_snapshot.url, navigate.url);
+    assert_eq!(aria_snapshot.title, navigate.title);
+    assert!(aria_snapshot.aria_snapshot.contains("document"));
+}
+
+#[tokio::test]
 async fn browser_session_manager_returns_recent_diagnostics_without_reopening_session() {
     // 测试场景: 诊断查询应复用当前 session，并在 close 后返回空结果而不是重建新会话。
     let fixture = BrowserFixture::new("openjarvis-browser-session-diagnostics");

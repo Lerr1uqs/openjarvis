@@ -19,6 +19,7 @@
 - 为 browser runtime 提供配置文件驱动的 cookies 状态复用能力，支持显式状态文件路径、open 自动注入和 close 自动导出。
 - 提供一个显式 Command / helper，让用户可以把当前 session cookies 手动导出落盘。
 - 为 browser toolset 提供统一的 `browser__open(mode=launch|attach, ...)` 会话入口。
+- 为工作区内的 browser 持久化状态文件提供统一目录约定，减少状态文件散落和误提交风险；首版实际落盘的是 cookies-only 文件。
 - 保持当前线程级 session 模型不变，不引入新的顶层浏览器子系统。
 
 **Non-Goals:**
@@ -33,7 +34,7 @@
 
 ### 1. 用户状态复用首版只做 cookies 状态文件，不做 profile 目录复用
 
-要解决“避免重复登录”，边界最清晰的方案仍然不是复用整个浏览器 profile，而是把当前会话 cookies 写入显式状态文件，再在后续 launch 会话中重新加载。这样可以继续维持首版关于独立 `user-data-dir` 的安全约束，同时给浏览器状态一个可审计、可复制、可清理的载体。
+要解决“避免重复登录”，边界最清晰的方案仍然不是复用整个浏览器 profile，而是把当前会话 cookies 写入显式状态文件，再在后续 launch 会话中重新加载。这样可以继续维持首版关于独立 `user-data-dir` 的安全约束，同时给浏览器持久化状态一个可审计、可复制、可清理的载体。
 
 这次设计仍然把 cookies 作为显式文件来管理，而不是把“复用登录态”等同于“复用整个 profile 目录”。
 
@@ -61,6 +62,21 @@ Alternative considered:
 
 - 继续暴露 `browser__export_cookies` / `browser__load_cookies` 两个 browser 工具。
   Rejected，因为 cookies 持久化更像 browser runtime policy 和显式用户命令，而不是每轮 agent 都需要看到的常驻浏览器动作工具。
+
+### 2.5 browser 持久化状态文件的工作区约定统一放在 `.openjarvis/browser/`
+
+虽然 cookies 状态文件仍然由显式路径控制，但项目层面最好避免每个 helper、脚本或手工验证把状态文件随意散落在 `tmp/`、 `observation/` 或仓库根目录。这里说的“browser 持久化状态文件”，首版实际指的就是 cookies 文件，而不是完整 storage state。更稳妥的约定是：
+
+- 工作区内需要长期保留的 browser 持久化状态文件统一放在 `.openjarvis/browser/`
+- 具体脚本或场景可以在该目录下再分子目录
+- `.openjarvis/browser/` 默认加入 gitignore，避免登录态 cookies 被误提交
+
+这条约定不改变“显式配置路径优先”的事实；它只是给项目内的默认实践提供一个统一落点。
+
+Alternative considered:
+
+- 继续让每个 helper 或脚本自行决定状态文件目录。
+  Rejected，因为这会让状态文件分布不可预测，也更容易把含登录态的 JSON 文件提交进版本库。
 
 ### 3. attach 与 launch 统一收敛到 `browser__open`
 
@@ -114,7 +130,8 @@ Alternative considered:
 
 ## Risks / Trade-offs
 
-- [cookies 只覆盖 HTTP cookie，不覆盖更完整的站点状态] -> 首版在 spec 中明确只承诺 cookies，避免把能力说大；后续确有需要再独立扩到 storage state。
+- [cookies 只覆盖 HTTP cookie，不覆盖更完整的站点状态] -> 首版在 spec 中明确 `.openjarvis/browser/` 下当前落盘的是 cookies-only 文件，避免把能力说大；后续确有需要再独立扩到 storage state。
+- [仅复用 cookies 可能不足以恢复某些站点的完整登录态] -> localStorage、sessionStorage、IndexedDB 仍然不在本次范围内；如果后续发现关键站点依赖这些状态，需要独立扩展到完整 storage state。
 - [attach 到外部浏览器后页面/标签页状态不可控] -> 要求 `browser__open(mode=attach, ...)` 返回当前接管页面的信息，并让后续 snapshot 重新建立观察基线。
 - [错误的 cookies 文件可能导致 launch 初始化失败或登录态异常] -> 缺少文件时允许首次 launch 正常继续；格式非法或内容损坏时需要显式报错，而不是静默忽略。
 - [attach endpoint 不可达时容易让实现偷回退到 launch 模式] -> spec 明确禁止静默回退，连接失败必须直接报错。
@@ -127,6 +144,7 @@ Alternative considered:
 3. 在 Rust `service/session/tool` 层补齐 `browser__open`、默认 lazy open 等价路径、attach/launch 替换逻辑和 close 结果表达。
 4. 在 `command` / hidden helper / script 验证路径中补齐手动 cookies 导出和 open 参数化验证入口。
 5. 补齐单元测试与真实链路 smoke，覆盖自动 cookies 复用和 attach 到已有 endpoint 两条主路径。
+6. 把工作区内的 helper / 手工验证脚本所用 cookies 状态文件收敛到 `.openjarvis/browser/`，并通过 gitignore 避免泄漏本地登录态。
 
 Rollback strategy:
 

@@ -37,6 +37,27 @@ async fn browser_sidecar_service_executes_mock_flow_and_writes_screenshot() {
 }
 
 #[tokio::test]
+async fn browser_sidecar_service_returns_mock_aria_snapshot() {
+    // 验证 mock sidecar 可以返回页面的 ARIA snapshot 文本。
+    let fixture = BrowserFixture::new("openjarvis-browser-service-aria-snapshot");
+    let mut service = BrowserSidecarService::new(fixture.service_config(true));
+
+    let navigate = service
+        .navigate("https://example.com")
+        .await
+        .expect("navigate should succeed");
+    let aria_snapshot = service
+        .aria_snapshot()
+        .await
+        .expect("aria_snapshot should succeed");
+
+    assert_eq!(navigate.url, aria_snapshot.url);
+    assert_eq!(navigate.title, aria_snapshot.title);
+    assert!(aria_snapshot.aria_snapshot.contains("document"));
+    assert!(aria_snapshot.aria_snapshot.contains("Search"));
+}
+
+#[tokio::test]
 async fn browser_sidecar_service_queries_recent_diagnostics_and_filters_failed_requests() {
     // 测试场景: service 应能查询 console/errors/requests，并支持 failed_only 过滤。
     let fixture = BrowserFixture::new("openjarvis-browser-service-diagnostics");

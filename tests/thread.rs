@@ -198,11 +198,21 @@ async fn compact_source_messages_exclude_stable_system_prefix() {
     // 测试场景: runtime compact 只能消费非 system 正式消息，稳定前缀不能进入 compact source。
     let now = Utc::now();
     let mut thread = Thread::new(
-        ThreadContextLocator::new(None, "feishu", "ou_thread", "thread_compact", "thread_compact"),
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_thread",
+            "thread_compact",
+            "thread_compact",
+        ),
         now,
     );
     thread
-        .push_message(ChatMessage::new(ChatMessageRole::System, "system prompt", now))
+        .push_message(ChatMessage::new(
+            ChatMessageRole::System,
+            "system prompt",
+            now,
+        ))
         .await
         .expect("system prompt should persist");
     thread

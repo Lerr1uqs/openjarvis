@@ -154,6 +154,7 @@ pub enum BrowserSidecarRequestPayload {
     Console(BrowserDiagnosticsQuery),
     Errors(BrowserDiagnosticsQuery),
     Requests(BrowserRequestDiagnosticsQuery),
+    AriaSnapshot,
     Snapshot {
         max_elements: Option<usize>,
     },
@@ -198,7 +199,12 @@ impl BrowserSidecarResponse {
     ///
     /// let response = BrowserSidecarResponse::success(
     ///     "req-1",
-    ///     BrowserSidecarResponsePayload::Close(BrowserCloseResult { closed: true }),
+    ///     BrowserSidecarResponsePayload::Close(BrowserCloseResult {
+    ///         closed: true,
+    ///         mode: None,
+    ///         exported_cookies_path: None,
+    ///         exported_cookie_count: None,
+    ///     }),
     /// );
     /// assert!(response.ok);
     /// ```
@@ -243,6 +249,7 @@ pub enum BrowserSidecarResponsePayload {
     Console(BrowserConsoleResult),
     Errors(BrowserErrorsResult),
     Requests(BrowserRequestsResult),
+    AriaSnapshot(BrowserAriaSnapshotResult),
     Snapshot(BrowserSnapshotResult),
     ClickRef(BrowserActionResult),
     TypeRef(BrowserTypeResult),
@@ -399,6 +406,14 @@ pub struct BrowserSnapshotResult {
     pub elements: Vec<BrowserSnapshotElement>,
     pub total_candidate_count: usize,
     pub truncated: bool,
+}
+
+/// Result returned after a successful `aria_snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserAriaSnapshotResult {
+    pub url: String,
+    pub title: String,
+    pub aria_snapshot: String,
 }
 
 /// One interactable element listed inside a browser snapshot.

@@ -10,11 +10,7 @@ use openjarvis::{
     thread::{Feature, Features, Thread, ThreadContextLocator, ThreadRuntime},
 };
 use serde_json::json;
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 struct FeatureRuntimeFixture {
@@ -181,7 +177,10 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
         })
         .expect("active memory fixture should be written");
 
-    let compact_config = compact_enabled_config().agent_config().compact_config().clone();
+    let compact_config = compact_enabled_config()
+        .agent_config()
+        .compact_config()
+        .clone();
     let resolver = FeatureResolver::development_default(Features::from_iter([
         Feature::Memory,
         Feature::Skill,
@@ -212,11 +211,19 @@ async fn thread_runtime_initializes_ordered_feature_prefix() {
     let messages = thread.messages();
     let environment_index = messages
         .iter()
-        .position(|message| message.content.contains("Runtime environment for this thread"))
+        .position(|message| {
+            message
+                .content
+                .contains("Runtime environment for this thread")
+        })
         .expect("environment perception prompt should exist");
     let memory_index = messages
         .iter()
-        .position(|message| message.content.contains("notion, workflow -> workflow/notion.md"))
+        .position(|message| {
+            message
+                .content
+                .contains("notion, workflow -> workflow/notion.md")
+        })
         .expect("memory prompt should exist");
     let skill_index = messages
         .iter()
@@ -316,7 +323,10 @@ async fn thread_runtime_persists_features_and_preserves_them_across_restore() {
     manager_b.install_thread_runtime(build_thread_runtime(
         Arc::clone(&registry),
         "worker system prompt changed",
-        compact_enabled_config().agent_config().compact_config().clone(),
+        compact_enabled_config()
+            .agent_config()
+            .compact_config()
+            .clone(),
         FeatureResolver::development_default(Features::from_iter([Feature::Skill])),
     ));
     let restored = manager_b
