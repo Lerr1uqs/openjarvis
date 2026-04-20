@@ -14,7 +14,11 @@ use tracing_subscriber::EnvFilter;
 
 pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
 pub const DEFAULT_OBSWIKI_VAULT_RELATIVE_PATH: &str = ".openjarvis/obswiki";
+pub const DEFAULT_MEMORY_HYBRID_BASE_URL: &str = "https://api.siliconflow.cn/v1";
+pub const DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL: &str = "BAAI/bge-large-zh-v1.5";
+pub const DEFAULT_MEMORY_HYBRID_RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
 const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
+const EXTERNAL_MEMORY_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/memory.yaml";
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1_024;
 const KIMI_K2_5_CONTEXT_WINDOW_TOKENS: usize = 262_144;
@@ -181,6 +185,7 @@ impl AppConfig {
 
         config.resolve_paths(path);
         config.load_external_mcp_sidecar(path)?;
+        config.load_external_memory_sidecar(path)?;
         config
             .validate()
             .with_context(|| format!("failed to validate config file {}", path.display()))?;
@@ -382,6 +387,41 @@ impl AppConfig {
                 .upsert_server(server_name, server_config);
         }
 
+        Ok(())
+    }
+
+    fn load_external_memory_sidecar(&mut self, config_path: &Path) -> Result<()> {
+        let memory_config_path = resolve_external_memory_config_path(config_path);
+        if !memory_config_path.exists() {
+            info!(
+                memory_config_path = %memory_config_path.display(),
+                "memory sidecar config not found, continuing with inline/default memory search config"
+            );
+            return Ok(());
+        }
+
+        let raw = fs::read_to_string(&memory_config_path).with_context(|| {
+            format!(
+                "failed to read memory config file {}",
+                memory_config_path.display()
+            )
+        })?;
+        let external_config =
+            serde_yaml::from_str::<ExternalMemoryYamlConfig>(&raw).with_context(|| {
+                format!(
+                    "failed to parse memory config file {}",
+                    memory_config_path.display()
+                )
+            })?;
+        self.agent.tool.memory.merge_external(external_config);
+        self.agent.tool.memory.resolve_paths(config_path);
+        info!(
+            memory_config_path = %memory_config_path.display(),
+            mode = ?self.agent.tool.memory.search.mode(),
+            embedding_model = %self.agent.tool.memory.search.hybrid.embedding_model(),
+            rerank_model = %self.agent.tool.memory.search.hybrid.rerank_model(),
+            "loaded external memory sidecar config"
+        );
         Ok(())
     }
 }
@@ -1203,6 +1243,7 @@ impl AgentCompactConfig {
 pub struct AgentToolConfig {
     mcp: AgentMcpConfig,
     browser: AgentBrowserToolConfig,
+    memory: AgentMemoryToolConfig,
     obswiki: AgentObswikiToolConfig,
 }
 
@@ -1233,6 +1274,22 @@ impl AgentToolConfig {
         &self.browser
     }
 
+    /// Return the configured `memory` runtime subsection.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::{AppConfig, MemorySearchMode};
+    ///
+    /// let config = AppConfig::default();
+    /// assert_eq!(
+    ///     config.agent_config().tool_config().memory_config().search_config().mode(),
+    ///     MemorySearchMode::Lexical
+    /// );
+    /// ```
+    pub fn memory_config(&self) -> &AgentMemoryToolConfig {
+        &self.memory
+    }
+
     /// Return the configured `obswiki` runtime subsection.
     ///
     /// # 示例
@@ -1249,12 +1306,279 @@ impl AgentToolConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         self.mcp.validate()?;
         self.browser.validate()?;
+        self.memory.validate()?;
         self.obswiki.validate()
     }
 
     fn resolve_paths(&mut self, config_path: &Path) {
         self.browser.resolve_paths(config_path);
+        self.memory.resolve_paths(config_path);
         self.obswiki.resolve_paths(config_path);
+    }
+}
+
+/// Memory tool runtime configuration loaded from `agent.tool.memory`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::AppConfig;
+///
+/// let config = AppConfig::default();
+/// assert_eq!(
+///     config.agent_config().tool_config().memory_config().search_config().hybrid_config().bm25_top_n(),
+///     30
+/// );
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentMemoryToolConfig {
+    search: AgentMemorySearchConfig,
+}
+
+impl AgentMemoryToolConfig {
+    /// Return the configured memory search subsection.
+    pub fn search_config(&self) -> &AgentMemorySearchConfig {
+        &self.search
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.search.validate()
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        self.search.resolve_paths(config_path);
+    }
+
+    fn merge_external(&mut self, external: ExternalMemoryYamlConfig) {
+        if let Some(search) = external.search {
+            self.search.merge_external(search);
+        }
+    }
+}
+
+/// Search mode selector for the `memory_search` tool.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemorySearchMode {
+    #[default]
+    Lexical,
+    Hybrid,
+}
+
+/// Memory search runtime configuration loaded from `agent.tool.memory.search`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::{AgentMemorySearchConfig, MemorySearchMode};
+///
+/// let config = AgentMemorySearchConfig::default();
+/// assert_eq!(config.mode(), MemorySearchMode::Lexical);
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentMemorySearchConfig {
+    mode: MemorySearchMode,
+    hybrid: AgentMemoryHybridSearchConfig,
+}
+
+impl AgentMemorySearchConfig {
+    /// Return the configured memory search mode.
+    pub fn mode(&self) -> MemorySearchMode {
+        self.mode
+    }
+
+    /// Return the hybrid-search subsection used when `mode=hybrid`.
+    pub fn hybrid_config(&self) -> &AgentMemoryHybridSearchConfig {
+        &self.hybrid
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.hybrid.validate()
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        self.hybrid.resolve_paths(config_path);
+    }
+
+    fn merge_external(&mut self, external: ExternalMemorySearchSidecarConfig) {
+        if let Some(mode) = external.mode {
+            self.mode = mode;
+        }
+        if let Some(hybrid) = external.hybrid {
+            self.hybrid.merge_external(hybrid);
+        }
+    }
+}
+
+/// Hybrid memory retrieval configuration loaded from `agent.tool.memory.search.hybrid`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::{
+///     AgentMemoryHybridSearchConfig, DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL,
+///     DEFAULT_MEMORY_HYBRID_RERANK_MODEL,
+/// };
+///
+/// let config = AgentMemoryHybridSearchConfig::default();
+/// assert_eq!(config.embedding_model(), DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL);
+/// assert_eq!(config.rerank_model(), DEFAULT_MEMORY_HYBRID_RERANK_MODEL);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentMemoryHybridSearchConfig {
+    base_url: String,
+    api_key_path: PathBuf,
+    embedding_model: String,
+    rerank_model: String,
+    bm25_top_n: usize,
+    dense_top_n: usize,
+    rerank_top_n: usize,
+    rrf_k: usize,
+    mmr_lambda: f64,
+    freshness_half_life_days: u64,
+}
+
+impl Default for AgentMemoryHybridSearchConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_MEMORY_HYBRID_BASE_URL.to_string(),
+            api_key_path: PathBuf::from("~/.siliconflow.apikey"),
+            embedding_model: DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL.to_string(),
+            rerank_model: DEFAULT_MEMORY_HYBRID_RERANK_MODEL.to_string(),
+            bm25_top_n: 30,
+            dense_top_n: 30,
+            rerank_top_n: 20,
+            rrf_k: 60,
+            mmr_lambda: 0.7,
+            freshness_half_life_days: 30,
+        }
+    }
+}
+
+impl AgentMemoryHybridSearchConfig {
+    /// Return the configured SiliconFlow-compatible API base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Return the configured API key file path.
+    pub fn api_key_path(&self) -> &Path {
+        &self.api_key_path
+    }
+
+    /// Return the embedding model identifier.
+    pub fn embedding_model(&self) -> &str {
+        &self.embedding_model
+    }
+
+    /// Return the rerank model identifier.
+    pub fn rerank_model(&self) -> &str {
+        &self.rerank_model
+    }
+
+    /// Return the BM25 candidate cutoff.
+    pub fn bm25_top_n(&self) -> usize {
+        self.bm25_top_n
+    }
+
+    /// Return the dense-recall candidate cutoff.
+    pub fn dense_top_n(&self) -> usize {
+        self.dense_top_n
+    }
+
+    /// Return the fused candidate cutoff before rerank.
+    pub fn rerank_top_n(&self) -> usize {
+        self.rerank_top_n
+    }
+
+    /// Return the RRF `k` parameter.
+    pub fn rrf_k(&self) -> usize {
+        self.rrf_k
+    }
+
+    /// Return the MMR relevance/diversity balance factor.
+    pub fn mmr_lambda(&self) -> f64 {
+        self.mmr_lambda
+    }
+
+    /// Return the freshness half-life in days.
+    pub fn freshness_half_life_days(&self) -> u64 {
+        self.freshness_half_life_days
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.base_url.trim().is_empty() {
+            bail!("agent.tool.memory.search.hybrid.base_url must not be blank");
+        }
+        if self.api_key_path.as_os_str().is_empty() {
+            bail!("agent.tool.memory.search.hybrid.api_key_path must not be blank");
+        }
+        if self.bm25_top_n == 0 {
+            bail!("agent.tool.memory.search.hybrid.bm25_top_n must be greater than 0");
+        }
+        if self.dense_top_n == 0 {
+            bail!("agent.tool.memory.search.hybrid.dense_top_n must be greater than 0");
+        }
+        if self.rerank_top_n == 0 {
+            bail!("agent.tool.memory.search.hybrid.rerank_top_n must be greater than 0");
+        }
+        if self.rrf_k == 0 {
+            bail!("agent.tool.memory.search.hybrid.rrf_k must be greater than 0");
+        }
+        if !(0.0..=1.0).contains(&self.mmr_lambda) {
+            bail!("agent.tool.memory.search.hybrid.mmr_lambda must be within [0.0, 1.0]");
+        }
+        if self.freshness_half_life_days == 0 {
+            bail!(
+                "agent.tool.memory.search.hybrid.freshness_half_life_days must be greater than 0"
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        if self.api_key_path.as_os_str().is_empty()
+            || self.api_key_path.is_absolute()
+            || path_uses_home_prefix(&self.api_key_path)
+        {
+            return;
+        }
+
+        let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        self.api_key_path = config_root.join(&self.api_key_path);
+    }
+
+    fn merge_external(&mut self, external: ExternalMemoryHybridSearchSidecarConfig) {
+        if let Some(base_url) = external.base_url {
+            self.base_url = base_url;
+        }
+        if let Some(api_key_path) = external.api_key_path {
+            self.api_key_path = api_key_path;
+        }
+        if let Some(embedding_model) = external.embedding_model {
+            self.embedding_model = embedding_model;
+        }
+        if let Some(rerank_model) = external.rerank_model {
+            self.rerank_model = rerank_model;
+        }
+        if let Some(bm25_top_n) = external.bm25_top_n {
+            self.bm25_top_n = bm25_top_n;
+        }
+        if let Some(dense_top_n) = external.dense_top_n {
+            self.dense_top_n = dense_top_n;
+        }
+        if let Some(rerank_top_n) = external.rerank_top_n {
+            self.rerank_top_n = rerank_top_n;
+        }
+        if let Some(rrf_k) = external.rrf_k {
+            self.rrf_k = rrf_k;
+        }
+        if let Some(mmr_lambda) = external.mmr_lambda {
+            self.mmr_lambda = mmr_lambda;
+        }
+        if let Some(freshness_half_life_days) = external.freshness_half_life_days {
+            self.freshness_half_life_days = freshness_half_life_days;
+        }
     }
 }
 
@@ -1587,6 +1911,34 @@ impl ExternalMcpJsonConfig {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExternalMemoryYamlConfig {
+    search: Option<ExternalMemorySearchSidecarConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExternalMemorySearchSidecarConfig {
+    mode: Option<MemorySearchMode>,
+    hybrid: Option<ExternalMemoryHybridSearchSidecarConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExternalMemoryHybridSearchSidecarConfig {
+    base_url: Option<String>,
+    api_key_path: Option<PathBuf>,
+    embedding_model: Option<String>,
+    rerank_model: Option<String>,
+    bm25_top_n: Option<usize>,
+    dense_top_n: Option<usize>,
+    rerank_top_n: Option<usize>,
+    rrf_k: Option<usize>,
+    mmr_lambda: Option<f64>,
+    freshness_half_life_days: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct ExternalMcpJsonServerConfig {
@@ -1812,6 +2164,16 @@ fn push_command<'a>(
 fn resolve_external_mcp_config_path(config_path: &Path) -> PathBuf {
     let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
     config_root.join(EXTERNAL_MCP_CONFIG_RELATIVE_PATH)
+}
+
+fn resolve_external_memory_config_path(config_path: &Path) -> PathBuf {
+    let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+    config_root.join(EXTERNAL_MEMORY_CONFIG_RELATIVE_PATH)
+}
+
+fn path_uses_home_prefix(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\")
 }
 
 fn default_deserialized_llm_protocol() -> String {

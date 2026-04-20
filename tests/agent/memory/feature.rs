@@ -1,17 +1,21 @@
-use super::super::support::ThreadTestExt;
-use super::MemoryWorkspaceFixture;
+use super::{
+    HybridMockServer, MemoryWorkspaceFixture, build_config_from_yaml, hybrid_config_yaml,
+    install_fixture_as_cwd, seed_hybrid_memory_corpus,
+};
+use crate::support::{TestTopicQueue, ThreadTestExt};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
     agent::{
-        AgentRequest, AgentRuntime, AgentWorker, AgentWorkerEvent, HookRegistry, ToolRegistry,
+        AgentRuntime, AgentWorker, AgentWorkerEvent, HookRegistry, ToolRegistry,
     },
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall},
     model::{IncomingMessage, ReplyTarget},
-    session::{SessionKey, SessionManager, ThreadLocator},
-    thread::Thread,
+    queue::{TopicQueue, TopicQueuePayload},
+    session::{SessionManager, ThreadLocator},
+    thread::ThreadAgentKind,
 };
 use serde_json::json;
 use std::{collections::VecDeque, sync::Arc};
@@ -91,6 +95,8 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
     // 测试场景: 用户触发 active memory 写入后，记忆要落盘；当前线程不热更新 catalog，清空重初始化后才把 grouped keywords->path 注入 system prompt。
     let sessions = SessionManager::new();
     let fixture = MemoryWorkspaceFixture::new("openjarvis-memory-feature-worker");
+    let writer_queue = Arc::new(TestTopicQueue::default());
+    let reader_queue = Arc::new(TestTopicQueue::default());
     let registry = Arc::new(ToolRegistry::with_workspace_root_and_skill_roots(
         fixture.root(),
         Vec::new(),
@@ -140,27 +146,30 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         ])),
         runtime.clone(),
     );
-    let mut writer_handle = writer_worker.spawn();
+    let thread_runtime = writer_worker.thread_runtime();
+    sessions.install_thread_runtime(Arc::clone(&thread_runtime));
+    let mut writer_handle = writer_worker.spawn(writer_queue.clone());
 
     let remember_incoming = build_incoming("请记住 notion 上传工作流");
-    let locator = build_locator(&remember_incoming);
-    writer_handle
-        .request_tx
-        .send(AgentRequest {
-            locator: locator.clone(),
-            incoming: remember_incoming.clone(),
-            sessions: sessions.clone(),
-        })
+    let locator = enqueue_new_request(&writer_queue, &sessions, &remember_incoming)
         .await
         .expect("writer request should be accepted");
+    writer_handle
+        .ensure_worker(locator.thread_key(), sessions.clone())
+        .await
+        .expect("writer domain worker should start");
 
-    let writer_events = collect_until_commit(
+    collect_until_completion(
         writer_handle
             .event_rx_mut()
             .expect("writer event receiver should be available"),
     )
     .await;
-    let remembered_thread = extract_completed_thread(&writer_events);
+    let remembered_thread = sessions
+        .load_thread(&locator)
+        .await
+        .expect("remembered thread should load")
+        .expect("remembered thread should exist");
     let memory_file = fixture.memory_root().join("active/workflow/notion.md");
     let written = std::fs::read_to_string(&memory_file).expect("memory file should exist");
     assert!(written.contains("Notion 上传工作流"));
@@ -178,19 +187,17 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         }),
         runtime,
     );
-    let mut reader_handle = reader_worker.spawn();
+    let mut reader_handle = reader_worker.spawn(reader_queue.clone());
 
     let same_thread_incoming = build_incoming("notion 细节是什么");
-    reader_handle
-        .request_tx
-        .send(AgentRequest {
-            locator: locator.clone(),
-            incoming: same_thread_incoming.clone(),
-            sessions: sessions.clone(),
-        })
+    enqueue_existing_request(&reader_queue, &locator, &same_thread_incoming)
         .await
         .expect("same-thread follow-up should be accepted");
-    let _ = collect_until_commit(
+    reader_handle
+        .ensure_worker(locator.thread_key(), sessions.clone())
+        .await
+        .expect("reader domain worker should start");
+    collect_until_completion(
         reader_handle
             .event_rx_mut()
             .expect("reader event receiver should be available"),
@@ -218,32 +225,29 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
             .await
             .expect("cleared thread lock result should resolve")
             .expect("cleared thread should lock");
-        cleared_thread.clear_to_initial_state(Utc::now());
-        sessions
-            .persist_locked_thread_context(
-                &locator,
-                &mut cleared_thread,
-                reinit_incoming.received_at,
-            )
+        thread_runtime
+            .reinitialize_thread(&mut cleared_thread, Utc::now())
             .await
             .expect("cleared thread should store");
     }
-    reader_handle
-        .request_tx
-        .send(AgentRequest {
-            locator,
-            incoming: reinit_incoming.clone(),
-            sessions: sessions.clone(),
-        })
+    enqueue_existing_request(&reader_queue, &locator, &reinit_incoming)
         .await
         .expect("reinit follow-up should be accepted");
-    let reinit_events = collect_until_commit(
+    reader_handle
+        .ensure_worker(locator.thread_key(), sessions.clone())
+        .await
+        .expect("reader domain worker should stay available");
+    collect_until_completion(
         reader_handle
             .event_rx_mut()
             .expect("reader event receiver should be available"),
     )
     .await;
-    let reinit_thread = extract_completed_thread(&reinit_events);
+    let reinit_thread = sessions
+        .load_thread(&locator)
+        .await
+        .expect("reinitialized thread should load")
+        .expect("reinitialized thread should exist");
     let captured_requests = requests.lock().await;
     let reinit_messages = &captured_requests[1].messages;
 
@@ -262,6 +266,70 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
             .iter()
             .any(|message| message.content.contains("上传到 notion 时走用户自定义模板"))
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hybrid_search_presence_does_not_auto_inject_passive_memory_into_normal_requests() {
+    // 测试场景: 即便工作区开启 hybrid retrieval，只要模型本轮没有显式调用 memory_search /
+    // memory_get，普通请求上下文里仍然不能自动注入 passive memory 摘要或正文。
+    let fixture = MemoryWorkspaceFixture::new("openjarvis-memory-feature-hybrid-no-auto-inject");
+    seed_hybrid_memory_corpus(fixture.root());
+    let mock_server = HybridMockServer::start(&fixture).await;
+    let cwd_guard = install_fixture_as_cwd(fixture.root());
+    let config = build_config_from_yaml(&hybrid_config_yaml(
+        &mock_server.base_url(),
+        mock_server
+            .api_key_path()
+            .to_str()
+            .expect("api key path should be utf-8"),
+        "",
+    ));
+    let runtime = AgentRuntime::from_config_with_skill_roots(config.agent_config(), Vec::new())
+        .await
+        .expect("agent runtime should build from hybrid config");
+    let sessions = SessionManager::new();
+    let queue = Arc::new(TestTopicQueue::default());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let worker = AgentWorker::with_runtime(
+        Arc::new(RecordingProvider {
+            requests: Arc::clone(&requests),
+        }),
+        runtime,
+    );
+    sessions.install_thread_runtime(worker.thread_runtime());
+    let mut handle = worker.spawn(queue.clone());
+    let incoming = build_incoming("以后回答时记住我的表达方式");
+    let locator = enqueue_new_request(&queue, &sessions, &incoming)
+        .await
+        .expect("hybrid thread should resolve");
+
+    handle
+        .ensure_worker(locator.thread_key(), sessions.clone())
+        .await
+        .expect("hybrid domain worker should start");
+    collect_until_completion(
+        handle
+            .event_rx_mut()
+            .expect("worker event receiver should be available"),
+    )
+    .await;
+
+    let captured_requests = requests.lock().await;
+    let request_messages = &captured_requests[0].messages;
+    assert!(!request_messages.iter().any(|message| {
+        message
+            .content
+            .contains("默认使用中文，回答保持简洁，先给结论再展开细节")
+    }));
+    assert!(!request_messages.iter().any(|message| {
+        message
+            .content
+            .contains("preferences/semantic-style-fresh.md")
+    }));
+    assert!(!request_messages.iter().any(|message| {
+        message.content.contains("memory_search") && message.content.contains("semantic-style")
+    }));
+    drop(cwd_guard);
 }
 
 fn build_incoming(content: &str) -> IncomingMessage {
@@ -283,17 +351,34 @@ fn build_incoming(content: &str) -> IncomingMessage {
     }
 }
 
-fn build_locator(incoming: &IncomingMessage) -> ThreadLocator {
-    let thread_key = "default";
-    ThreadLocator::new(
-        Uuid::new_v4(),
-        incoming,
-        thread_key,
-        SessionKey::from_incoming(incoming).derive_thread_id(thread_key),
-    )
+async fn enqueue_new_request(
+    queue: &TestTopicQueue,
+    sessions: &SessionManager,
+    incoming: &IncomingMessage,
+) -> Result<ThreadLocator> {
+    let locator = sessions
+        .create_thread(incoming, ThreadAgentKind::Main)
+        .await
+        .expect("thread should resolve");
+    enqueue_existing_request(queue, &locator, incoming).await?;
+    Ok(locator)
 }
 
-async fn collect_until_commit(
+async fn enqueue_existing_request(
+    queue: &TestTopicQueue,
+    locator: &ThreadLocator,
+    incoming: &IncomingMessage,
+) -> Result<()> {
+    queue
+        .add(
+            &locator.thread_key(),
+            TopicQueuePayload::new(locator.clone(), incoming.clone()),
+        )
+        .await
+        .map(|_| ())
+}
+
+async fn collect_until_completion(
     event_rx: &mut mpsc::Receiver<AgentWorkerEvent>,
 ) -> Vec<AgentWorkerEvent> {
     timeout(Duration::from_secs(2), async {
@@ -303,7 +388,7 @@ async fn collect_until_commit(
                 .recv()
                 .await
                 .expect("agent worker event channel should stay open");
-            let terminal = matches!(event, AgentWorkerEvent::TurnFinalized(_));
+            let terminal = matches!(event, AgentWorkerEvent::RequestCompleted(_));
             events.push(event);
             if terminal {
                 break events;
@@ -312,14 +397,4 @@ async fn collect_until_commit(
     })
     .await
     .expect("agent worker events should arrive in time")
-}
-
-fn extract_completed_thread(events: &[AgentWorkerEvent]) -> Thread {
-    events
-        .iter()
-        .find_map(|event| match event {
-            AgentWorkerEvent::TurnFinalized(turn) => Some(turn.turn.snapshot.clone()),
-            _ => None,
-        })
-        .expect("turn finalized event should exist")
 }

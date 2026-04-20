@@ -16,7 +16,8 @@ pub mod toolset;
 pub mod write;
 
 use crate::config::{
-    AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentToolConfig, try_global_config,
+    AgentMcpServerConfig, AgentMcpServerTransportConfig, AgentMemorySearchConfig, AgentToolConfig,
+    try_global_config,
 };
 use crate::session::SessionManager;
 use crate::thread::{Thread, ThreadContextLocator};
@@ -279,6 +280,7 @@ pub struct ToolRegistry {
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
     memory_repository: Arc<MemoryRepository>,
+    memory_search_config: AgentMemorySearchConfig,
     command_sessions: Arc<CommandSessionManager>,
     sandbox: StdRwLock<Option<Arc<dyn Sandbox>>>,
     subagent_runner: StdRwLock<Option<Weak<crate::agent::SubagentRunner>>>,
@@ -382,6 +384,7 @@ impl ToolRegistry {
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
             memory_repository: Arc::new(MemoryRepository::new(workspace_root)),
+            memory_search_config: AgentMemorySearchConfig::default(),
             command_sessions: Arc::new(CommandSessionManager::new()),
             sandbox: StdRwLock::new(None),
             subagent_runner: StdRwLock::new(None),
@@ -417,6 +420,7 @@ impl ToolRegistry {
         skill_roots: Vec<PathBuf>,
     ) -> Result<Self> {
         let mut registry = Self::with_skill_roots(skill_roots);
+        registry.memory_search_config = config.memory_config().search_config().clone();
         registry.configured_obswiki = configured_obswiki_runtime_config(config);
         let definitions = build_mcp_server_definitions(config)?;
         registry.mcp.load_definitions(definitions).await?;
@@ -824,6 +828,10 @@ impl ToolRegistry {
     /// ```
     pub fn memory_repository(&self) -> Arc<MemoryRepository> {
         Arc::clone(&self.memory_repository)
+    }
+
+    pub(crate) fn memory_search_config(&self) -> &AgentMemorySearchConfig {
+        &self.memory_search_config
     }
 
     /// Return the shared command session manager used by builtin command tools.
