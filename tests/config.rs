@@ -1,6 +1,8 @@
 use openjarvis::config::{
-    AgentMcpServerTransportConfig, AppConfig, LLMConfig, LogRotation, SessionStoreBackend,
-    global_config, install_global_config, try_global_config,
+    AgentMcpServerTransportConfig, AppConfig, DEFAULT_MEMORY_HYBRID_BASE_URL,
+    DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL, DEFAULT_MEMORY_HYBRID_RERANK_MODEL, LLMConfig,
+    LogRotation, MemorySearchMode, SessionStoreBackend, global_config, install_global_config,
+    try_global_config,
 };
 use openjarvis::thread::DEFAULT_ASSISTANT_SYSTEM_PROMPT;
 use serde_json::json;
@@ -49,6 +51,17 @@ impl ConfigFixture {
             serde_json::to_string_pretty(&value).expect("mcp json should serialize"),
         )
         .expect("mcp json should be written");
+    }
+
+    fn write_memory_yaml(&self, yaml: &str) {
+        let memory_yaml_path = self.root.join("config/openjarvis/memory.yaml");
+        fs::create_dir_all(
+            memory_yaml_path
+                .parent()
+                .expect("memory yaml parent path should exist"),
+        )
+        .expect("memory yaml directory should be created");
+        fs::write(&memory_yaml_path, yaml).expect("memory yaml should be written");
     }
 }
 
@@ -509,6 +522,156 @@ llm:
     .expect_err("browser cookie auto flags without state file should fail");
 
     assert!(format!("{error:#}").contains("agent.tool.browser.cookies_state_file is required"));
+}
+
+#[test]
+fn memory_search_defaults_to_lexical_with_default_hybrid_models() {
+    let config = AppConfig::from_yaml_str(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    )
+    .expect("default memory config should parse");
+
+    let memory_search = config
+        .agent_config()
+        .tool_config()
+        .memory_config()
+        .search_config();
+    let hybrid = memory_search.hybrid_config();
+
+    assert_eq!(memory_search.mode(), MemorySearchMode::Lexical);
+    assert_eq!(hybrid.base_url(), DEFAULT_MEMORY_HYBRID_BASE_URL);
+    assert_eq!(
+        hybrid.embedding_model(),
+        DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL
+    );
+    assert_eq!(hybrid.rerank_model(), DEFAULT_MEMORY_HYBRID_RERANK_MODEL);
+}
+
+#[test]
+fn memory_search_relative_api_key_path_resolves_to_config_root() {
+    let fixture = ConfigFixture::new("openjarvis-memory-search-relative-path");
+    fixture.write_yaml(
+        r#"
+agent:
+  tool:
+    memory:
+      search:
+        mode: "hybrid"
+        hybrid:
+          api_key_path: "secrets/siliconflow.key"
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    );
+
+    let config =
+        AppConfig::from_path(fixture.config_path()).expect("memory search config should resolve");
+    let hybrid = config
+        .agent_config()
+        .tool_config()
+        .memory_config()
+        .search_config()
+        .hybrid_config();
+
+    assert_eq!(
+        hybrid.api_key_path(),
+        fixture.root.join("secrets/siliconflow.key").as_path()
+    );
+    assert_eq!(
+        hybrid.embedding_model(),
+        DEFAULT_MEMORY_HYBRID_EMBEDDING_MODEL
+    );
+    assert_eq!(hybrid.rerank_model(), DEFAULT_MEMORY_HYBRID_RERANK_MODEL);
+}
+
+#[test]
+fn memory_search_sidecar_loads_from_config_directory() {
+    let fixture = ConfigFixture::new("openjarvis-memory-search-sidecar");
+    fixture.write_yaml(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    );
+    fixture.write_memory_yaml(
+        r#"
+search:
+  mode: "hybrid"
+  hybrid:
+    base_url: "https://example.invalid/v1"
+    embedding_model: "demo-embedding"
+    rerank_model: "demo-rerank"
+    bm25_top_n: 12
+    dense_top_n: 14
+    rerank_top_n: 9
+    rrf_k: 33
+    mmr_lambda: 0.55
+    freshness_half_life_days: 7
+"#,
+    );
+
+    let config = AppConfig::from_path(fixture.config_path())
+        .expect("memory sidecar config should load and merge");
+    let memory_search = config
+        .agent_config()
+        .tool_config()
+        .memory_config()
+        .search_config();
+    let hybrid = memory_search.hybrid_config();
+
+    assert_eq!(memory_search.mode(), MemorySearchMode::Hybrid);
+    assert_eq!(hybrid.base_url(), "https://example.invalid/v1");
+    assert_eq!(hybrid.embedding_model(), "demo-embedding");
+    assert_eq!(hybrid.rerank_model(), "demo-rerank");
+    assert_eq!(hybrid.bm25_top_n(), 12);
+    assert_eq!(hybrid.dense_top_n(), 14);
+    assert_eq!(hybrid.rerank_top_n(), 9);
+    assert_eq!(hybrid.rrf_k(), 33);
+    assert_eq!(hybrid.mmr_lambda(), 0.55);
+    assert_eq!(hybrid.freshness_half_life_days(), 7);
+}
+
+#[test]
+fn memory_search_sidecar_relative_api_key_path_resolves_to_config_root() {
+    let fixture = ConfigFixture::new("openjarvis-memory-search-sidecar-relative-path");
+    fixture.write_yaml(
+        r#"
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    );
+    fixture.write_memory_yaml(
+        r#"
+search:
+  mode: "hybrid"
+  hybrid:
+    api_key_path: "secrets/memory-siliconflow.key"
+"#,
+    );
+
+    let config = AppConfig::from_path(fixture.config_path())
+        .expect("memory sidecar relative path should resolve");
+    let hybrid = config
+        .agent_config()
+        .tool_config()
+        .memory_config()
+        .search_config()
+        .hybrid_config();
+
+    assert_eq!(
+        hybrid.api_key_path(),
+        fixture
+            .root
+            .join("secrets/memory-siliconflow.key")
+            .as_path()
+    );
 }
 
 #[test]

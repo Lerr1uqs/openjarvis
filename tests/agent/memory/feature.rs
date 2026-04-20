@@ -1,5 +1,8 @@
-use super::super::support::ThreadTestExt;
-use super::MemoryWorkspaceFixture;
+use super::{
+    HybridMockServer, MemoryWorkspaceFixture, build_config_from_yaml, hybrid_config_yaml,
+    install_fixture_as_cwd, seed_hybrid_memory_corpus,
+};
+use crate::support::ThreadTestExt;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -10,8 +13,8 @@ use openjarvis::{
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall},
     model::{IncomingMessage, ReplyTarget},
-    session::{SessionKey, SessionManager, ThreadLocator},
-    thread::Thread,
+    session::SessionManager,
+    thread::ThreadAgentKind,
 };
 use serde_json::json;
 use std::{collections::VecDeque, sync::Arc};
@@ -140,10 +143,15 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         ])),
         runtime.clone(),
     );
+    let thread_runtime = writer_worker.thread_runtime();
+    sessions.install_thread_runtime(Arc::clone(&thread_runtime));
     let mut writer_handle = writer_worker.spawn();
 
     let remember_incoming = build_incoming("请记住 notion 上传工作流");
-    let locator = build_locator(&remember_incoming);
+    let locator = sessions
+        .create_thread(&remember_incoming, ThreadAgentKind::Main)
+        .await
+        .expect("writer thread should resolve");
     writer_handle
         .request_tx
         .send(AgentRequest {
@@ -154,8 +162,12 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         .await
         .expect("writer request should be accepted");
 
-    let writer_events = collect_until_commit(&mut writer_handle.event_rx).await;
-    let remembered_thread = extract_completed_thread(&writer_events);
+    collect_until_completion(&mut writer_handle.event_rx).await;
+    let remembered_thread = sessions
+        .load_thread(&locator)
+        .await
+        .expect("remembered thread should load")
+        .expect("remembered thread should exist");
     let memory_file = fixture.memory_root().join("active/workflow/notion.md");
     let written = std::fs::read_to_string(&memory_file).expect("memory file should exist");
     assert!(written.contains("Notion 上传工作流"));
@@ -185,7 +197,7 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         })
         .await
         .expect("same-thread follow-up should be accepted");
-    let _ = collect_until_commit(&mut reader_handle.event_rx).await;
+    collect_until_completion(&mut reader_handle.event_rx).await;
 
     let captured_requests = requests.lock().await;
     let same_thread_messages = &captured_requests[0].messages;
@@ -208,27 +220,26 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
             .await
             .expect("cleared thread lock result should resolve")
             .expect("cleared thread should lock");
-        cleared_thread.clear_to_initial_state(Utc::now());
-        sessions
-            .persist_locked_thread_context(
-                &locator,
-                &mut cleared_thread,
-                reinit_incoming.received_at,
-            )
+        thread_runtime
+            .reinitialize_thread(&mut cleared_thread, Utc::now())
             .await
             .expect("cleared thread should store");
     }
     reader_handle
         .request_tx
         .send(AgentRequest {
-            locator,
+            locator: locator.clone(),
             incoming: reinit_incoming.clone(),
             sessions: sessions.clone(),
         })
         .await
         .expect("reinit follow-up should be accepted");
-    let reinit_events = collect_until_commit(&mut reader_handle.event_rx).await;
-    let reinit_thread = extract_completed_thread(&reinit_events);
+    collect_until_completion(&mut reader_handle.event_rx).await;
+    let reinit_thread = sessions
+        .load_thread(&locator)
+        .await
+        .expect("reinitialized thread should load")
+        .expect("reinitialized thread should exist");
     let captured_requests = requests.lock().await;
     let reinit_messages = &captured_requests[1].messages;
 
@@ -247,6 +258,70 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
             .iter()
             .any(|message| message.content.contains("上传到 notion 时走用户自定义模板"))
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hybrid_search_presence_does_not_auto_inject_passive_memory_into_normal_requests() {
+    // 测试场景: 即便工作区开启 hybrid retrieval，只要模型本轮没有显式调用 memory_search /
+    // memory_get，普通请求上下文里仍然不能自动注入 passive memory 摘要或正文。
+    let fixture = MemoryWorkspaceFixture::new("openjarvis-memory-feature-hybrid-no-auto-inject");
+    seed_hybrid_memory_corpus(fixture.root());
+    let mock_server = HybridMockServer::start(&fixture).await;
+    let cwd_guard = install_fixture_as_cwd(fixture.root());
+    let config = build_config_from_yaml(&hybrid_config_yaml(
+        &mock_server.base_url(),
+        mock_server
+            .api_key_path()
+            .to_str()
+            .expect("api key path should be utf-8"),
+        "",
+    ));
+    let runtime = AgentRuntime::from_config_with_skill_roots(config.agent_config(), Vec::new())
+        .await
+        .expect("agent runtime should build from hybrid config");
+    let sessions = SessionManager::new();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let worker = AgentWorker::with_runtime(
+        Arc::new(RecordingProvider {
+            requests: Arc::clone(&requests),
+        }),
+        runtime,
+    );
+    sessions.install_thread_runtime(worker.thread_runtime());
+    let mut handle = worker.spawn();
+    let incoming = build_incoming("以后回答时记住我的表达方式");
+    let locator = sessions
+        .create_thread(&incoming, ThreadAgentKind::Main)
+        .await
+        .expect("hybrid thread should resolve");
+
+    handle
+        .request_tx
+        .send(AgentRequest {
+            locator,
+            incoming: incoming.clone(),
+            sessions,
+        })
+        .await
+        .expect("hybrid request should be accepted");
+    collect_until_completion(&mut handle.event_rx).await;
+
+    let captured_requests = requests.lock().await;
+    let request_messages = &captured_requests[0].messages;
+    assert!(!request_messages.iter().any(|message| {
+        message
+            .content
+            .contains("默认使用中文，回答保持简洁，先给结论再展开细节")
+    }));
+    assert!(!request_messages.iter().any(|message| {
+        message
+            .content
+            .contains("preferences/semantic-style-fresh.md")
+    }));
+    assert!(!request_messages.iter().any(|message| {
+        message.content.contains("memory_search") && message.content.contains("semantic-style")
+    }));
+    drop(cwd_guard);
 }
 
 fn build_incoming(content: &str) -> IncomingMessage {
@@ -268,17 +343,7 @@ fn build_incoming(content: &str) -> IncomingMessage {
     }
 }
 
-fn build_locator(incoming: &IncomingMessage) -> ThreadLocator {
-    let thread_key = "default";
-    ThreadLocator::new(
-        Uuid::new_v4(),
-        incoming,
-        thread_key,
-        SessionKey::from_incoming(incoming).derive_thread_id(thread_key),
-    )
-}
-
-async fn collect_until_commit(
+async fn collect_until_completion(
     event_rx: &mut mpsc::Receiver<AgentWorkerEvent>,
 ) -> Vec<AgentWorkerEvent> {
     timeout(Duration::from_secs(2), async {
@@ -288,7 +353,7 @@ async fn collect_until_commit(
                 .recv()
                 .await
                 .expect("agent worker event channel should stay open");
-            let terminal = matches!(event, AgentWorkerEvent::TurnFinalized(_));
+            let terminal = matches!(event, AgentWorkerEvent::RequestCompleted(_));
             events.push(event);
             if terminal {
                 break events;
@@ -297,14 +362,4 @@ async fn collect_until_commit(
     })
     .await
     .expect("agent worker events should arrive in time")
-}
-
-fn extract_completed_thread(events: &[AgentWorkerEvent]) -> Thread {
-    events
-        .iter()
-        .find_map(|event| match event {
-            AgentWorkerEvent::TurnFinalized(turn) => Some(turn.turn.snapshot.clone()),
-            _ => None,
-        })
-        .expect("turn finalized event should exist")
 }

@@ -1,0 +1,20 @@
+# Optional memory retrieval sidecar.
+#
+# Uncomment the fields you want to tune. This file is loaded from
+# `config/openjarvis/memory.yaml` beside the main `config.yaml`.
+
+search: {}
+
+# search:
+#   mode: "hybrid"
+#   hybrid:
+#     base_url: "https://api.siliconflow.cn/v1"
+#     api_key_path: "~/.siliconflow.apikey"
+#     embedding_model: "BAAI/bge-large-zh-v1.5"
+#     rerank_model: "BAAI/bge-reranker-v2-m3"
+#     bm25_top_n: 30
+#     dense_top_n: 30
+#     rerank_top_n: 20
+#     rrf_k: 60
+#     mmr_lambda: 0.7
+#     freshness_half_life_days: 30

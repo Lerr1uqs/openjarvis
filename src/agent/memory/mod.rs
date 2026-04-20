@@ -1,6 +1,7 @@
 //! Local markdown-backed memory repository and loadable memory toolset.
 
 pub mod repository;
+pub(crate) mod search;
 pub mod tool;
 
 pub use repository::{

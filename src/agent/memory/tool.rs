@@ -1,6 +1,7 @@
 //! Loadable `memory` toolset backed by the local [`MemoryRepository`].
 
 use super::repository::{MemoryRepository, MemoryType, MemoryWriteRequest};
+use super::search::MemorySearchService;
 use crate::agent::tool::{parse_tool_arguments, tool_definition_from_args};
 use crate::agent::{
     ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry, ToolsetCatalogEntry,
@@ -36,6 +37,9 @@ pub async fn register_memory_toolset(registry: &ToolRegistry) -> Result<()> {
     }
 
     let repository = registry.memory_repository();
+    let search_service = Arc::new(MemorySearchService::new(
+        registry.memory_search_config().clone(),
+    )?);
     registry
         .register_toolset(
             ToolsetCatalogEntry::new(
@@ -44,7 +48,10 @@ pub async fn register_memory_toolset(registry: &ToolRegistry) -> Result<()> {
             ),
             vec![
                 Arc::new(MemoryGetTool::new(Arc::clone(&repository))),
-                Arc::new(MemorySearchTool::new(Arc::clone(&repository))),
+                Arc::new(MemorySearchTool::new(
+                    Arc::clone(&repository),
+                    search_service,
+                )),
                 Arc::new(MemoryWriteTool::new(Arc::clone(&repository))),
                 Arc::new(MemoryListTool::new(repository)),
             ],
@@ -60,6 +67,7 @@ struct MemoryGetTool {
 #[derive(Clone)]
 struct MemorySearchTool {
     repository: Arc<MemoryRepository>,
+    service: Arc<MemorySearchService>,
 }
 
 #[derive(Clone)]
@@ -121,8 +129,11 @@ impl MemoryGetTool {
 }
 
 impl MemorySearchTool {
-    fn new(repository: Arc<MemoryRepository>) -> Self {
-        Self { repository }
+    fn new(repository: Arc<MemoryRepository>, service: Arc<MemorySearchService>) -> Self {
+        Self {
+            repository,
+            service,
+        }
     }
 }
 
@@ -174,9 +185,15 @@ impl ToolHandler for MemorySearchTool {
 
     async fn call(&self, request: ToolCallRequest) -> Result<ToolCallResult> {
         let args: MemorySearchArguments = parse_tool_arguments(request, "memory_search")?;
-        let response =
-            self.repository
-                .search(&args.query, args.memory_type, args.limit.unwrap_or(10))?;
+        let response = self
+            .service
+            .search(
+                &self.repository,
+                &args.query,
+                args.memory_type,
+                args.limit.unwrap_or(10),
+            )
+            .await?;
         info!(
             query = %response.query,
             total_matches = response.total_matches,

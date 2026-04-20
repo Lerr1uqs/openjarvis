@@ -472,6 +472,13 @@ impl MemoryRepository {
         Ok(Some(prompt))
     }
 
+    pub(crate) fn load_search_documents(
+        &self,
+        memory_type: Option<MemoryType>,
+    ) -> Result<Vec<MemoryDocument>> {
+        self.load_documents(memory_type)
+    }
+
     fn load_documents(&self, memory_type: Option<MemoryType>) -> Result<Vec<MemoryDocument>> {
         let mut documents = Vec::new();
         match memory_type {
