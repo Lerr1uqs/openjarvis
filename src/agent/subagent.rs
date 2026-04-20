@@ -206,7 +206,7 @@ async fn handle_subagent_request(
         .as_ref()
         .map(|value| value.succeeded)
         .unwrap_or(false);
-    hooks
+    let stop_hook_result = hooks
         .emit(HookEvent {
             kind: HookEventKind::SubagentStop,
             payload: json!({
@@ -216,7 +216,8 @@ async fn handle_subagent_request(
                 "succeeded": succeeded,
             }),
         })
-        .await?;
+        .await;
+    stop_hook_result?;
 
     let output = output?;
     debug!(

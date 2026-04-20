@@ -7,6 +7,7 @@ pub mod browser;
 pub mod command;
 pub mod edit;
 pub mod mcp;
+pub mod obswiki;
 pub mod read;
 pub mod shell;
 pub mod skill;
@@ -28,7 +29,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock as StdRwLock, Weak},
     time::Instant,
 };
@@ -274,6 +275,7 @@ pub struct ToolRegistry {
     // AGENT-TODO: 对String起别名
     always_visible_handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
     toolsets: RwLock<HashMap<String, RegisteredToolset>>,
+    workspace_root: PathBuf,
     mcp: Arc<mcp::McpManager>,
     skills: Arc<skill::SkillRegistry>,
     memory_repository: Arc<MemoryRepository>,
@@ -281,6 +283,8 @@ pub struct ToolRegistry {
     sandbox: StdRwLock<Option<Arc<dyn Sandbox>>>,
     subagent_runner: StdRwLock<Option<Weak<crate::agent::SubagentRunner>>>,
     browser_sessions: RwLock<Option<Arc<browser::BrowserSessionManager>>>,
+    configured_obswiki: Option<obswiki::ObswikiRuntimeConfig>,
+    obswiki_runtime: RwLock<Option<Arc<obswiki::ObswikiRuntime>>>,
 }
 
 pub fn tool_definition_from_args<T>(
@@ -370,16 +374,20 @@ impl ToolRegistry {
         workspace_root: impl Into<PathBuf>,
         skill_roots: Vec<PathBuf>,
     ) -> Self {
+        let workspace_root = workspace_root.into();
         Self {
             always_visible_handlers: RwLock::new(HashMap::new()),
             toolsets: RwLock::new(HashMap::new()),
+            workspace_root: workspace_root.clone(),
             mcp: Arc::new(mcp::McpManager::new()),
             skills: Arc::new(skill::SkillRegistry::with_roots(skill_roots)),
-            memory_repository: Arc::new(MemoryRepository::new(workspace_root.into())),
+            memory_repository: Arc::new(MemoryRepository::new(workspace_root)),
             command_sessions: Arc::new(CommandSessionManager::new()),
             sandbox: StdRwLock::new(None),
             subagent_runner: StdRwLock::new(None),
             browser_sessions: RwLock::new(None),
+            configured_obswiki: None,
+            obswiki_runtime: RwLock::new(None),
         }
     }
 
@@ -408,7 +416,8 @@ impl ToolRegistry {
         config: &AgentToolConfig,
         skill_roots: Vec<PathBuf>,
     ) -> Result<Self> {
-        let registry = Self::with_skill_roots(skill_roots);
+        let mut registry = Self::with_skill_roots(skill_roots);
+        registry.configured_obswiki = configured_obswiki_runtime_config(config);
         let definitions = build_mcp_server_definitions(config)?;
         registry.mcp.load_definitions(definitions).await?;
         registry.sync_mcp_toolsets().await?;
@@ -532,6 +541,11 @@ impl ToolRegistry {
         }
         if !self.toolset_registered("memory").await {
             register_memory_toolset(self).await?;
+        }
+        if !self.toolset_registered("obswiki").await
+            && let Some(config) = self.configured_obswiki.clone()
+        {
+            obswiki::register_obswiki_toolset_with_config(self, config).await?;
         }
         self.skills.reload().await?;
         self.sync_skill_handlers().await;
@@ -825,6 +839,10 @@ impl ToolRegistry {
         Arc::clone(&self.command_sessions)
     }
 
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     /// Install the subagent runner used by builtin subagent tools.
     pub fn install_subagent_runner(&self, runner: &Arc<crate::agent::SubagentRunner>) {
         *self
@@ -844,6 +862,14 @@ impl ToolRegistry {
         &self,
     ) -> Option<Arc<browser::BrowserSessionManager>> {
         self.browser_sessions.read().await.clone()
+    }
+
+    pub(crate) async fn remember_obswiki_runtime(&self, runtime: Arc<obswiki::ObswikiRuntime>) {
+        *self.obswiki_runtime.write().await = Some(runtime);
+    }
+
+    pub(crate) async fn obswiki_runtime(&self) -> Option<Arc<obswiki::ObswikiRuntime>> {
+        self.obswiki_runtime.read().await.clone()
     }
 
     async fn register_if_missing(&self, handler: Arc<dyn ToolHandler>) {
@@ -1170,6 +1196,12 @@ fn configured_browser_session_manager_config(
     manager_config.runtime.load_cookies_on_open = browser_config.load_cookies_on_open();
     manager_config.runtime.save_cookies_on_close = browser_config.save_cookies_on_close();
     manager_config
+}
+
+fn configured_obswiki_runtime_config(
+    config: &AgentToolConfig,
+) -> Option<obswiki::ObswikiRuntimeConfig> {
+    obswiki::ObswikiRuntimeConfig::from_agent_config(config.obswiki_config())
 }
 
 fn build_mcp_server_definition(

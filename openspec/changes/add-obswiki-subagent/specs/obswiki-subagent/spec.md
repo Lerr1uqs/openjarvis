@@ -1,10 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: 系统 SHALL 通过配置绑定一个可插拔的 Obsidian vault
-系统 SHALL 通过显式配置绑定一个 `obswiki` Obsidian vault。该配置至少 MUST 指定 vault 路径，并 MAY 指定 Obsidian CLI 相关运行时参数。系统在启动或 `obswiki` subagent 初始化时 MUST 校验该路径存在且满足最小骨架要求；若 vault 路径不存在、不可访问或骨架缺失，系统 MUST 直接失败，而不是在运行时提供单独的初始化工具。
+系统 SHALL 通过显式配置绑定一个 `obswiki` Obsidian vault。该配置至少 MUST 指定 vault 路径，并 MAY 指定 Obsidian CLI 相关运行时参数。系统在启动或 `obswiki` subagent 初始化时 MUST 校验该路径存在且满足最小骨架要求，并 MUST 通过 Obsidian CLI 验证当前 vault 已有一个运行中的 Obsidian app 可供连接；若 vault 路径不存在、不可访问、骨架缺失、当前没有可连接的 Obsidian app，或当前打开的不是目标 vault，系统 MUST 直接失败，而不是在运行时提供单独的初始化工具或替用户启动桌面 app。
 
 #### Scenario: 已配置且存在的 vault 通过 preflight 校验
 - **WHEN** 配置中的 `obswiki` vault 路径存在且包含必需骨架
+- **THEN** 系统会通过 Obsidian CLI 验证当前 vault 已连接到一个运行中的 Obsidian app
 - **THEN** 系统会接受该 vault 作为当前 `obswiki` 知识库
 - **THEN** 后续 `obswiki` subagent 与工具都以这个 vault 为事实来源
 
@@ -12,6 +13,12 @@
 - **WHEN** `obswiki` 已启用但配置中的 vault 路径不存在
 - **THEN** 系统会直接返回配置或初始化错误
 - **THEN** 系统不会暴露 `obswiki_init` 一类运行时初始化工具
+
+#### Scenario: Obsidian app 未运行或未打开目标 vault 时直接报错并提示手动管理
+- **WHEN** `obswiki` 已启用且 vault 骨架完整，但 Obsidian CLI 无法连接当前 vault 的运行中 app
+- **THEN** 系统会直接返回 preflight 错误
+- **THEN** 错误信息会提示用户先手动打开对应 vault 再重试
+- **THEN** 系统不会自动启动或关闭 Obsidian 桌面 app
 
 ### Requirement: 系统 SHALL 要求 vault 满足标准骨架并以 `AGENTS.md` 作为知识库说明真相
 `obswiki` vault 根目录 MUST 至少包含 `raw/`、`wiki/`、`schema/`、`index.md` 和 `AGENTS.md`。其中 `AGENTS.md` MUST 说明该知识库的目录职责、渐进式披露方式和写回约束；系统 MAY 对更细的目录结构保持开放，但 MUST 以上述骨架作为最小通用范式。
@@ -39,13 +46,14 @@
 - **THEN** 系统会拒绝该操作
 - **THEN** 系统不会允许 agent 改写已导入的 Raw 文档
 
-### Requirement: 系统 SHALL 仅暴露核心 `obswiki` 工具，而不暴露初始化或状态管理工具
-`obswiki` 子线程内模型可见的工具集 MUST 只覆盖核心业务动作。首版系统 MUST 暴露 `obswiki_import_raw`、`obswiki_search`、`obswiki_read`、`obswiki_write` 和 `obswiki_update`。系统 SHALL NOT 暴露 `obswiki_init`、`obswiki_status`、`obswiki_sync_index` 或 `obswiki_append_log` 作为模型可调用工具。
+### Requirement: 系统 SHALL 为 `obswiki` 子线程暴露受限工具面，而不暴露初始化或状态管理工具
+`obswiki` 子线程内模型可见的工具集 MUST 以核心 wiki 动作为主。首版系统 MUST 暴露 `obswiki_import_raw`、`obswiki_search`、`obswiki_read`、`obswiki_write` 和 `obswiki_update`；同时 MAY 暴露少量受控辅助工具，但首版仅允许 `exec_command` 与在本地 skill 可用时出现的 `load_skill`。系统 SHALL NOT 暴露 `memory` 工具，也 SHALL NOT 暴露 `obswiki_init`、`obswiki_status`、`obswiki_sync_index` 或 `obswiki_append_log` 作为模型可调用工具。
 
-#### Scenario: `obswiki` 子线程只看到核心工具
+#### Scenario: `obswiki` 子线程看到核心工具和受控辅助工具
 - **WHEN** 一个 `obswiki` child thread 完成初始化并查看可用工具
 - **THEN** 它能看到 `obswiki_import_raw`、`obswiki_search`、`obswiki_read`、`obswiki_write` 和 `obswiki_update`
-- **THEN** 它看不到 `obswiki_init`、`obswiki_status`、`obswiki_sync_index` 或 `obswiki_append_log`
+- **THEN** 它还可以看到 `exec_command`，并在本地 skill 存在时看到 `load_skill`
+- **THEN** 它看不到 `memory` 工具，也看不到 `obswiki_init`、`obswiki_status`、`obswiki_sync_index` 或 `obswiki_append_log`
 
 ### Requirement: `obswiki_search` SHALL 优先使用 QMD CLI 纯文本匹配并返回结构化候选
 `obswiki_search` MUST 支持双后端执行策略：当 QMD CLI 已配置且当前可用时，系统 SHALL 优先使用 QMD 执行纯文本匹配检索；当 QMD CLI 未配置或当前不可用时，系统 SHALL 回退到 Obsidian CLI 搜索。首版系统 SHALL NOT 要求 embedding、向量索引或 rerank。该工具返回 MUST 是结构化候选，而不是最终回答。

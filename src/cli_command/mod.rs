@@ -38,6 +38,7 @@ impl CliCommandRegistry {
         registry.register(Arc::new(skill::SkillCliCommandExecutor))?;
         registry.register(Arc::new(internal::InternalMcpCliCommandExecutor))?;
         registry.register(Arc::new(internal::InternalBrowserCliCommandExecutor))?;
+        registry.register(Arc::new(internal::InternalObswikiCliCommandExecutor))?;
         registry.register(Arc::new(internal::InternalSandboxCliCommandExecutor))?;
         Ok(registry)
     }

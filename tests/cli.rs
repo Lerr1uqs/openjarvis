@@ -1,8 +1,8 @@
 use clap::{Parser, error::ErrorKind};
 use openjarvis::{
     cli::{
-        InternalBrowserCommand, InternalBrowserMode, InternalMcpCommand, InternalSandboxCommand,
-        OpenJarvisCli, SkillCommand,
+        InternalBrowserCommand, InternalBrowserMode, InternalMcpCommand, InternalObswikiCommand,
+        InternalSandboxCommand, OpenJarvisCli, SkillCommand,
     },
     config::{AgentMcpServerTransportConfig, AppConfig, BUILTIN_MCP_SERVER_NAME},
 };
@@ -191,6 +191,23 @@ fn cli_parses_internal_browser_mock_sidecar_command() {
     assert!(matches!(
         cli.internal_browser_command(),
         Some(InternalBrowserCommand::MockSidecar)
+    ));
+}
+
+#[test]
+fn cli_parses_internal_obswiki_prompt_command() {
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-obswiki",
+        "prompt",
+        "--content",
+        "summarize current vault",
+    ]);
+
+    assert!(matches!(
+        cli.internal_obswiki_command(),
+        Some(InternalObswikiCommand::Prompt { content })
+            if content == "summarize current vault"
     ));
 }
 

@@ -208,6 +208,7 @@ fn thread_agent_kind_profiles_follow_predefined_catalog_defaults() {
     // 测试场景: `ThreadAgentKind` 的初始化真相来自仓库静态 agent catalog，而不是散落的硬编码默认值。
     let main_agent = ThreadAgent::from_kind(ThreadAgentKind::Main);
     let browser_agent = ThreadAgent::from_kind(ThreadAgentKind::Browser);
+    let obswiki_agent = ThreadAgent::from_kind(ThreadAgentKind::Obswiki);
 
     assert_eq!(
         ThreadAgentKind::Main.system_prompt(),
@@ -219,6 +220,7 @@ fn thread_agent_kind_profiles_follow_predefined_catalog_defaults() {
     );
     assert!(main_agent.bound_toolsets.is_empty());
     assert_eq!(browser_agent.bound_toolsets, vec!["browser".to_string()]);
+    assert_eq!(obswiki_agent.bound_toolsets, vec!["obswiki".to_string()]);
 }
 
 #[test]

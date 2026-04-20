@@ -2,6 +2,7 @@
 
 pub mod auto_compact;
 pub mod memory;
+pub mod obswiki;
 pub mod shell_env;
 pub mod skill;
 pub mod subagent;

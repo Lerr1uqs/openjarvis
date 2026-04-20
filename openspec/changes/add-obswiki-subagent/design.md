@@ -25,6 +25,7 @@
 - 让 `obswiki` child thread 在启动时自动获得 vault 运行状态、`AGENTS.md` 内容与 `index.md` 中的 `[链接|摘要]` 索引列表，不依赖额外 `status` 工具。
 - 让 `obswiki` subagent 的受控工具只覆盖 `ingest / query / read / write / update` 这些核心动作，不暴露初始化、状态、日志或手动同步索引工具。
 - 要求所有受管理的 vault 文档操作都通过 Obsidian CLI 或其封装层执行。
+- 要求系统只连接已运行的 Obsidian app，不负责桌面 app 的启动、后台守护或退出清理。
 - 把 QMD 纳入本次 change，但首版只要求 QMD CLI 纯文本匹配检索，不要求 embedding。
 - 先提供独立于 main agent 的调试快车道，便于先验证 tools 与 vault 接线，再决定何时让主线程主动使用它。
 
@@ -46,9 +47,10 @@
 - 解析配置中的 vault 路径；
 - 校验路径存在；
 - 校验 vault 根目录下存在 `AGENTS.md`、`index.md`、`raw/`、`wiki/`、`schema/`；
-- 校验 Obsidian CLI 可调用。
+- 先校验 Obsidian CLI 可调用；
+- 再通过一次真实的 CLI `read` 探测确认该 vault 已绑定到一个运行中的 Obsidian app。
 
-如果这些条件不满足，系统直接失败，而不是提供 `obswiki_init` 让模型在运行时“初始化仓库”。
+如果这些条件不满足，系统直接失败，而不是提供 `obswiki_init` 让模型在运行时“初始化仓库”，也不会替用户自动启动或关闭 Obsidian 桌面 app。
 
 这样做的原因：
 
@@ -60,6 +62,8 @@ Alternative considered:
 
 - 提供 `obswiki_init()` 由 agent 运行时创建 vault。
   Rejected，因为它和“外部可插拔知识库”的目标冲突，也容易让模型在错误位置初始化出半成品目录。
+- 在 runtime 内自动拉起 `obsidian.app` 并在任务结束后关闭。
+  Rejected，因为当前 CLI 需要依赖用户自己的桌面会话环境，强行管理 app 生命周期会引入阻塞、前后台行为差异和额外失败面。
 
 ### 2. vault 目录语义由 `vault/AGENTS.md` 定义，程序只校验最小骨架
 
@@ -103,15 +107,20 @@ Alternative considered:
 - 暴露 `obswiki_status()` 让模型主动查询。
   Rejected，因为它会让模型为了拿背景信息额外走一轮工具调用，也与用户“status 应作为背景信息注入”的要求不符。
 
-### 4. `obswiki` 的模型可见工具集只保留核心动作
+### 4. `obswiki` 的模型可见工具集以核心动作优先，并只保留最小辅助能力
 
-首版不提供 `init/status/sync_index/log` 之类管理工具，只提供与用户任务直接相关的核心工具：
+首版不提供 `init/status/sync_index/log` 之类管理工具，核心上只提供与用户任务直接相关的 `obswiki` 工具：
 
 - `obswiki_import_raw(source_path, title?, source_uri?)`
 - `obswiki_search(query, scope?, limit?)`
 - `obswiki_read(path)`
 - `obswiki_write(path, title, content, page_type?, links?, source_refs?)`
 - `obswiki_update(path, instructions, expected_links?, source_refs?)`
+
+此外，为了让 `obswiki` child thread 在必要时执行最少量的外部辅助动作，首版只额外放行：
+
+- `exec_command`
+- `load_skill`（仅当本地 skill 实际可用时出现）
 
 其中：
 
@@ -120,6 +129,8 @@ Alternative considered:
 - `obswiki_read` 负责显式读取正文；
 - `obswiki_write` 用于新建或整体覆写一个受管页面，只允许写 `wiki/` 或 `schema/`，禁止写 `raw/`；
 - `obswiki_update` 用于在已有页面上执行定向更新，语义参考当前内置文件工具里的“更新/编辑”动作，同样禁止写 `raw/`。
+- `exec_command` 只作为受控辅助 builtin tool 存在，不额外暴露 `write_stdin` / `list_unread_command_tasks` 这类命令会话管理工具。
+- `obswiki` child thread 不启用 `memory` feature，避免把 vault 资产与独立 memory 仓库混成两套事实来源；但允许启用 `skill` feature，以便按需加载本地技能。
 
 `index.md` 的更新由工具内部自动触发，不单独暴露 `obswiki_sync_index()`。
 
@@ -199,7 +210,7 @@ Alternative considered:
 
 ## Risks / Trade-offs
 
-- [Risk] Obsidian CLI 的实际 headless 行为和不同安装方式存在差异 -> Mitigation: 首版通过独立调试入口先做本机验证，并把 CLI 可用性作为 preflight 条件。
+- [Risk] Obsidian CLI 依赖用户自行维护运行中的桌面 app，不同安装方式和桌面会话下可连接性存在差异 -> Mitigation: preflight 同时校验 CLI 可执行与实际 `read` 探测，并在失败时明确提示用户手动启动 Obsidian 后重试。
 - [Risk] 直接注入 `AGENTS.md` 与 `index.md` 链接列表可能增加 child thread 初始上下文长度 -> Mitigation: 首版要求 `index.md` 只维护紧凑的 `[链接|摘要]` 列表，不把页面全文塞进索引。
 - [Risk] QMD CLI 与 Obsidian 搜索结果可能存在差异 -> Mitigation: 统一工具返回结构，并在 metadata 中标记 backend 来源。
 - [Risk] `raw/` 不可变会让“修正导入错误”变得不方便 -> Mitigation: 首版明确把修正视为重新导入或人工整理，不在 agent 自动改写范围内。

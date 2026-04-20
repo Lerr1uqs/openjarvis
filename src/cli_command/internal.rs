@@ -3,7 +3,7 @@
 use crate::{
     agent::{
         run_internal_sandbox_command,
-        tool::{browser, mcp::demo},
+        tool::{browser, mcp::demo, obswiki},
     },
     cli::OpenJarvisCommand,
 };
@@ -17,6 +17,9 @@ pub struct InternalMcpCliCommandExecutor;
 
 /// Executor for `openjarvis internal-browser ...`.
 pub struct InternalBrowserCliCommandExecutor;
+
+/// Executor for `openjarvis internal-obswiki ...`.
+pub struct InternalObswikiCliCommandExecutor;
 
 /// Executor for `openjarvis internal-sandbox ...`.
 pub struct InternalSandboxCliCommandExecutor;
@@ -46,6 +49,20 @@ impl CliCommandExecutor for InternalBrowserCliCommandExecutor {
             bail!("internal-browser executor received mismatched top-level command");
         };
         browser::run_internal_browser_command(&arguments.command).await
+    }
+}
+
+#[async_trait]
+impl CliCommandExecutor for InternalObswikiCliCommandExecutor {
+    fn name(&self) -> &'static str {
+        "internal-obswiki"
+    }
+
+    async fn run(&self, command: &OpenJarvisCommand) -> Result<()> {
+        let OpenJarvisCommand::InternalObswiki(arguments) = command else {
+            bail!("internal-obswiki executor received mismatched top-level command");
+        };
+        obswiki::run_internal_obswiki_command(&arguments.command).await
     }
 }
 

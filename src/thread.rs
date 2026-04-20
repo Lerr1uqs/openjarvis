@@ -703,7 +703,7 @@ impl ThreadRuntime {
         thread_context: &Thread,
         thread_agent: &ThreadAgent,
         enabled_features: &Features,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         let capability_profile = thread_agent.kind.capability_profile();
         let preloaded_toolsets = self.preloaded_toolsets(thread_agent, enabled_features);
         let registered_toolsets = self
@@ -713,12 +713,26 @@ impl ThreadRuntime {
             .into_iter()
             .map(|entry| entry.name)
             .collect::<std::collections::BTreeSet<_>>();
+        let missing_bound_toolsets = thread_agent
+            .kind
+            .default_bound_toolsets()
+            .into_iter()
+            .filter(|toolset_name| !registered_toolsets.contains(toolset_name))
+            .collect::<Vec<_>>();
+        if !missing_bound_toolsets.is_empty() {
+            bail!(
+                "thread agent kind `{}` requires registered bound toolsets: {}",
+                thread_agent.kind.as_str(),
+                missing_bound_toolsets.join(", ")
+            );
+        }
         let mut loaded_toolsets = thread_context.load_toolsets();
         loaded_toolsets.extend(preloaded_toolsets);
         let resolved = normalize_loaded_toolsets(loaded_toolsets)
             .into_iter()
             .filter(|toolset_name| {
-                capability_profile.binds_toolset(toolset_name)
+                (capability_profile.binds_toolset(toolset_name)
+                    && registered_toolsets.contains(toolset_name))
                     || (capability_profile.allows_optional_toolset(toolset_name)
                         && registered_toolsets.contains(toolset_name))
             })
@@ -729,7 +743,7 @@ impl ThreadRuntime {
             loaded_toolsets = ?resolved,
             "resolved thread loaded toolsets through thread agent capability profile"
         );
-        resolved
+        Ok(resolved)
     }
 
     async fn build_predefined_role_messages(
@@ -813,7 +827,7 @@ impl ThreadRuntime {
             self.resolve_enabled_features(thread_context, &resolved_thread_agent);
         let resolved_loaded_toolsets = self
             .resolve_loaded_toolsets(thread_context, &resolved_thread_agent, &resolved_features)
-            .await;
+            .await?;
 
         if thread_context.is_initialized() {
             let backfilled = thread_context
@@ -872,6 +886,15 @@ impl ThreadRuntime {
             ShellEnv::detect().render_prompt(),
             initialized_at,
         ));
+        if resolved_thread_agent.kind == ThreadAgentKind::Obswiki {
+            for prompt in feature::init::obswiki::usage(&self.tool_registry).await? {
+                initialized_messages.push(ChatMessage::new(
+                    ChatMessageRole::System,
+                    prompt,
+                    initialized_at,
+                ));
+            }
+        }
 
         thread_context.replace_thread_agent(resolved_thread_agent.clone());
         thread_context.replace_enabled_features(Features::default());

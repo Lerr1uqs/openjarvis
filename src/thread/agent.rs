@@ -16,6 +16,10 @@ pub const DEFAULT_ASSISTANT_SYSTEM_PROMPT: &str =
 pub const DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT: &str =
     include_str!("../../resources/prompts/thread_agent/browser.md");
 
+/// Bundled `obswiki` thread system prompt template used for Obsidian-backed wiki worker threads.
+pub const DEFAULT_OBSWIKI_THREAD_SYSTEM_PROMPT: &str =
+    include_str!("../../resources/prompts/thread_agent/obswiki.md");
+
 const PREDEFINED_THREAD_AGENT_CATALOG_YAML: &str = include_str!("../../config/agents.yaml");
 
 /// Closed set of thread agent kinds used to select stable initialization profiles.
@@ -27,6 +31,7 @@ pub enum ThreadAgentKind {
     #[default]
     Main,
     Browser,
+    Obswiki,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -121,6 +126,7 @@ impl ThreadAgentCapabilityProfile {
 enum ThreadAgentSystemPromptKey {
     Main,
     Browser,
+    Obswiki,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -141,6 +147,7 @@ enum RawThreadAgentOptionalToolsetAccessMode {
 struct RawThreadAgentCatalog {
     main: RawThreadAgentProfile,
     browser: RawThreadAgentProfile,
+    obswiki: RawThreadAgentProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +192,7 @@ struct RawThreadAgentOptionalToolsetProfile {
 struct PredefinedThreadAgentCatalog {
     main: PredefinedThreadAgentProfile,
     browser: PredefinedThreadAgentProfile,
+    obswiki: PredefinedThreadAgentProfile,
 }
 
 impl PredefinedThreadAgentCatalog {
@@ -192,6 +200,7 @@ impl PredefinedThreadAgentCatalog {
         match kind {
             ThreadAgentKind::Main => &self.main,
             ThreadAgentKind::Browser => &self.browser,
+            ThreadAgentKind::Obswiki => &self.obswiki,
         }
     }
 }
@@ -253,6 +262,7 @@ impl RawThreadAgentCatalog {
         Ok(PredefinedThreadAgentCatalog {
             main: self.main.resolve("main")?,
             browser: self.browser.resolve("browser")?,
+            obswiki: self.obswiki.resolve("obswiki")?,
         })
     }
 }
@@ -380,6 +390,7 @@ fn resolve_thread_agent_system_prompt(key: ThreadAgentSystemPromptKey) -> &'stat
     match key {
         ThreadAgentSystemPromptKey::Main => DEFAULT_ASSISTANT_SYSTEM_PROMPT.trim(),
         ThreadAgentSystemPromptKey::Browser => DEFAULT_BROWSER_THREAD_SYSTEM_PROMPT.trim(),
+        ThreadAgentSystemPromptKey::Obswiki => DEFAULT_OBSWIKI_THREAD_SYSTEM_PROMPT.trim(),
     }
 }
 
@@ -392,13 +403,22 @@ pub(crate) struct SubagentCatalogEntry {
     pub when_not_to_use: &'static str,
 }
 
-const AVAILABLE_SUBAGENT_CATALOG: [SubagentCatalogEntry; 1] = [SubagentCatalogEntry {
-    kind: ThreadAgentKind::Browser,
-    subagent_key: "browser",
-    role_summary: "负责浏览器观察与页面交互，在独立 child thread 中完成多步网页操作。",
-    when_to_use: "任务明确需要打开页面、观察网页状态、执行连续页面动作，或者希望复用浏览器 child thread 的上下文。",
-    when_not_to_use: "主线程已经能直接完成任务，或者只需要一次简单工具调用时，不要额外启动 browser subagent。",
-}];
+const AVAILABLE_SUBAGENT_CATALOG: [SubagentCatalogEntry; 2] = [
+    SubagentCatalogEntry {
+        kind: ThreadAgentKind::Browser,
+        subagent_key: "browser",
+        role_summary: "负责浏览器观察与页面交互，在独立 child thread 中完成多步网页操作。",
+        when_to_use: "任务明确需要打开页面、观察网页状态、执行连续页面动作，或者希望复用浏览器 child thread 的上下文。",
+        when_not_to_use: "主线程已经能直接完成任务，或者只需要一次简单工具调用时，不要额外启动 browser subagent。",
+    },
+    SubagentCatalogEntry {
+        kind: ThreadAgentKind::Obswiki,
+        subagent_key: "obswiki",
+        role_summary: "负责受控 Obsidian vault 检索、阅读、Raw 导入与 wiki/schema 页面维护，通常更适合用 persist 模式复用同一个 child thread。",
+        when_to_use: "任务需要查询或整理本地 Obsidian 知识库，且希望在独立 child thread 中复用 vault 约束与索引上下文时，优先使用 persist 模式。",
+        when_not_to_use: "问题不依赖本地 wiki 资产，或者只需要普通文件工具即可完成时，不要额外启动 obswiki subagent。",
+    },
+];
 
 impl ThreadAgentKind {
     /// Return the stable label used by logs and persisted thread state.
@@ -409,11 +429,13 @@ impl ThreadAgentKind {
     ///
     /// assert_eq!(ThreadAgentKind::Main.as_str(), "main");
     /// assert_eq!(ThreadAgentKind::Browser.as_str(), "browser");
+    /// assert_eq!(ThreadAgentKind::Obswiki.as_str(), "obswiki");
     /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Main => "main",
             Self::Browser => "browser",
+            Self::Obswiki => "obswiki",
         }
     }
 

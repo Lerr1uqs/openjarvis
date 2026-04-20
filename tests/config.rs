@@ -512,6 +512,55 @@ llm:
 }
 
 #[test]
+fn obswiki_vault_path_resolves_relative_to_config_root() {
+    let fixture = ConfigFixture::new("openjarvis-obswiki-relative-path");
+    fixture.write_yaml(
+        r#"
+agent:
+  tool:
+    obswiki:
+      enabled: true
+      vault_path: "runtime/wiki-vault"
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    );
+
+    let config = AppConfig::from_path(fixture.config_path())
+        .expect("obswiki relative vault path should resolve");
+
+    assert_eq!(
+        config
+            .agent_config()
+            .tool_config()
+            .obswiki_config()
+            .vault_path(),
+        fixture.root.join("runtime/wiki-vault").as_path()
+    );
+}
+
+#[test]
+fn obswiki_enabled_requires_non_blank_obsidian_bin() {
+    let error = AppConfig::from_yaml_str(
+        r#"
+agent:
+  tool:
+    obswiki:
+      enabled: true
+      vault_path: "/tmp/obswiki"
+      obsidian_bin: "   "
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+    )
+    .expect_err("blank obsidian_bin should fail validation");
+
+    assert!(format!("{error:#}").contains("agent.tool.obswiki.obsidian_bin must not be blank"));
+}
+
+#[test]
 fn session_memory_backend_parses_from_yaml() {
     let config = AppConfig::from_yaml_str(
         r#"

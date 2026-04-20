@@ -74,6 +74,113 @@ fn write_mock_browser_sidecar_wrapper(root: &Path, extra_env: &[(&str, &str)]) -
     wrapper_path
 }
 
+fn write_mock_obswiki_cli(root: &Path) -> PathBuf {
+    let script_path = root.join("mock-obswiki-cli.py");
+    let running_flag = root.join("obsidian-running.flag");
+    let script = r##"#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+cwd = Path.cwd()
+running_flag = Path(r"__RUNNING_FLAG__")
+
+def parse(args):
+    data = {}
+    flags = set()
+    for arg in args:
+        if "=" in arg:
+            key, value = arg.split("=", 1)
+            data[key] = value
+        else:
+            flags.add(arg)
+    return data, flags
+
+if len(sys.argv) < 2:
+    sys.exit(0)
+
+command = sys.argv[1]
+data, flags = parse(sys.argv[2:])
+
+if command in {"help", "--help"}:
+    sys.exit(0)
+
+if not running_flag.exists():
+    print("obsidian app not started", file=sys.stderr)
+    sys.exit(7)
+
+if command == "create":
+    target = cwd / data["path"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and "overwrite" not in flags:
+        print("exists", file=sys.stderr)
+        sys.exit(2)
+    target.write_text(data.get("content", ""), encoding="utf-8")
+    print(data["path"])
+    sys.exit(0)
+
+if command == "read":
+    target = cwd / data["path"]
+    if not target.exists():
+        print("missing", file=sys.stderr)
+        sys.exit(4)
+    print(target.read_text(encoding="utf-8"), end="")
+    sys.exit(0)
+
+if command == "files":
+    folder = data.get("folder", "")
+    extension = data.get("ext", "md")
+    root = cwd / folder
+    results = []
+    if root.exists():
+        for file in sorted(root.rglob(f"*.{extension}")):
+            results.append(file.relative_to(cwd).as_posix())
+    print("\n".join(results))
+    sys.exit(0)
+
+if command == "search":
+    query = data.get("query", "").lower()
+    limit = int(data.get("limit", "10"))
+    scope = data.get("path")
+    search_root = cwd / scope if scope else cwd
+    results = []
+    if search_root.exists():
+        for file in sorted(search_root.rglob("*.md")):
+            rel = file.relative_to(cwd).as_posix()
+            text = file.read_text(encoding="utf-8")
+            if query in rel.lower() or query in text.lower():
+                results.append(rel)
+                if len(results) >= limit:
+                    break
+    if data.get("format") == "json":
+        print(json.dumps(results))
+    else:
+        print("\n".join(results))
+    sys.exit(0)
+
+print(f"unsupported command: {command}", file=sys.stderr)
+sys.exit(9)
+"##
+    .replace("__RUNNING_FLAG__", &running_flag.display().to_string());
+    fs::write(&script_path, script).expect("mock obswiki cli should be written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(&script_path).expect("mock obswiki cli metadata should exist");
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)
+            .expect("mock obswiki cli permissions should apply");
+    }
+    script_path
+}
+
+fn mark_obsidian_running(root: &Path) {
+    fs::write(root.join("obsidian-running.flag"), "running")
+        .expect("obsidian running flag should be written");
+}
+
 fn acpx_skill_resource_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/unittest/skills/acpx/SKILL.md")
 }
@@ -348,6 +455,60 @@ fn internal_browser_smoke_helper_supports_attach_mode_with_explicit_endpoint() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("open: mode=Attach"));
     assert!(!stdout.contains("open: mode=Launch"));
+}
+
+#[test]
+fn internal_obswiki_prompt_helper_runs_child_thread_with_loaded_config() {
+    // 测试场景: internal-obswiki helper 应能独立加载配置并直接驱动 obswiki child thread 返回结果。
+    let fixture = MainConfigFixture::new("openjarvis-main-obswiki-helper");
+    let vault_root = fixture.root().join("vault");
+    fs::create_dir_all(vault_root.join("raw")).expect("raw dir should exist");
+    fs::create_dir_all(vault_root.join("wiki")).expect("wiki dir should exist");
+    fs::create_dir_all(vault_root.join("schema")).expect("schema dir should exist");
+    fs::write(
+        vault_root.join("AGENTS.md"),
+        "# Vault\n\nFollow the vault rules.\n",
+    )
+    .expect("AGENTS.md should exist");
+    fs::write(
+        vault_root.join("index.md"),
+        "# Index\n\n- [wiki/guide.md|Guide summary]\n",
+    )
+    .expect("index.md should exist");
+    fs::write(vault_root.join("wiki/guide.md"), "# Guide\n\nGuide body.\n")
+        .expect("guide page should exist");
+    mark_obsidian_running(fixture.root());
+    let obsidian_bin = write_mock_obswiki_cli(fixture.root());
+    fixture.write_yaml(&format!(
+        r#"
+agent:
+  tool:
+    obswiki:
+      enabled: true
+      vault_path: "{}"
+      obsidian_bin: "{}"
+llm:
+  protocol: "mock"
+  provider: "mock"
+  mock_response: "obswiki-helper-ok"
+"#,
+        vault_root.display(),
+        obsidian_bin.display(),
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_openjarvis"))
+        .arg("internal-obswiki")
+        .arg("prompt")
+        .arg("--content")
+        .arg("summarize current vault")
+        .env("OPENJARVIS_CONFIG", fixture.config_path())
+        .current_dir(fixture.root())
+        .output()
+        .expect("internal obswiki helper should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("obswiki-helper-ok"));
 }
 
 #[test]

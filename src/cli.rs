@@ -73,6 +73,14 @@ impl OpenJarvisCli {
         }
     }
 
+    /// Return the parsed internal `obswiki` command when the binary is running in helper mode.
+    pub fn internal_obswiki_command(&self) -> Option<&InternalObswikiCommand> {
+        match &self.command {
+            Some(OpenJarvisCommand::InternalObswiki(arguments)) => Some(&arguments.command),
+            _ => None,
+        }
+    }
+
     /// Return the parsed internal sandbox command when the binary is running in helper mode.
     pub fn internal_sandbox_command(&self) -> Option<&InternalSandboxCommand> {
         match &self.command {
@@ -114,6 +122,9 @@ pub enum OpenJarvisCommand {
     /// Internal browser helpers used by local smoke verification and tests.
     #[command(name = "internal-browser", hide = true)]
     InternalBrowser(InternalBrowserArgs),
+    /// Internal obswiki helpers used by local vault verification and tests.
+    #[command(name = "internal-obswiki", hide = true)]
+    InternalObswiki(InternalObswikiArgs),
     /// Internal sandbox helpers used by the bubblewrap runtime.
     #[command(name = "internal-sandbox", hide = true)]
     InternalSandbox(InternalSandboxArgs),
@@ -126,6 +137,7 @@ impl OpenJarvisCommand {
             Self::Skill(_) => "skill",
             Self::InternalMcp(_) => "internal-mcp",
             Self::InternalBrowser(_) => "internal-browser",
+            Self::InternalObswiki(_) => "internal-obswiki",
             Self::InternalSandbox(_) => "internal-sandbox",
         }
     }
@@ -192,6 +204,13 @@ impl InternalMcpCommand {
 pub struct InternalBrowserArgs {
     #[command(subcommand)]
     pub command: InternalBrowserCommand,
+}
+
+/// Arguments for the hidden `internal-obswiki` helper namespace.
+#[derive(Debug, Clone, Args)]
+pub struct InternalObswikiArgs {
+    #[command(subcommand)]
+    pub command: InternalObswikiCommand,
 }
 
 /// Arguments for the hidden `internal-sandbox` helper namespace.
@@ -288,6 +307,18 @@ pub enum InternalBrowserCommand {
     /// Test-only mock sidecar that speaks the same JSON-line protocol as the Node sidecar.
     #[command(name = "mock-sidecar", hide = true)]
     MockSidecar,
+}
+
+/// Demo-only internal obswiki helper commands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum InternalObswikiCommand {
+    /// Execute one prompt directly against the `obswiki` child-thread profile.
+    #[command(name = "prompt")]
+    Prompt {
+        /// Prompt content that should be sent to the `obswiki` child thread.
+        #[arg(long)]
+        content: String,
+    },
 }
 
 /// Demo-only internal sandbox helper commands.

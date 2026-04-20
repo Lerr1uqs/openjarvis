@@ -29,11 +29,24 @@ pub(crate) fn managed_tool_names() -> &'static [&'static str] {
 pub async fn usage(thread_id: &str, tool_registry: &ToolRegistry) -> Option<String> {
     debug!(thread_id, "starting subagent feature usage prompt build");
     let catalog = if tool_registry.subagent_tools_available().await {
-        ThreadAgentKind::available_subagent_catalog()
+        let mut available = Vec::new();
+        for entry in ThreadAgentKind::available_subagent_catalog() {
+            let mut all_bound_toolsets_ready = true;
+            for toolset_name in entry.kind.default_bound_toolsets() {
+                if !tool_registry.toolset_registered(&toolset_name).await {
+                    all_bound_toolsets_ready = false;
+                    break;
+                }
+            }
+            if all_bound_toolsets_ready {
+                available.push(*entry);
+            }
+        }
+        available
     } else {
-        &[]
+        Vec::new()
     };
-    let prompt = render_prompt(catalog);
+    let prompt = render_prompt(&catalog);
     info!(
         thread_id,
         available_subagent_count = catalog.len(),

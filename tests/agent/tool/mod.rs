@@ -2,6 +2,7 @@ mod browser;
 mod command;
 mod edit;
 pub(crate) mod mcp;
+mod obswiki;
 mod read;
 mod schema;
 mod shell;

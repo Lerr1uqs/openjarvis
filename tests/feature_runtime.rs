@@ -5,6 +5,9 @@ use openjarvis::{
         AgentRuntime, FeatureResolver, HookRegistry, MemoryType, MemoryWriteRequest, ShellEnv,
         SubagentRunner, ToolCallRequest, ToolCallResult, ToolDefinition, ToolHandler, ToolRegistry,
         ToolSource, ToolsetCatalogEntry, empty_tool_input_schema,
+        tool::obswiki::{
+            ObswikiRuntimeConfig, ObswikiVaultLayout, register_obswiki_toolset_with_config,
+        },
     },
     config::{AppConfig, LLMConfig},
     llm::MockLLMProvider,
@@ -154,6 +157,136 @@ async fn install_mock_subagent_runner(
         .await
         .expect("builtin tools should register after subagent runner install");
     runner
+}
+
+fn write_mock_obswiki_cli(root: &Path) -> PathBuf {
+    let path = root.join("mock-obswiki-cli.py");
+    let running_flag = root.join("obsidian-running.flag");
+    let script = r##"#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+cwd = Path.cwd()
+running_flag = Path(r"__RUNNING_FLAG__")
+
+def parse(args):
+    data = {}
+    flags = set()
+    for arg in args:
+        if "=" in arg:
+            key, value = arg.split("=", 1)
+            data[key] = value
+        else:
+            flags.add(arg)
+    return data, flags
+
+if len(sys.argv) < 2:
+    sys.exit(0)
+
+command = sys.argv[1]
+data, flags = parse(sys.argv[2:])
+
+if command in {"help", "--help"}:
+    sys.exit(0)
+
+if not running_flag.exists():
+    print("obsidian app not started", file=sys.stderr)
+    sys.exit(7)
+
+if command == "create":
+    target = cwd / data["path"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and "overwrite" not in flags:
+        print("exists", file=sys.stderr)
+        sys.exit(2)
+    target.write_text(data.get("content", ""), encoding="utf-8")
+    print(data["path"])
+    sys.exit(0)
+
+if command == "read":
+    target = cwd / data["path"]
+    if not target.exists():
+        print("missing", file=sys.stderr)
+        sys.exit(4)
+    print(target.read_text(encoding="utf-8"), end="")
+    sys.exit(0)
+
+if command == "files":
+    folder = data.get("folder", "")
+    extension = data.get("ext", "md")
+    root = cwd / folder
+    results = []
+    if root.exists():
+        for file in sorted(root.rglob(f"*.{extension}")):
+            results.append(file.relative_to(cwd).as_posix())
+    print("\n".join(results))
+    sys.exit(0)
+
+if command == "search":
+    query = data.get("query", "").lower()
+    limit = int(data.get("limit", "10"))
+    scope = data.get("path")
+    search_root = cwd / scope if scope else cwd
+    results = []
+    if search_root.exists():
+        for file in sorted(search_root.rglob("*.md")):
+            rel = file.relative_to(cwd).as_posix()
+            text = file.read_text(encoding="utf-8")
+            if query in rel.lower() or query in text.lower():
+                results.append(rel)
+                if len(results) >= limit:
+                    break
+    if data.get("format") == "json":
+        print(json.dumps(results))
+    else:
+        print("\n".join(results))
+    sys.exit(0)
+
+print(f"unsupported command: {command}", file=sys.stderr)
+sys.exit(9)
+"##
+    .replace("__RUNNING_FLAG__", &running_flag.display().to_string());
+    fs::write(&path, script).expect("mock obswiki cli should be written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(&path).expect("mock obswiki cli metadata should exist");
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("mock obswiki cli permissions should apply");
+    }
+    path
+}
+
+fn mark_obsidian_running(root: &Path) {
+    fs::write(root.join("obsidian-running.flag"), "running")
+        .expect("obsidian running flag should be written");
+}
+
+fn build_obswiki_runtime_config(vault_root: &Path, obsidian_bin: &Path) -> ObswikiRuntimeConfig {
+    ObswikiVaultLayout::new(vault_root)
+        .ensure_default_skeleton()
+        .expect("obswiki feature runtime vault skeleton should exist");
+    let config = AppConfig::from_yaml_str(&format!(
+        r#"
+agent:
+  tool:
+    obswiki:
+      enabled: true
+      vault_path: "{}"
+      obsidian_bin: "{}"
+llm:
+  protocol: "mock"
+  provider: "mock"
+"#,
+        vault_root.display(),
+        obsidian_bin.display(),
+    ))
+    .expect("obswiki runtime config should parse");
+    ObswikiRuntimeConfig::from_agent_config(config.agent_config().tool_config().obswiki_config())
+        .expect("enabled obswiki config should resolve")
 }
 
 #[test]
@@ -692,6 +825,211 @@ async fn subagent_feature_prompt_is_only_injected_for_main_threads() {
         .expect("child thread tools should list");
     assert!(!child_tools.iter().any(|tool| tool.name == "spawn_subagent"));
     assert!(!child_tools.iter().any(|tool| tool.name == "send_subagent"));
+}
+
+#[tokio::test]
+async fn subagent_feature_prompt_lists_obswiki_when_toolset_is_registered() {
+    // 测试场景: obswiki toolset 已注册时，主线程 subagent catalog 必须把 obswiki profile 暴露出来。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-obswiki-catalog");
+    let registry = fixture.registry();
+    let compact_config = AppConfig::default().agent_config().compact_config().clone();
+    let _runner = install_mock_subagent_runner(&registry, compact_config.clone()).await;
+    let vault_root = fixture.root.join("vault");
+    mark_obsidian_running(&fixture.root);
+    let obsidian_bin = write_mock_obswiki_cli(&fixture.root);
+    register_obswiki_toolset_with_config(
+        &registry,
+        build_obswiki_runtime_config(&vault_root, &obsidian_bin),
+    )
+    .await
+    .expect("obswiki toolset should register");
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        compact_config,
+        FeatureResolver::development_default(Features::from_iter([Feature::Subagent])),
+    );
+
+    let mut main_thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_obswiki_catalog",
+            "thread_obswiki_catalog",
+            "thread_obswiki_catalog",
+        ),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut main_thread, ThreadAgentKind::Main)
+        .await
+        .expect("main thread should initialize");
+
+    let main_messages = main_thread.messages();
+    let subagent_prompt = main_messages
+        .iter()
+        .find(|message| message.content.contains("当前可用 subagent 数量:"))
+        .expect("main thread should receive subagent feature prompt");
+    assert!(
+        subagent_prompt
+            .content
+            .contains("当前可用 subagent 数量: 2")
+    );
+    assert!(subagent_prompt.content.contains("subagent_key: browser"));
+    assert!(subagent_prompt.content.contains("subagent_key: obswiki"));
+    assert!(subagent_prompt.content.contains("persist 模式"));
+}
+
+#[tokio::test]
+async fn obswiki_child_thread_initializes_with_vault_context_and_bound_tools() {
+    // 测试场景: obswiki child thread 初始化时必须注入 vault 状态/AGENTS/index，
+    // 只开启 skill feature，不继承 memory，并且内置工具只暴露 exec_command / load_skill。
+    let fixture = FeatureRuntimeFixture::new("openjarvis-feature-runtime-obswiki-child");
+    fixture.write_skill("obswiki_demo_skill", "obswiki-only fixture skill");
+    let registry = fixture.registry();
+    let vault_root = fixture.root.join("vault");
+    mark_obsidian_running(&fixture.root);
+    let obsidian_bin = write_mock_obswiki_cli(&fixture.root);
+    register_obswiki_toolset_with_config(
+        &registry,
+        build_obswiki_runtime_config(&vault_root, &obsidian_bin),
+    )
+    .await
+    .expect("obswiki toolset should register");
+    let compact_config = AppConfig::default().agent_config().compact_config().clone();
+    let runtime = ThreadRuntime::with_feature_resolver(
+        Arc::clone(&registry),
+        registry.memory_repository(),
+        compact_config,
+        FeatureResolver::development_default(Features::default()),
+    );
+
+    let mut seed_thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_obswiki_seed",
+            "thread_obswiki_seed",
+            "thread_obswiki_seed",
+        ),
+        Utc::now(),
+    );
+    seed_thread.replace_loaded_toolsets(vec!["obswiki".to_string()]);
+    registry
+        .call_for_context(
+            &mut seed_thread,
+            ToolCallRequest {
+                name: "obswiki_write".to_string(),
+                arguments: json!({
+                    "path": "wiki/guide.md",
+                    "title": "Guide",
+                    "content": "# Guide\n\nKnowledge entry",
+                    "page_type": "guide",
+                }),
+            },
+        )
+        .await
+        .expect("seed wiki page should be created");
+
+    let mut child_thread = Thread::new(
+        ThreadContextLocator::new(
+            None,
+            "feishu",
+            "ou_obswiki_child",
+            "thread_obswiki_child",
+            derive_child_thread_id("thread_obswiki_child", "obswiki").to_string(),
+        )
+        .with_child_thread(ChildThreadIdentity::new(
+            "thread_obswiki_child",
+            "obswiki",
+            SubagentSpawnMode::Persist,
+        )),
+        Utc::now(),
+    );
+    runtime
+        .initialize_thread(&mut child_thread, ThreadAgentKind::Obswiki)
+        .await
+        .expect("obswiki child thread should initialize");
+
+    assert_eq!(child_thread.thread_agent_kind(), ThreadAgentKind::Obswiki);
+    assert_eq!(child_thread.enabled_features().names(), vec!["skill"]);
+    assert_eq!(child_thread.load_toolsets(), vec!["obswiki".to_string()]);
+    assert!(
+        child_thread
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("Obswiki vault runtime status:"))
+    );
+    assert!(child_thread.messages().iter().any(|message| {
+        message
+            .content
+            .contains("Obswiki vault `AGENTS.md` 正文如下:")
+    }));
+    assert!(
+        child_thread
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("[wiki/guide.md|"))
+    );
+    assert!(child_thread.messages().iter().any(|message| {
+        message.content.contains("Available local skills")
+            && message.content.contains("obswiki_demo_skill")
+    }));
+    assert!(child_thread.messages().iter().all(|message| {
+        !message.content.contains("memory feature")
+            && !message.content.contains("Memory toolset")
+            && !message.content.contains("当前可用 subagent 数量:")
+    }));
+
+    let visible_tools = registry
+        .list_for_context(&child_thread)
+        .await
+        .expect("obswiki child tools should list");
+    assert!(
+        visible_tools
+            .iter()
+            .any(|tool| tool.name == "obswiki_search")
+    );
+    assert!(visible_tools.iter().any(|tool| tool.name == "obswiki_read"));
+    assert!(
+        visible_tools
+            .iter()
+            .any(|tool| tool.name == "obswiki_write")
+    );
+    assert!(
+        visible_tools
+            .iter()
+            .any(|tool| tool.name == "obswiki_update")
+    );
+    assert!(visible_tools.iter().any(|tool| tool.name == "exec_command"));
+    assert!(visible_tools.iter().any(|tool| tool.name == "load_skill"));
+    assert!(
+        !visible_tools
+            .iter()
+            .any(|tool| tool.name == "spawn_subagent")
+    );
+    assert!(!visible_tools.iter().any(|tool| tool.name == "memory_get"));
+    assert!(!visible_tools.iter().any(|tool| tool.name == "write_stdin"));
+    assert!(
+        !visible_tools
+            .iter()
+            .any(|tool| tool.name == "list_unread_command_tasks")
+    );
+
+    let error = registry
+        .call_for_context(
+            &mut child_thread,
+            ToolCallRequest {
+                name: "write_stdin".to_string(),
+                arguments: json!({
+                    "session_id": "blocked",
+                    "chars": "",
+                }),
+            },
+        )
+        .await
+        .expect_err("obswiki child thread should reject disallowed builtin command session tools");
+    assert!(format!("{error:#}").contains("tool `write_stdin` is not enabled"));
 }
 
 #[tokio::test]

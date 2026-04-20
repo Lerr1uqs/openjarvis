@@ -13,6 +13,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 pub const BUILTIN_MCP_SERVER_NAME: &str = "builtin_demo_stdio";
+pub const DEFAULT_OBSWIKI_VAULT_RELATIVE_PATH: &str = ".openjarvis/obswiki";
 const EXTERNAL_MCP_CONFIG_RELATIVE_PATH: &str = "config/openjarvis/mcp.json";
 const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1_024;
@@ -1084,6 +1085,7 @@ impl AgentCompactConfig {
 pub struct AgentToolConfig {
     mcp: AgentMcpConfig,
     browser: AgentBrowserToolConfig,
+    obswiki: AgentObswikiToolConfig,
 }
 
 impl AgentToolConfig {
@@ -1113,13 +1115,28 @@ impl AgentToolConfig {
         &self.browser
     }
 
+    /// Return the configured `obswiki` runtime subsection.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::AppConfig;
+    ///
+    /// let config = AppConfig::default();
+    /// assert!(!config.agent_config().tool_config().obswiki_config().enabled());
+    /// ```
+    pub fn obswiki_config(&self) -> &AgentObswikiToolConfig {
+        &self.obswiki
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         self.mcp.validate()?;
-        self.browser.validate()
+        self.browser.validate()?;
+        self.obswiki.validate()
     }
 
     fn resolve_paths(&mut self, config_path: &Path) {
         self.browser.resolve_paths(config_path);
+        self.obswiki.resolve_paths(config_path);
     }
 }
 
@@ -1185,6 +1202,94 @@ impl AgentBrowserToolConfig {
 
         let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
         *path = config_root.join(&*path);
+    }
+}
+
+/// Obsidian-backed local wiki runtime configuration loaded from `agent.tool.obswiki`.
+///
+/// # 示例
+/// ```rust
+/// use openjarvis::config::{AppConfig, DEFAULT_OBSWIKI_VAULT_RELATIVE_PATH};
+///
+/// let config = AppConfig::default();
+/// let obswiki = config.agent_config().tool_config().obswiki_config();
+///
+/// assert!(!obswiki.enabled());
+/// assert_eq!(
+///     obswiki.vault_path().to_string_lossy(),
+///     DEFAULT_OBSWIKI_VAULT_RELATIVE_PATH
+/// );
+/// assert_eq!(obswiki.obsidian_bin(), "obsidian");
+/// assert!(obswiki.qmd_bin().is_none());
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentObswikiToolConfig {
+    enabled: bool,
+    vault_path: PathBuf,
+    obsidian_bin: String,
+    qmd_bin: Option<String>,
+}
+
+impl Default for AgentObswikiToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vault_path: PathBuf::from(DEFAULT_OBSWIKI_VAULT_RELATIVE_PATH),
+            obsidian_bin: "obsidian".to_string(),
+            qmd_bin: None,
+        }
+    }
+}
+
+impl AgentObswikiToolConfig {
+    /// Return whether the `obswiki` runtime should be enabled.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Return the configured Obsidian vault root path.
+    pub fn vault_path(&self) -> &Path {
+        &self.vault_path
+    }
+
+    /// Return the executable used to invoke the Obsidian CLI.
+    pub fn obsidian_bin(&self) -> &str {
+        &self.obsidian_bin
+    }
+
+    /// Return the optional QMD CLI executable used for preferred lexical search.
+    pub fn qmd_bin(&self) -> Option<&str> {
+        self.qmd_bin.as_deref()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.vault_path.as_os_str().is_empty() {
+            bail!("agent.tool.obswiki.vault_path must not be blank");
+        }
+        if self.obsidian_bin.trim().is_empty() {
+            bail!("agent.tool.obswiki.obsidian_bin must not be blank");
+        }
+        if self
+            .qmd_bin
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("agent.tool.obswiki.qmd_bin must not be blank when configured");
+        }
+        Ok(())
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) {
+        if self.vault_path.is_absolute() || self.vault_path.as_os_str().is_empty() {
+            return;
+        }
+
+        let config_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        self.vault_path = config_root.join(&self.vault_path);
     }
 }
 

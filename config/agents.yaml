@@ -40,3 +40,23 @@ browser:
     optional:
       mode: none
       names: []
+
+obswiki:
+  system_prompt: obswiki
+  features:
+    init_policy: defaults
+    default:
+      - skill
+    allowed:
+      - skill
+  visible_tools:
+    mode: only
+    names:
+      - exec_command
+      - load_skill
+  toolsets:
+    bound:
+      - obswiki
+    optional:
+      mode: none
+      names: []
