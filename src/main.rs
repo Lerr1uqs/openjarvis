@@ -1,6 +1,6 @@
 //! Binary entrypoint that loads configuration, boots channels, and waits for shutdown signals.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use openjarvis::{
     agent::{AgentWorker, SkillRegistry},
@@ -9,6 +9,7 @@ use openjarvis::{
     command::CommandRegistry,
     config::{AppConfig, SessionStoreBackend, install_global_config},
     logging,
+    queue::{PostgresTopicQueue, TopicQueue},
     router::ChannelRouter,
     session::{MemorySessionStore, SessionManager, SessionStore, SqliteSessionStore},
 };
@@ -94,9 +95,19 @@ async fn main() -> Result<()> {
                 .await?,
             ),
         };
+    let queue_database_url = config
+        .queue_config()
+        .database_url()
+        .context("queue.database_url is required to run the PostgreSQL topic queue")?;
+    let topic_queue: Arc<dyn TopicQueue> = Arc::new(
+        PostgresTopicQueue::connect(queue_database_url, config.queue_config().runtime_config())
+            .await?,
+    );
+    topic_queue.initialize_schema().await?;
 
     let mut router = ChannelRouter::builder()
         .agent(agent)
+        .topic_queue(topic_queue)
         .session_manager(SessionManager::with_store(session_store).await?)
         .command_registry(command_registry)
         .build()?;

@@ -12,6 +12,7 @@ pub mod context;
 pub mod llm;
 pub mod logging;
 pub mod model;
+pub mod queue;
 pub mod router;
 pub mod session;
 pub mod skill;

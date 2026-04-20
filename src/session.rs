@@ -12,6 +12,7 @@ use crate::thread::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -28,7 +29,7 @@ pub use store::{
 const OPENJARVIS_SESSION_ID_NAMESPACE: Uuid =
     Uuid::from_u128(0x2c427c19_1ec5_4637_8fb6_930f5d84ec48);
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionKey {
     pub channel: String,
     pub user_id: String,
@@ -98,7 +99,7 @@ impl SessionKey {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadLocator {
     pub session_id: Uuid,
     pub channel: String,
@@ -281,6 +282,13 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Outcome of one "prepare thread only when missing from current-process cache" decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadPrepareOutcome {
+    AlreadyLoaded,
+    PreparedColdThread,
+}
+
 type SharedThreadContext = Arc<Mutex<Thread>>;
 
 #[derive(Debug, Clone)]
@@ -394,7 +402,41 @@ impl SessionManager {
             .clone()
     }
 
-    fn resolve_thread_locator(&self, incoming: &IncomingMessage) -> ThreadLocator {
+    /// Resolve one stable thread locator from the normalized incoming message without creating or
+    /// loading the thread.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use chrono::Utc;
+    /// use openjarvis::{
+    ///     model::{IncomingMessage, ReplyTarget},
+    ///     session::SessionManager,
+    /// };
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let manager = SessionManager::new();
+    /// let incoming = IncomingMessage {
+    ///     id: Uuid::new_v4(),
+    ///     external_message_id: Some("msg_resolve".to_string()),
+    ///     channel: "feishu".to_string(),
+    ///     user_id: "ou_resolve".to_string(),
+    ///     user_name: None,
+    ///     content: "hello".to_string(),
+    ///     external_thread_id: Some("chat_resolve".to_string()),
+    ///     received_at: Utc::now(),
+    ///     metadata: json!({}),
+    ///     attachments: Vec::new(),
+    ///     reply_target: ReplyTarget {
+    ///         receive_id: "oc_resolve".to_string(),
+    ///         receive_id_type: "chat_id".to_string(),
+    ///     },
+    /// };
+    ///
+    /// let locator = manager.resolve_locator(&incoming);
+    /// assert_eq!(locator.thread_key(), "ou_resolve:feishu:chat_resolve");
+    /// ```
+    pub fn resolve_locator(&self, incoming: &IncomingMessage) -> ThreadLocator {
         let session_key = SessionKey::from_incoming(incoming);
         let external_thread_id = incoming.resolved_external_thread_id();
         let session_id = session_key.derive_session_id();
@@ -439,9 +481,44 @@ impl SessionManager {
         incoming: &IncomingMessage,
         thread_agent_kind: ThreadAgentKind,
     ) -> SessionStoreResult<ThreadLocator> {
-        let locator = self.resolve_thread_locator(incoming);
+        let locator = self.resolve_locator(incoming);
         self.create_thread_at(&locator, incoming.received_at, thread_agent_kind)
             .await
+    }
+
+    /// Return whether the current process already has one live cached handle for the locator.
+    pub async fn is_thread_loaded(&self, locator: &ThreadLocator) -> bool {
+        self.cached_thread_handle(locator).await.is_some()
+    }
+
+    /// Prepare one thread only when the current process has not loaded it yet.
+    ///
+    /// This keeps router-side queue ingress from re-running create logic for already hot threads.
+    pub async fn prepare_thread_if_needed(
+        &self,
+        locator: &ThreadLocator,
+        now: DateTime<Utc>,
+        thread_agent_kind: ThreadAgentKind,
+    ) -> SessionStoreResult<ThreadPrepareOutcome> {
+        if self.is_thread_loaded(locator).await {
+            info!(
+                session_id = %locator.session_id,
+                thread_id = %locator.thread_id,
+                thread_key = %locator.thread_key(),
+                "reused loaded thread without rerunning create path"
+            );
+            return Ok(ThreadPrepareOutcome::AlreadyLoaded);
+        }
+
+        self.create_thread_at(locator, now, thread_agent_kind)
+            .await?;
+        info!(
+            session_id = %locator.session_id,
+            thread_id = %locator.thread_id,
+            thread_key = %locator.thread_key(),
+            "prepared cold thread before topic queue enqueue"
+        );
+        Ok(ThreadPrepareOutcome::PreparedColdThread)
     }
 
     /// Prepare one thread from an explicit resolved locator.

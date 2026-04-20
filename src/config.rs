@@ -1,6 +1,6 @@
 //! Configuration loading and default values for the application, channels, and LLM provider.
 
-use crate::thread::Features;
+use crate::{queue::TopicQueueRuntimeConfig, thread::Features};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -112,6 +112,7 @@ pub struct AppConfig {
     server: ServerConfig,
     logging: LoggingConfig,
     session: SessionConfig,
+    queue: QueueConfig,
     #[serde(flatten)]
     channels: ChannelConfig,
     agent: AgentConfig,
@@ -124,6 +125,7 @@ impl Default for AppConfig {
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             session: SessionConfig::default(),
+            queue: QueueConfig::default(),
             channels: ChannelConfig::default(),
             agent: AgentConfig::default(),
             llm: LLMConfig::default(),
@@ -267,6 +269,11 @@ impl AppConfig {
         &self.session
     }
 
+    /// Return the read-only PostgreSQL topic queue configuration view.
+    pub fn queue_config(&self) -> &QueueConfig {
+        &self.queue
+    }
+
     /// Return the read-only agent runtime configuration view.
     ///
     /// # 示例
@@ -319,6 +326,7 @@ impl AppConfig {
         self.logging.validate()?;
         self.channels.validate()?;
         self.session.validate()?;
+        self.queue.validate()?;
         self.llm.validate()?;
         self.agent.validate()
     }
@@ -409,6 +417,12 @@ impl AppConfigBuilderForTest {
     /// Replace the session section used by the test config under construction.
     pub fn session(mut self, session: SessionConfig) -> Self {
         self.config.session = session;
+        self
+    }
+
+    /// Replace the queue section used by the test config under construction.
+    pub fn queue(mut self, queue: QueueConfig) -> Self {
+        self.config.queue = queue;
         self
     }
 
@@ -727,6 +741,110 @@ impl SessionConfig {
 
     pub(crate) fn resolve_paths(&mut self, config_path: &Path) {
         self.persistence.resolve_paths(config_path);
+    }
+}
+
+/// PostgreSQL topic queue configuration loaded from `queue`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueueConfig {
+    database_url: String,
+    lease_ttl_secs: u64,
+    heartbeat_interval_secs: u64,
+    idle_timeout_secs: u64,
+    reconcile_interval_secs: u64,
+    pending_topic_scan_limit: usize,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            database_url: String::new(),
+            lease_ttl_secs: 30,
+            heartbeat_interval_secs: 10,
+            idle_timeout_secs: 5,
+            reconcile_interval_secs: 10,
+            pending_topic_scan_limit: 128,
+        }
+    }
+}
+
+impl QueueConfig {
+    /// Return the configured PostgreSQL database URL when present.
+    ///
+    /// # 示例
+    /// ```rust
+    /// use openjarvis::config::QueueConfig;
+    ///
+    /// let config = QueueConfig::default();
+    /// assert!(config.database_url().is_none());
+    /// ```
+    pub fn database_url(&self) -> Option<&str> {
+        let database_url = self.database_url.trim();
+        if database_url.is_empty() {
+            None
+        } else {
+            Some(database_url)
+        }
+    }
+
+    /// Return the worker lease ttl in seconds.
+    pub fn lease_ttl_secs(&self) -> u64 {
+        self.lease_ttl_secs
+    }
+
+    /// Return the worker heartbeat interval in seconds.
+    pub fn heartbeat_interval_secs(&self) -> u64 {
+        self.heartbeat_interval_secs
+    }
+
+    /// Return the domain worker idle timeout in seconds.
+    pub fn idle_timeout_secs(&self) -> u64 {
+        self.idle_timeout_secs
+    }
+
+    /// Return the router maintenance reconciliation interval in seconds.
+    pub fn reconcile_interval_secs(&self) -> u64 {
+        self.reconcile_interval_secs
+    }
+
+    /// Return the maximum number of pending topics scanned in one maintenance pass.
+    pub fn pending_topic_scan_limit(&self) -> usize {
+        self.pending_topic_scan_limit
+    }
+
+    /// Convert the config snapshot into queue runtime knobs used by router reconciliation and
+    /// domain workers.
+    pub fn runtime_config(&self) -> TopicQueueRuntimeConfig {
+        TopicQueueRuntimeConfig {
+            lease_ttl: std::time::Duration::from_secs(self.lease_ttl_secs),
+            heartbeat_interval: std::time::Duration::from_secs(self.heartbeat_interval_secs),
+            idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
+            reconcile_interval: std::time::Duration::from_secs(self.reconcile_interval_secs),
+            pending_topic_scan_limit: self.pending_topic_scan_limit,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.lease_ttl_secs == 0 {
+            bail!("queue.lease_ttl_secs must be greater than 0");
+        }
+        if self.heartbeat_interval_secs == 0 {
+            bail!("queue.heartbeat_interval_secs must be greater than 0");
+        }
+        if self.idle_timeout_secs == 0 {
+            bail!("queue.idle_timeout_secs must be greater than 0");
+        }
+        if self.reconcile_interval_secs == 0 {
+            bail!("queue.reconcile_interval_secs must be greater than 0");
+        }
+        if self.pending_topic_scan_limit == 0 {
+            bail!("queue.pending_topic_scan_limit must be greater than 0");
+        }
+        if self.heartbeat_interval_secs >= self.lease_ttl_secs {
+            bail!("queue.heartbeat_interval_secs must be less than queue.lease_ttl_secs");
+        }
+        Ok(())
     }
 }
 
