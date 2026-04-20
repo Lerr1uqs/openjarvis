@@ -154,7 +154,12 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         .await
         .expect("writer request should be accepted");
 
-    let writer_events = collect_until_commit(&mut writer_handle.event_rx).await;
+    let writer_events = collect_until_commit(
+        writer_handle
+            .event_rx_mut()
+            .expect("writer event receiver should be available"),
+    )
+    .await;
     let remembered_thread = extract_completed_thread(&writer_events);
     let memory_file = fixture.memory_root().join("active/workflow/notion.md");
     let written = std::fs::read_to_string(&memory_file).expect("memory file should exist");
@@ -185,7 +190,12 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         })
         .await
         .expect("same-thread follow-up should be accepted");
-    let _ = collect_until_commit(&mut reader_handle.event_rx).await;
+    let _ = collect_until_commit(
+        reader_handle
+            .event_rx_mut()
+            .expect("reader event receiver should be available"),
+    )
+    .await;
 
     let captured_requests = requests.lock().await;
     let same_thread_messages = &captured_requests[0].messages;
@@ -227,7 +237,12 @@ async fn active_memory_write_persists_to_filesystem_and_only_reappears_after_rei
         })
         .await
         .expect("reinit follow-up should be accepted");
-    let reinit_events = collect_until_commit(&mut reader_handle.event_rx).await;
+    let reinit_events = collect_until_commit(
+        reader_handle
+            .event_rx_mut()
+            .expect("reader event receiver should be available"),
+    )
+    .await;
     let reinit_thread = extract_completed_thread(&reinit_events);
     let captured_requests = requests.lock().await;
     let reinit_messages = &captured_requests[1].messages;

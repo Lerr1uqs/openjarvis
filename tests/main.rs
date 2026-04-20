@@ -1,3 +1,6 @@
+#[path = "support/mod.rs"]
+mod support;
+
 use openjarvis::{
     agent::{AgentWorker, SkillManifest},
     config::{AppConfig, install_global_config},
@@ -10,7 +13,9 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
 };
+use support::TestTopicQueue;
 use uuid::Uuid;
 
 struct MainConfigFixture {
@@ -193,6 +198,7 @@ async fn startup_components_build_from_default_config() {
         .expect("agent should build");
     let _router = ChannelRouter::builder()
         .agent(agent)
+        .topic_queue(Arc::new(TestTopicQueue::default()))
         .build()
         .expect("router should build");
 }
@@ -209,6 +215,7 @@ async fn startup_components_build_from_installed_global_config() {
         .expect("agent should build from global config");
     let _router = ChannelRouter::builder()
         .agent(agent)
+        .topic_queue(Arc::new(TestTopicQueue::default()))
         .build()
         .expect("router should build");
 }

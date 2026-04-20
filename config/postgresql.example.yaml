@@ -1,0 +1,61 @@
+server:
+  bind: "0.0.0.0:3000"
+
+logging:
+  level: "info"
+  stderr: true
+  stderr_ansi: false
+  file:
+    enabled: true
+    directory: "../logs"
+    rotation: "daily"
+    filename_prefix: "openjarvis"
+    filename_suffix: "log"
+    max_files: 7
+
+session:
+  persistence:
+    backend: "sqlite"
+    sqlite:
+      path: "../data/openjarvis/session.sqlite3"
+
+queue:
+  database_url: "postgres://admin:123456@127.0.0.1:5432/openjarvis"
+  lease_ttl_secs: 30
+  heartbeat_interval_secs: 10
+  idle_timeout_secs: 5
+  reconcile_interval_secs: 10
+  pending_topic_scan_limit: 128
+
+feishu:
+  mode: "long_connection"
+  webhook_path: "/webhook/feishu"
+  open_base_url: "https://open.feishu.cn"
+  app_id: "cli_xxx"
+  app_secret: "xxx"
+  verification_token: ""
+  encrypt_key: ""
+  dry_run: true
+  auto_start_sidecar: true
+  node_bin: "node"
+  sidecar_script: "scripts/feishu_ws_client.mjs"
+
+agent:
+  hook: {}
+  compact:
+    enabled: false
+    auto_compact: false
+    runtime_threshold_ratio: 0.85
+    tool_visible_threshold_ratio: 0.70
+    reserved_output_tokens: 1024
+
+llm:
+  provider: "mock"
+  model: "mock-received"
+  base_url: "https://api.deepseek.com"
+  api_key: ""
+  api_key_path: ""
+  mock_response: "[openjarvis][DEBUG] 测试回复"
+  context_window_tokens: 8192
+  max_output_tokens: 1024
+  tokenizer: "chars_div4"

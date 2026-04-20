@@ -1,4 +1,9 @@
+#[path = "support/mod.rs"]
+mod support;
+
 use openjarvis::{agent::AgentWorkerHandle, router::ChannelRouter, session::SessionManager};
+use std::sync::Arc;
+use support::TestTopicQueue;
 use tokio::{
     sync::{mpsc, oneshot},
     time::{Duration, timeout},
@@ -10,13 +15,10 @@ async fn wait_for_test_shutdown(shutdown_rx: oneshot::Receiver<()>) {
 
 #[tokio::test]
 async fn router_run_stays_pending_while_service_is_healthy() {
-    let (request_tx, _request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive to model a healthy service.
     let mut router = ChannelRouter::builder()
-        .agent_handle(AgentWorkerHandle {
-            request_tx,
-            event_rx,
-        })
+        .agent_handle(AgentWorkerHandle::noop(event_rx))
+        .topic_queue(Arc::new(TestTopicQueue::default()))
         .session_manager(SessionManager::new())
         .build()
         .expect("router should build");
@@ -33,13 +35,10 @@ async fn router_run_stays_pending_while_service_is_healthy() {
 
 #[tokio::test]
 async fn router_run_until_shutdown_exits_when_shutdown_signal_arrives() {
-    let (request_tx, _request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: keeps the downstream event channel alive to model a healthy service.
     let mut router = ChannelRouter::builder()
-        .agent_handle(AgentWorkerHandle {
-            request_tx,
-            event_rx,
-        })
+        .agent_handle(AgentWorkerHandle::noop(event_rx))
+        .topic_queue(Arc::new(TestTopicQueue::default()))
         .session_manager(SessionManager::new())
         .build()
         .expect("router should build");
@@ -63,13 +62,10 @@ async fn router_run_until_shutdown_exits_when_shutdown_signal_arrives() {
 
 #[tokio::test]
 async fn router_returns_error_when_agent_event_channel_closes() {
-    let (request_tx, _request_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8); // test-only: drop this sender to simulate a crashed downstream worker.
     let mut router = ChannelRouter::builder()
-        .agent_handle(AgentWorkerHandle {
-            request_tx,
-            event_rx,
-        })
+        .agent_handle(AgentWorkerHandle::noop(event_rx))
+        .topic_queue(Arc::new(TestTopicQueue::default()))
         .session_manager(SessionManager::new())
         .build()
         .expect("router should build");

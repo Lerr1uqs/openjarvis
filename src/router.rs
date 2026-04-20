@@ -1,7 +1,7 @@
 //! Message router that multiplexes channel traffic and agent traffic in one main loop.
 
 use crate::agent::{
-    AgentDispatchEvent, AgentRequest, AgentWorker, AgentWorkerEvent, AgentWorkerHandle,
+    AgentDispatchEvent, AgentWorker, AgentWorkerEvent, AgentWorkerHandle,
     CommittedAgentDispatchItem,
 };
 use crate::attachment_syntax::AttachmentSyntaxParser;
@@ -10,11 +10,12 @@ use crate::channels::{Channel, ChannelRegistration};
 use crate::command::{CommandRegistry, CommandReply};
 use crate::config::ChannelConfig;
 use crate::model::{IncomingMessage, OutgoingMessage};
-use crate::session::{SessionManager, ThreadLocator};
+use crate::queue::{TopicQueue, TopicQueuePayload, TopicQueueRuntimeConfig};
+use crate::session::{SessionManager, ThreadPrepareOutcome};
 use crate::thread::ThreadAgentKind;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::future::{Future, pending};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -23,15 +24,15 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct ChannelRouter {
-    agent_tx: mpsc::Sender<AgentRequest>,
+    agent: AgentWorkerHandle,
     agent_event_rx: mpsc::Receiver<AgentWorkerEvent>,
+    queue: Arc<dyn TopicQueue>,
+    queue_runtime_config: TopicQueueRuntimeConfig,
     channel_incoming_streams: StreamMap<String, ReceiverStream<IncomingMessage>>,
     channels: HashMap<String, mpsc::Sender<OutgoingMessage>>,
     sessions: SessionManager,
     commands: CommandRegistry,
     feishu_deduper: FeishuMemoryDeduper,
-    pending_threads: Mutex<HashSet<ThreadLocator>>,
-    queued_messages: Mutex<HashMap<ThreadLocator, VecDeque<IncomingMessage>>>,
 }
 
 /// Builder for assembling one [`ChannelRouter`] around an agent worker or handle.
@@ -53,7 +54,9 @@ pub struct ChannelRouter {
 /// let _ = router.sessions();
 /// ```
 pub struct ChannelRouterBuilder {
+    agent: Option<AgentWorker>,
     agent_handle: Option<AgentWorkerHandle>,
+    queue: Option<Arc<dyn TopicQueue>>,
     sessions: SessionManager,
     commands: CommandRegistry,
 }
@@ -61,7 +64,9 @@ pub struct ChannelRouterBuilder {
 impl Default for ChannelRouterBuilder {
     fn default() -> Self {
         Self {
+            agent: None,
             agent_handle: None,
+            queue: None,
             sessions: SessionManager::new(),
             commands: CommandRegistry::default(),
         }
@@ -77,13 +82,19 @@ impl ChannelRouterBuilder {
     /// Attach one long-lived agent worker and spawn its runtime handle.
     pub fn agent(mut self, agent: AgentWorker) -> Self {
         self.sessions.install_thread_runtime(agent.thread_runtime());
-        self.agent_handle = Some(agent.spawn());
+        self.agent = Some(agent);
         self
     }
 
     /// Attach one already constructed agent handle.
     pub fn agent_handle(mut self, agent_handle: AgentWorkerHandle) -> Self {
         self.agent_handle = Some(agent_handle);
+        self
+    }
+
+    /// Attach the durable topic queue used for inbound ordinary messages and worker leases.
+    pub fn topic_queue(mut self, queue: Arc<dyn TopicQueue>) -> Self {
+        self.queue = Some(queue);
         self
     }
 
@@ -110,20 +121,29 @@ impl ChannelRouterBuilder {
 
     /// Build the router from the accumulated fields.
     pub fn build(self) -> Result<ChannelRouter> {
-        let Some(agent_handle) = self.agent_handle else {
+        let Some(queue) = self.queue else {
+            bail!("channel router builder requires a topic queue");
+        };
+        let mut agent_handle = if let Some(agent_handle) = self.agent_handle {
+            agent_handle
+        } else if let Some(agent) = self.agent {
+            agent.spawn(Arc::clone(&queue))
+        } else {
             bail!("channel router builder requires an agent worker or agent handle");
         };
+        let queue_runtime_config = queue.runtime_config();
+        let agent_event_rx = agent_handle.take_event_rx()?;
 
         Ok(ChannelRouter {
-            agent_tx: agent_handle.request_tx,
-            agent_event_rx: agent_handle.event_rx,
+            agent: agent_handle,
+            agent_event_rx,
+            queue,
+            queue_runtime_config,
             channel_incoming_streams: StreamMap::new(),
             channels: HashMap::new(),
             sessions: self.sessions,
             commands: self.commands,
             feishu_deduper: FeishuMemoryDeduper::default(),
-            pending_threads: Mutex::new(HashSet::new()),
-            queued_messages: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -150,17 +170,23 @@ impl ChannelRouter {
     ///     .build()
     ///     .expect("router should build");
     /// ```
-    pub fn new(agent: AgentWorker) -> Self {
+    pub fn new(agent: AgentWorker, queue: Arc<dyn TopicQueue>) -> Self {
         Self::builder()
             .agent(agent)
+            .topic_queue(queue)
             .build()
             .expect("channel router new should always have the required agent worker")
     }
 
     /// Create a router with an explicit session manager instance.
-    pub fn with_session_manager(agent: AgentWorker, sessions: SessionManager) -> Self {
+    pub fn with_session_manager(
+        agent: AgentWorker,
+        queue: Arc<dyn TopicQueue>,
+        sessions: SessionManager,
+    ) -> Self {
         Self::builder()
             .agent(agent)
+            .topic_queue(queue)
             .session_manager(sessions)
             .build()
             .expect(
@@ -174,26 +200,39 @@ impl ChannelRouter {
     /// ```rust,no_run
     /// use openjarvis::{
     ///     agent::AgentWorkerHandle,
+    ///     queue::{PostgresTopicQueue, TopicQueue, TopicQueueRuntimeConfig},
     ///     router::ChannelRouter,
     ///     session::SessionManager,
     /// };
+    /// use std::sync::Arc;
     /// use tokio::sync::mpsc;
     ///
-    /// let (request_tx, _request_rx) = mpsc::channel(8);
+    /// # async fn demo() -> anyhow::Result<()> {
     /// let (_event_tx, event_rx) = mpsc::channel(8);
-    /// let handle = AgentWorkerHandle { request_tx, event_rx };
-    /// let _router = ChannelRouter::builder()
-    ///     .agent_handle(handle)
-    ///     .session_manager(SessionManager::new())
-    ///     .build()
-    ///     .expect("router should build");
+    /// let handle = AgentWorkerHandle::noop(event_rx);
+    /// let queue: Arc<dyn TopicQueue> = Arc::new(
+    ///     PostgresTopicQueue::connect(
+    ///         "postgres://postgres:postgres@127.0.0.1:5432/openjarvis",
+    ///         TopicQueueRuntimeConfig::default(),
+    ///     )
+    ///     .await?,
+    /// );
+    /// let _router = ChannelRouter::with_session_manager_and_agent_handle(
+    ///     handle,
+    ///     queue,
+    ///     SessionManager::new(),
+    /// );
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_session_manager_and_agent_handle(
         agent_handle: AgentWorkerHandle,
+        queue: Arc<dyn TopicQueue>,
         sessions: SessionManager,
     ) -> Self {
         Self::builder()
             .agent_handle(agent_handle)
+            .topic_queue(queue)
             .session_manager(sessions)
             .build()
             .expect("channel router with_session_manager_and_agent_handle should always have the required agent handle")
@@ -352,6 +391,10 @@ impl ChannelRouter {
         F: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
+        let mut queue_reconcile_interval =
+            tokio::time::interval(self.queue_runtime_config.reconcile_interval);
+        queue_reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.reconcile_queue_state("startup").await?;
 
         loop {
             let channel_incoming_streams = &mut self.channel_incoming_streams;
@@ -359,6 +402,11 @@ impl ChannelRouter {
 
             tokio::select! {
                 _ = &mut shutdown => return Ok(()),
+                _ = queue_reconcile_interval.tick() => {
+                    if let Err(error) = self.reconcile_queue_state("maintenance").await {
+                        warn!(error = %error, "router failed to reconcile topic queue state");
+                    }
+                }
                 incoming = channel_incoming_streams.next(), if !channel_incoming_streams.is_empty() => {
                     if let Some((_channel_name, message)) = incoming {
                         if let Err(error) = self.handle_incoming(message).await {
@@ -394,13 +442,14 @@ impl ChannelRouter {
             "router accepted incoming message"
         );
 
-        let locator = self
-            .sessions
-            .create_thread(&message, ThreadAgentKind::Main)
-            .await?;
+        let locator = self.sessions.resolve_locator(&message);
 
         if self.commands.is_command(&message)? {
-            if self.is_thread_pending(&locator).await {
+            if self
+                .queue
+                .is_worker_active(&locator.thread_key(), Utc::now())
+                .await?
+            {
                 if let Some(reply) = self.commands.running_thread_reply(&message)? {
                     info!(
                         thread_id = %locator.thread_id,
@@ -412,6 +461,10 @@ impl ChannelRouter {
                     return Ok(());
                 }
             }
+            let locator = self
+                .sessions
+                .create_thread_at(&locator, message.received_at, ThreadAgentKind::Main)
+                .await?;
             let thread_context = self
                 .sessions
                 .lock_thread(&locator, message.received_at)
@@ -439,13 +492,46 @@ impl ChannelRouter {
             }
         }
 
-        if self.try_mark_thread_pending(&locator).await {
-            if let Err(error) = self.dispatch_to_agent(locator, message.clone()).await {
+        let prepare_outcome = self
+            .sessions
+            .prepare_thread_if_needed(&locator, message.received_at, ThreadAgentKind::Main)
+            .await?;
+        let queued = match self
+            .queue
+            .add(
+                &locator.thread_key(),
+                TopicQueuePayload::new(locator.clone(), message.clone()),
+            )
+            .await
+        {
+            Ok(queued) => queued,
+            Err(error) => {
                 self.complete_channel_dedup(&message, false).await;
                 return Err(error);
             }
-        } else {
-            self.enqueue_message(locator, message).await;
+        };
+        info!(
+            thread_id = %locator.thread_id,
+            thread_key = %locator.thread_key(),
+            queue_message_id = %queued.message_id,
+            thread_prepare_outcome = match prepare_outcome {
+                ThreadPrepareOutcome::AlreadyLoaded => "already_loaded",
+                ThreadPrepareOutcome::PreparedColdThread => "prepared_cold_thread",
+            },
+            "router enqueued ordinary incoming message into topic queue"
+        );
+        if let Err(error) = self
+            .agent
+            .ensure_worker(locator.thread_key(), self.sessions.clone())
+            .await
+        {
+            warn!(
+                thread_id = %locator.thread_id,
+                thread_key = %locator.thread_key(),
+                queue_message_id = %queued.message_id,
+                error = %format!("{error:#}"),
+                "failed to ensure domain worker after topic queue enqueue; maintenance loop will retry"
+            );
         }
         Ok(())
     }
@@ -461,7 +547,7 @@ impl ChannelRouter {
                     request.succeeded,
                 )
                 .await;
-                self.release_or_dispatch_next(&request.locator).await
+                Ok(())
             }
         }
     }
@@ -590,65 +676,42 @@ impl ChannelRouter {
         }
     }
 
-    async fn try_mark_thread_pending(&self, locator: &ThreadLocator) -> bool {
-        let mut pending_threads = self.pending_threads.lock().await;
-        pending_threads.insert(locator.clone())
-    }
-
-    async fn is_thread_pending(&self, locator: &ThreadLocator) -> bool {
-        let pending_threads = self.pending_threads.lock().await;
-        pending_threads.contains(locator)
-    }
-
-    async fn enqueue_message(&self, locator: ThreadLocator, message: IncomingMessage) {
-        let mut queued_messages = self.queued_messages.lock().await;
-        queued_messages
-            .entry(locator)
-            .or_default()
-            .push_back(message);
-    }
-
-    async fn dispatch_to_agent(
-        &self,
-        locator: ThreadLocator,
-        message: IncomingMessage,
-    ) -> Result<()> {
-        if let Err(error) = self
-            .agent_tx
-            .send(AgentRequest {
-                locator: locator.clone(),
-                incoming: message.clone(),
-                sessions: self.sessions.clone(),
-            })
-            .await
+    async fn reconcile_queue_state(&self, reason: &str) -> Result<()> {
+        let now = Utc::now();
+        let reap_report = self.queue.reap_expired(now).await?;
+        if !reap_report.expired_domains.is_empty() || !reap_report.recovered_message_ids.is_empty()
         {
-            self.pending_threads.lock().await.remove(&locator);
-            return Err(anyhow::anyhow!("failed to enqueue agent request: {error}"));
+            info!(
+                reason,
+                expired_domains = ?reap_report.expired_domains,
+                recovered_message_ids = ?reap_report.recovered_message_ids,
+                "router reconciled expired topic queue leases and stranded messages"
+            );
         }
-        Ok(())
-    }
 
-    async fn release_or_dispatch_next(&self, locator: &ThreadLocator) -> Result<()> {
-        let next_message = {
-            let queued_messages = self.queued_messages.lock().await;
-            queued_messages
-                .get(locator)
-                .and_then(|queue| queue.front().cloned())
-        };
-
-        if let Some(message) = next_message {
-            self.dispatch_to_agent(locator.clone(), message).await?;
-            let mut queued_messages = self.queued_messages.lock().await;
-            if let Some(queue) = queued_messages.get_mut(locator) {
-                queue.pop_front();
-                if queue.is_empty() {
-                    queued_messages.remove(locator);
-                }
-            }
+        let pending_topics = self
+            .queue
+            .pending_topics(self.queue_runtime_config.pending_topic_scan_limit)
+            .await?;
+        if pending_topics.is_empty() {
             return Ok(());
         }
 
-        self.pending_threads.lock().await.remove(locator);
+        info!(reason, pending_topics = ?pending_topics, "router ensuring workers for pending queue topics");
+        for topic in pending_topics {
+            if let Err(error) = self
+                .agent
+                .ensure_worker(topic.clone(), self.sessions.clone())
+                .await
+            {
+                warn!(
+                    reason,
+                    topic = %topic,
+                    error = %format!("{error:#}"),
+                    "router failed to ensure worker during topic queue reconciliation"
+                );
+            }
+        }
         Ok(())
     }
 }

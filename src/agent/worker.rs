@@ -14,14 +14,21 @@ use crate::config::{AgentCompactConfig, AppConfig, LLMConfig, global_config};
 use crate::context::{ChatMessage, ChatMessageRole};
 use crate::llm::{LLMProvider, build_provider, build_provider_from_global_config};
 use crate::model::IncomingMessage;
+use crate::queue::{
+    ClaimedTopicQueueMessage, TopicQueue, TopicQueueLeaseAcquireResult, TopicQueueWorkerLease,
+};
 use crate::session::{SessionManager, ThreadLocator};
 use crate::thread::{Thread, ThreadRuntime};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::warn;
+use std::{collections::HashSet, pin::Pin, sync::Arc, time::Duration as StdDuration};
+use tokio::{
+    sync::{Mutex, mpsc},
+    time::{Instant, Sleep},
+};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
@@ -52,8 +59,8 @@ pub enum AgentWorkerEvent {
 }
 
 pub struct AgentWorkerHandle {
-    pub request_tx: mpsc::Sender<AgentRequest>,
-    pub event_rx: mpsc::Receiver<AgentWorkerEvent>,
+    controller: AgentWorkerHandleController,
+    event_rx: Option<mpsc::Receiver<AgentWorkerEvent>>,
 }
 
 pub struct AgentWorker {
@@ -61,6 +68,18 @@ pub struct AgentWorker {
     thread_runtime: Arc<ThreadRuntime>,
     subagent_runner: Arc<SubagentRunner>,
     sandbox: Arc<dyn Sandbox>,
+}
+
+enum AgentWorkerHandleController {
+    DomainPool(Arc<AgentDomainWorkerPool>),
+    Noop,
+}
+
+struct AgentDomainWorkerPool {
+    worker: Arc<AgentWorker>,
+    queue: Arc<dyn TopicQueue>,
+    event_tx: mpsc::Sender<AgentWorkerEvent>,
+    live_domains: Arc<Mutex<HashSet<String>>>,
 }
 
 struct WorkerCommittedMessageHandler {
@@ -371,46 +390,45 @@ impl AgentWorker {
         self.sandbox.as_ref()
     }
 
-    /// Spawn the long-lived agent worker loop and return its router-facing channels.
+    /// Spawn the domain worker pool and return its router-facing event channel.
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use openjarvis::{agent::AgentWorker, llm::MockLLMProvider};
+    /// use openjarvis::{
+    ///     agent::AgentWorker,
+    ///     llm::MockLLMProvider,
+    ///     queue::{PostgresTopicQueue, TopicQueue, TopicQueueRuntimeConfig},
+    /// };
     /// use std::sync::Arc;
     ///
+    /// # async fn demo() -> anyhow::Result<()> {
     /// let worker = AgentWorker::builder()
     ///     .llm(Arc::new(MockLLMProvider::new("pong")))
     ///     .build()
     ///     .expect("worker should build");
-    /// let handle = worker.spawn();
-    /// let _ = handle.request_tx.clone();
+    /// let queue: Arc<dyn TopicQueue> = Arc::new(
+    ///     PostgresTopicQueue::connect(
+    ///         "postgres://postgres:postgres@127.0.0.1:5432/openjarvis",
+    ///         TopicQueueRuntimeConfig::default(),
+    ///     )
+    ///     .await?,
+    /// );
+    /// let mut handle = worker.spawn(queue);
+    /// let _ = handle.event_rx_mut()?.try_recv();
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn spawn(self) -> AgentWorkerHandle {
-        let (request_tx, request_rx) = mpsc::channel(128);
+    pub fn spawn(self, queue: Arc<dyn TopicQueue>) -> AgentWorkerHandle {
         let (event_tx, event_rx) = mpsc::channel(128);
-
-        tokio::spawn(async move {
-            self.run(request_rx, event_tx).await;
+        let pool = Arc::new(AgentDomainWorkerPool {
+            worker: Arc::new(self),
+            queue,
+            event_tx,
+            live_domains: Arc::new(Mutex::new(HashSet::new())),
         });
-
         AgentWorkerHandle {
-            request_tx,
-            event_rx,
-        }
-    }
-
-    async fn run(
-        self,
-        mut request_rx: mpsc::Receiver<AgentRequest>,
-        event_tx: mpsc::Sender<AgentWorkerEvent>,
-    ) {
-        while let Some(request) = request_rx.recv().await {
-            if let Err(error) = self.handle_request(request, event_tx.clone()).await {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "agent worker failed to handle request"
-                );
-            }
+            controller: AgentWorkerHandleController::DomainPool(pool),
+            event_rx: Some(event_rx),
         }
     }
 
@@ -449,20 +467,7 @@ impl AgentWorker {
             .await;
 
         match loop_output {
-            Ok(loop_output) => {
-                event_tx
-                    .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
-                        locator: request.locator.clone(),
-                        completed_at: Utc::now(),
-                        external_message_id: request.incoming.external_message_id.clone(),
-                        succeeded: loop_output.succeeded,
-                    }))
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to report completed request: {error}")
-                    })?;
-                Ok(loop_output)
-            }
+            Ok(loop_output) => Ok(loop_output),
             Err(error) => {
                 warn!(
                     error = %format!("{error:#}"),
@@ -514,19 +519,265 @@ impl AgentWorker {
                         )
                     })?;
                 thread_context.finish_request(Utc::now(), false)?;
-                event_tx
-                    .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
-                        locator: request.locator.clone(),
-                        completed_at: Utc::now(),
-                        external_message_id: request.incoming.external_message_id.clone(),
-                        succeeded: false,
-                    }))
-                    .await
-                    .map_err(|send_error| {
-                        anyhow::anyhow!("failed to report completed fallback request: {send_error}")
-                    })?;
                 Err(error)
             }
         }
     }
+}
+
+impl AgentWorkerHandle {
+    /// Construct one no-op handle for tests that only need the downstream event channel.
+    pub fn noop(event_rx: mpsc::Receiver<AgentWorkerEvent>) -> Self {
+        Self {
+            controller: AgentWorkerHandleController::Noop,
+            event_rx: Some(event_rx),
+        }
+    }
+
+    /// Borrow the downstream event receiver for direct event assertions in tests and callers.
+    pub fn event_rx_mut(&mut self) -> Result<&mut mpsc::Receiver<AgentWorkerEvent>> {
+        self.event_rx
+            .as_mut()
+            .context("agent worker handle event receiver has already been taken")
+    }
+
+    /// Transfer the downstream event receiver into the router main loop exactly once.
+    pub(crate) fn take_event_rx(&mut self) -> Result<mpsc::Receiver<AgentWorkerEvent>> {
+        self.event_rx
+            .take()
+            .context("agent worker handle event receiver has already been taken")
+    }
+
+    /// Ensure one domain worker task exists for the provided thread domain.
+    pub async fn ensure_worker(
+        &self,
+        domain: impl Into<String>,
+        sessions: SessionManager,
+    ) -> Result<bool> {
+        match &self.controller {
+            AgentWorkerHandleController::DomainPool(pool) => {
+                pool.ensure_worker(domain.into(), sessions).await
+            }
+            AgentWorkerHandleController::Noop => Ok(false),
+        }
+    }
+}
+
+impl AgentDomainWorkerPool {
+    async fn ensure_worker(
+        self: &Arc<Self>,
+        domain: String,
+        sessions: SessionManager,
+    ) -> Result<bool> {
+        let domain = domain.trim().to_string();
+        if domain.is_empty() {
+            bail!("agent worker domain must not be blank");
+        }
+
+        {
+            let mut live_domains = self.live_domains.lock().await;
+            if !live_domains.insert(domain.clone()) {
+                debug!(domain = %domain, "skip worker spawn because local domain task already exists");
+                return Ok(false);
+            }
+        }
+
+        let pool = Arc::clone(self);
+        let domain_for_task = domain.clone();
+        tokio::spawn(async move {
+            let join_result = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                let domain_for_join = domain_for_task.clone();
+                async move { pool.run_domain_worker_task(domain_for_join, sessions).await }
+            })
+            .await;
+            match join_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(domain = %domain_for_task, error = %format!("{error:#}"), "domain worker task exited with error");
+                }
+                Err(error) => {
+                    warn!(domain = %domain_for_task, error = %error, "domain worker task panicked");
+                }
+            }
+            pool.live_domains.lock().await.remove(&domain);
+        });
+        Ok(true)
+    }
+    async fn run_domain_worker_task(
+        self: Arc<Self>,
+        domain: String,
+        sessions: SessionManager,
+    ) -> Result<()> {
+        let worker_id = Uuid::new_v4().to_string();
+        let lease = match self
+            .queue
+            .acquire_worker_lease(&domain, &worker_id, Utc::now())
+            .await?
+        {
+            TopicQueueLeaseAcquireResult::Acquired(lease) => lease,
+            TopicQueueLeaseAcquireResult::Busy => {
+                debug!(
+                    domain = %domain,
+                    worker_id,
+                    "skip domain worker start because another lease is already active"
+                );
+                return Ok(());
+            }
+        };
+
+        let result = Arc::clone(&self)
+            .run_domain_worker_loop(lease.clone(), sessions)
+            .await;
+        if let Err(error) = self.queue.release_worker(&lease, Utc::now()).await {
+            warn!(
+                domain = %lease.domain,
+                worker_id = %lease.worker_id,
+                error = %format!("{error:#}"),
+                "failed to release domain worker lease on exit"
+            );
+        }
+        result
+    }
+
+    async fn run_domain_worker_loop(
+        self: Arc<Self>,
+        lease: TopicQueueWorkerLease,
+        sessions: SessionManager,
+    ) -> Result<()> {
+        let runtime_config = self.queue.runtime_config();
+        let idle_timeout = runtime_config.idle_timeout;
+        let heartbeat_interval = runtime_config.heartbeat_interval;
+        let poll_interval = worker_poll_interval(heartbeat_interval, idle_timeout);
+        let mut idle_deadline = Instant::now() + idle_timeout;
+
+        info!(
+            domain = %lease.domain,
+            worker_id = %lease.worker_id,
+            "started domain queue worker"
+        );
+
+        loop {
+            let now = Utc::now();
+            if let Some(claimed) = self.queue.claim(&lease.domain, &lease, now).await? {
+                Arc::clone(&self)
+                    .process_claimed_message(
+                        lease.clone(),
+                        claimed,
+                        sessions.clone(),
+                        heartbeat_interval,
+                    )
+                    .await?;
+                idle_deadline = Instant::now() + idle_timeout;
+                continue;
+            }
+
+            if Instant::now() >= idle_deadline {
+                info!(
+                    domain = %lease.domain,
+                    worker_id = %lease.worker_id,
+                    "domain queue worker exited after idle timeout"
+                );
+                return Ok(());
+            }
+
+            tokio::time::sleep(poll_interval).await;
+            let heartbeat_ok = self.queue.heartbeat_worker(&lease, Utc::now()).await?;
+            if !heartbeat_ok {
+                warn!(
+                    domain = %lease.domain,
+                    worker_id = %lease.worker_id,
+                    "domain queue worker lease is no longer active during idle heartbeat"
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    async fn process_claimed_message(
+        self: Arc<Self>,
+        lease: TopicQueueWorkerLease,
+        claimed: ClaimedTopicQueueMessage,
+        sessions: SessionManager,
+        heartbeat_interval: StdDuration,
+    ) -> Result<()> {
+        let request = AgentRequest {
+            locator: claimed.payload.locator.clone(),
+            incoming: claimed.payload.incoming.clone(),
+            sessions,
+        };
+        let locator = request.locator.clone();
+        let external_message_id = request.incoming.external_message_id.clone();
+        let event_tx = self.event_tx.clone();
+        let processing = async {
+            let succeeded = match self.worker.handle_request(request, event_tx.clone()).await {
+                Ok(loop_output) => loop_output.succeeded,
+                Err(error) => {
+                    warn!(
+                        domain = %lease.domain,
+                        worker_id = %lease.worker_id,
+                        message_id = %claimed.message_id,
+                        error = %format!("{error:#}"),
+                        "domain worker finished one claimed message through fallback failure path"
+                    );
+                    false
+                }
+            };
+            if !self
+                .queue
+                .complete(claimed.message_id, &claimed.claim_token, Utc::now())
+                .await?
+            {
+                bail!(
+                    "queue complete rejected claimed message `{}` on domain `{}`",
+                    claimed.message_id,
+                    lease.domain
+                );
+            }
+            event_tx
+                .send(AgentWorkerEvent::RequestCompleted(CompletedAgentRequest {
+                    locator,
+                    completed_at: Utc::now(),
+                    external_message_id,
+                    succeeded,
+                }))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to report completed queue message: {error}")
+                })?;
+            Ok(())
+        };
+        tokio::pin!(processing);
+        let mut heartbeat_sleep = heartbeat_sleep(heartbeat_interval);
+        loop {
+            tokio::select! {
+                result = &mut processing => return result,
+                _ = &mut heartbeat_sleep => {
+                    let heartbeat_ok = self.queue.heartbeat_worker(&lease, Utc::now()).await?;
+                    if !heartbeat_ok {
+                        warn!(
+                            domain = %lease.domain,
+                            worker_id = %lease.worker_id,
+                            message_id = %claimed.message_id,
+                            "domain worker lost active lease while processing; queue remains at-least-once"
+                        );
+                    }
+                    heartbeat_sleep.as_mut().reset(Instant::now() + heartbeat_interval);
+                }
+            }
+        }
+    }
+}
+
+fn worker_poll_interval(heartbeat_interval: StdDuration, idle_timeout: StdDuration) -> StdDuration {
+    let candidate = std::cmp::min(heartbeat_interval, idle_timeout) / 4;
+    if candidate.is_zero() {
+        StdDuration::from_millis(100)
+    } else {
+        std::cmp::min(candidate, StdDuration::from_secs(1))
+    }
+}
+
+fn heartbeat_sleep(heartbeat_interval: StdDuration) -> Pin<Box<Sleep>> {
+    Box::pin(tokio::time::sleep(heartbeat_interval))
 }
