@@ -30,6 +30,13 @@
 
 ## 本地启动
 
+推荐先准备这些本地依赖：
+
+- Rust toolchain
+- Node.js / npm
+- Linux 下如需跑 sandbox 相关能力或测试，安装 `bubblewrap`（`bwrap`）
+- Linux 下如需排查 sandbox / helper 进程启动问题，安装 `strace`
+
 1. 复制配置文件
 
 ```powershell

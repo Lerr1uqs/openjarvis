@@ -38,17 +38,13 @@ impl SandboxFixture {
         fs::write(path, yaml).expect("capabilities yaml should be written");
     }
 
-    fn write_fake_bwrap_wrapper(&self) -> PathBuf {
-        let path = self.root.join("fake-bwrap.sh");
-        let workspace_root = self.root.clone();
-        let script = format!(
-            "#!/usr/bin/env bash\nset -euo pipefail\nwhile [[ $# -gt 0 ]]; do\n  if [[ \"$1\" == \"--\" ]]; then\n    shift\n    break\n  fi\n  shift\ndone\nif [[ $# -eq 0 ]]; then\n  echo \"missing -- separator\" >&2\n  exit 1\nfi\nshift\nargs=()\nwhile [[ $# -gt 0 ]]; do\n  if [[ \"$1\" == \"--workspace-root\" ]]; then\n    shift\n    args+=(\"--workspace-root\" \"{workspace_root}\")\n    if [[ $# -gt 0 ]]; then\n      shift\n    fi\n    continue\n  fi\n  args+=(\"$1\")\n  shift\ndone\nexec '{openjarvis_bin}' \"${{args[@]}}\"\n",
-            workspace_root = workspace_root.display(),
-            openjarvis_bin = env!("CARGO_BIN_EXE_openjarvis")
-        );
-        fs::write(&path, script).expect("fake bwrap wrapper should be written");
-        make_executable(&path);
-        path
+    fn install_fake_bwrap_wrapper(&self) -> PathBuf {
+        // 通过 symlink 复用仓库内静态 wrapper，避免现写现执行脚本时偶发 ETXTBSY。
+        let wrapper_path = self.root.join("fake-bwrap.sh");
+        let helper_path = self.root.join("openjarvis-test-bin");
+        install_helper_link(&repo_fake_bwrap_wrapper(), &wrapper_path);
+        install_helper_link(Path::new(env!("CARGO_BIN_EXE_openjarvis")), &helper_path);
+        wrapper_path
     }
 }
 
@@ -58,19 +54,38 @@ impl Drop for SandboxFixture {
     }
 }
 
-#[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
 
-    let mut permissions = fs::metadata(path)
-        .expect("executable metadata should exist")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("executable permissions should be updated");
+fn repo_fake_bwrap_wrapper() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-bwrap.sh")
+}
+
+#[cfg(unix)]
+fn install_helper_link(source: &Path, target: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let _ = fs::remove_file(target);
+    symlink(source, target).unwrap_or_else(|error| {
+        panic!(
+            "failed to symlink helper `{}` -> `{}`: {error}",
+            target.display(),
+            source.display()
+        )
+    });
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &Path) {}
+fn install_helper_link(source: &Path, target: &Path) {
+    fs::copy(source, target).unwrap_or_else(|error| {
+        panic!(
+            "failed to copy helper `{}` -> `{}`: {error}",
+            source.display(),
+            target.display()
+        )
+    });
+    make_executable(target);
+}
 
 fn bubblewrap_yaml(executable_path: &Path) -> String {
     format!(
@@ -155,7 +170,7 @@ sandbox:
 #[test]
 fn bubblewrap_sandbox_rejects_parent_escape_and_restricted_paths() {
     let fixture = SandboxFixture::new("openjarvis-sandbox-path-policy");
-    let wrapper = fixture.write_fake_bwrap_wrapper();
+    let wrapper = fixture.install_fake_bwrap_wrapper();
     let config = SandboxCapabilityConfig::from_yaml_str(&bubblewrap_yaml(&wrapper), fixture.root())
         .expect("bubblewrap capability config should parse");
     let sandbox = build_sandbox(config).expect("bubblewrap sandbox should build");
@@ -183,7 +198,7 @@ fn bubblewrap_sandbox_rejects_parent_escape_and_restricted_paths() {
 fn bubblewrap_sandbox_allows_workspace_alias_and_tmp_paths() {
     // 测试场景: agent 在 sandbox 中看到的 `/workspace/...` 路径和显式 `/tmp/...` 路径都应可直接复用。
     let fixture = SandboxFixture::new("openjarvis-sandbox-path-aliases");
-    let wrapper = fixture.write_fake_bwrap_wrapper();
+    let wrapper = fixture.install_fake_bwrap_wrapper();
     let config = SandboxCapabilityConfig::from_yaml_str(&bubblewrap_yaml(&wrapper), fixture.root())
         .expect("bubblewrap capability config should parse");
     let sandbox = build_sandbox(config).expect("bubblewrap sandbox should build");
@@ -224,7 +239,7 @@ fn bubblewrap_sandbox_allows_workspace_alias_and_tmp_paths() {
 #[test]
 fn bubblewrap_sandbox_jsonrpc_workspace_writes_are_host_visible() {
     let fixture = SandboxFixture::new("openjarvis-sandbox-jsonrpc-sync");
-    let wrapper = fixture.write_fake_bwrap_wrapper();
+    let wrapper = fixture.install_fake_bwrap_wrapper();
     let config = SandboxCapabilityConfig::from_yaml_str(&bubblewrap_yaml(&wrapper), fixture.root())
         .expect("bubblewrap capability config should parse");
     let sandbox = build_sandbox(config).expect("bubblewrap sandbox should build");
@@ -277,7 +292,7 @@ fn bubblewrap_sandbox_real_bwrap_jsonrpc_workspace_writes_are_host_visible() {
 #[test]
 fn agent_worker_uses_configured_bubblewrap_sandbox_backend() {
     let fixture = SandboxFixture::new("openjarvis-sandbox-worker-backend");
-    let wrapper = fixture.write_fake_bwrap_wrapper();
+    let wrapper = fixture.install_fake_bwrap_wrapper();
     let config = SandboxCapabilityConfig::from_yaml_str(&bubblewrap_yaml(&wrapper), fixture.root())
         .expect("bubblewrap capability config should parse");
 
@@ -295,7 +310,7 @@ fn agent_worker_uses_configured_bubblewrap_sandbox_backend() {
 async fn sandbox_file_tools_route_through_proxy_into_workspace() {
     // 测试场景: sandbox 开启后，read/write/edit 应通过 proxy 读写当前工作区根，而不是额外落到 `.openjarvis/workspace`。
     let fixture = SandboxFixture::new("openjarvis-sandbox-tool-file-routing");
-    let wrapper = fixture.write_fake_bwrap_wrapper();
+    let wrapper = fixture.install_fake_bwrap_wrapper();
     let config = SandboxCapabilityConfig::from_yaml_str(&bubblewrap_yaml(&wrapper), fixture.root())
         .expect("bubblewrap capability config should parse");
     let sandbox = build_sandbox(config).expect("bubblewrap sandbox should build");
@@ -455,7 +470,7 @@ async fn sandbox_exec_command_tool_real_bwrap_allows_tmp_workdir() {
 async fn sandbox_command_session_tools_route_through_proxy() {
     // 测试场景: sandbox 开启后，exec_command / list_unread_command_tasks / write_stdin 应共用 proxy 内的 command session。
     let fixture = SandboxFixture::new("openjarvis-sandbox-command-session-routing");
-    let wrapper = fixture.write_fake_bwrap_wrapper();
+    let wrapper = fixture.install_fake_bwrap_wrapper();
     let config = SandboxCapabilityConfig::from_yaml_str(&bubblewrap_yaml(&wrapper), fixture.root())
         .expect("bubblewrap capability config should parse");
     let sandbox = build_sandbox(config).expect("bubblewrap sandbox should build");
