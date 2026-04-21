@@ -11,4 +11,26 @@ sandbox:
   allow_parent_access: false
   bubblewrap:
     executable: "bwrap"
+    namespaces:
+      user: true
+      ipc: true
+      pid: true
+      uts: true
+      net: true
+    baseline_seccomp_profile: "proxy-baseline-v1"
+    proxy_landlock_profile: "workspace-rpc"
+    command_profiles:
+      selected_profile: "default"
+      profiles:
+        default:
+          landlock_profile: "command-default"
+          seccomp_profile: "command-default-v1"
+        readonly:
+          landlock_profile: "command-readonly"
+          seccomp_profile: "command-readonly-v1"
+    compatibility:
+      require_landlock: true
+      min_landlock_abi: 1
+      require_seccomp: true
+      strict: true
   docker: {}

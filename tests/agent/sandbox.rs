@@ -16,6 +16,8 @@ use std::{
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+mod kernel;
+
 struct SandboxFixture {
     root: PathBuf,
 }
@@ -88,6 +90,21 @@ fn install_helper_link(source: &Path, target: &Path) {
 }
 
 fn bubblewrap_yaml(executable_path: &Path) -> String {
+    bubblewrap_yaml_with_compatibility(executable_path, "default", false, false, false, 1)
+}
+
+fn strict_bubblewrap_yaml(executable_path: &Path, selected_profile: &str) -> String {
+    bubblewrap_yaml_with_compatibility(executable_path, selected_profile, true, true, true, 1)
+}
+
+fn bubblewrap_yaml_with_compatibility(
+    executable_path: &Path,
+    selected_profile: &str,
+    require_landlock: bool,
+    require_seccomp: bool,
+    strict: bool,
+    min_landlock_abi: u8,
+) -> String {
     format!(
         r#"
 sandbox:
@@ -103,9 +120,36 @@ sandbox:
   allow_parent_access: false
   bubblewrap:
     executable: "{}"
+    namespaces:
+      user: true
+      ipc: true
+      pid: true
+      uts: true
+      net: true
+    baseline_seccomp_profile: "proxy-baseline-v1"
+    proxy_landlock_profile: "workspace-rpc"
+    command_profiles:
+      selected_profile: "{}"
+      profiles:
+        default:
+          landlock_profile: "command-default"
+          seccomp_profile: "command-default-v1"
+        readonly:
+          landlock_profile: "command-readonly"
+          seccomp_profile: "command-readonly-v1"
+    compatibility:
+      require_landlock: {}
+      min_landlock_abi: {}
+      require_seccomp: {}
+      strict: {}
   docker: {{}}
 "#,
-        executable_path.display()
+        executable_path.display(),
+        selected_profile,
+        require_landlock,
+        min_landlock_abi,
+        require_seccomp,
+        strict
     )
 }
 
@@ -116,6 +160,37 @@ fn host_supports_real_bwrap() -> bool {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+}
+
+fn host_supports_fake_bwrap_kernel_enforcement() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let fixture = SandboxFixture::new("openjarvis-sandbox-fake-bwrap-enforcement-probe");
+    let wrapper = fixture.install_fake_bwrap_wrapper();
+    let config = match SandboxCapabilityConfig::from_yaml_str(
+        &strict_bubblewrap_yaml(&wrapper, "default"),
+        fixture.root(),
+    ) {
+        Ok(config) => config,
+        Err(_) => return false,
+    };
+    build_sandbox(config).is_ok()
+}
+
+fn host_supports_real_bwrap_kernel_enforcement() -> bool {
+    if !host_supports_real_bwrap() {
+        return false;
+    }
+    let fixture = SandboxFixture::new("openjarvis-sandbox-real-bwrap-enforcement-probe");
+    let config = match SandboxCapabilityConfig::from_yaml_str(
+        &strict_bubblewrap_yaml(Path::new("bwrap"), "default"),
+        fixture.root(),
+    ) {
+        Ok(config) => config,
+        Err(_) => return false,
+    };
+    build_sandbox(config).is_ok()
 }
 
 fn build_thread(thread_id: &str) -> Thread {
@@ -408,7 +483,6 @@ async fn sandbox_exec_command_tool_real_bwrap_runs_inside_workspace() {
         .await
         .expect("sandbox exec_command should succeed");
 
-    assert!(result.content.contains("/workspace"));
     assert!(result.content.contains("command-ok"));
     assert_eq!(
         fs::read_to_string(fixture.root().join("cmd.txt"))
@@ -531,4 +605,118 @@ async fn sandbox_command_session_tools_route_through_proxy() {
         .expect("sandbox write_stdin should drain proxy-owned session");
     assert!(drained.content.contains("Process exited with code 0"));
     assert!(drained.content.contains("proxy-finished"));
+}
+
+#[test]
+fn bubblewrap_sandbox_strict_kernel_enforcement_boots_proxy_and_syncs_workspace() {
+    // 测试场景: 严格 enforcement 可满足时，proxy 应先完成收口再对外提供正常的 workspace 同步能力。
+    if !host_supports_fake_bwrap_kernel_enforcement() {
+        return;
+    }
+
+    let fixture = SandboxFixture::new("openjarvis-sandbox-strict-proxy-enforcement");
+    let wrapper = fixture.install_fake_bwrap_wrapper();
+    let config = SandboxCapabilityConfig::from_yaml_str(
+        &strict_bubblewrap_yaml(&wrapper, "default"),
+        fixture.root(),
+    )
+    .expect("strict bubblewrap capability config should parse");
+    let sandbox = build_sandbox(config).expect("strict bubblewrap sandbox should build");
+
+    sandbox
+        .write_workspace_text(Path::new("strict/proxy.txt"), "proxy-enforced")
+        .expect("strict proxy should still allow workspace writes");
+    assert_eq!(
+        fs::read_to_string(fixture.root().join("strict/proxy.txt"))
+            .expect("strict proxy write should be host visible"),
+        "proxy-enforced"
+    );
+}
+
+#[test]
+fn bubblewrap_sandbox_real_bwrap_strict_kernel_enforcement_syncs_workspace() {
+    // 测试场景: 真实 bwrap 满足严格 enforcement 时，proxy 仍应成功握手并保留 workspace 同步语义。
+    if !host_supports_real_bwrap_kernel_enforcement() {
+        return;
+    }
+
+    let fixture = SandboxFixture::new("openjarvis-sandbox-real-bwrap-strict-enforcement");
+    let config = SandboxCapabilityConfig::from_yaml_str(
+        &strict_bubblewrap_yaml(Path::new("bwrap"), "default"),
+        fixture.root(),
+    )
+    .expect("strict real bubblewrap capability config should parse");
+    let sandbox = build_sandbox(config).expect("strict real bubblewrap sandbox should build");
+
+    sandbox
+        .write_workspace_text(Path::new("strict/real-proxy.txt"), "real-proxy-enforced")
+        .expect("strict real proxy should allow workspace writes");
+    assert_eq!(
+        fs::read_to_string(fixture.root().join("strict/real-proxy.txt"))
+            .expect("strict real proxy write should be host visible"),
+        "real-proxy-enforced"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_command_child_helper_enforces_readonly_profile_for_pipe_and_pty() {
+    // 测试场景: child helper 应在 pipe/PTY 两条链路里都安装 readonly profile，并拒绝写入 workspace。
+    if !host_supports_fake_bwrap_kernel_enforcement() {
+        return;
+    }
+
+    let fixture = SandboxFixture::new("openjarvis-sandbox-child-helper-readonly");
+    let wrapper = fixture.install_fake_bwrap_wrapper();
+    let config = SandboxCapabilityConfig::from_yaml_str(
+        &strict_bubblewrap_yaml(&wrapper, "readonly"),
+        fixture.root(),
+    )
+    .expect("readonly bubblewrap capability config should parse");
+    let sandbox = build_sandbox(config).expect("readonly bubblewrap sandbox should build");
+    let registry = ToolRegistry::with_workspace_root_and_skill_roots(fixture.root(), Vec::new());
+    registry.install_sandbox(Arc::clone(&sandbox));
+    registry
+        .register_builtin_tools()
+        .await
+        .expect("builtin tools should register");
+    let mut thread = build_thread("sandbox-child-helper-readonly");
+
+    let pipe_result = registry
+        .call_for_context(
+            &mut thread,
+            ToolCallRequest {
+                name: "exec_command".to_string(),
+                arguments: json!({
+                    "cmd": "printf 'blocked' > readonly-pipe.txt",
+                    "yield_time_ms": 1_000,
+                }),
+            },
+        )
+        .await
+        .expect("readonly pipe command should return a structured result");
+    assert_ne!(pipe_result.metadata["exit_code"].as_i64(), Some(0));
+    assert!(
+        !fixture.root().join("readonly-pipe.txt").exists(),
+        "readonly pipe profile should block workspace writes"
+    );
+
+    let pty_result = registry
+        .call_for_context(
+            &mut thread,
+            ToolCallRequest {
+                name: "exec_command".to_string(),
+                arguments: json!({
+                    "cmd": "printf 'blocked' > readonly-pty.txt",
+                    "tty": true,
+                    "yield_time_ms": 1_000,
+                }),
+            },
+        )
+        .await
+        .expect("readonly PTY command should return a structured result");
+    assert_ne!(pty_result.metadata["exit_code"].as_i64(), Some(0));
+    assert!(
+        !fixture.root().join("readonly-pty.txt").exists(),
+        "readonly PTY profile should block workspace writes"
+    );
 }

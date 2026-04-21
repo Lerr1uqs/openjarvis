@@ -26,7 +26,7 @@
   - `openai_compatible` 及其别名 `openai` / `deepseek`
 - 已实现 Feishu 文本消息回发
 - 已实现 tool call / tool result 事件回发到当前群聊
-- `sandbox` 仍然是占位实现，暂未接入真实隔离能力
+- 已实现 bubblewrap sandbox，并在 proxy / command child 两级接入 namespace + Landlock + Seccomp 分层收口
 
 ## 本地启动
 
@@ -35,7 +35,9 @@
 - Rust toolchain
 - Node.js / npm
 - Linux 下如需跑 sandbox 相关能力或测试，安装 `bubblewrap`（`bwrap`）
+- Linux 下如需启用严格 bubblewrap kernel enforcement，内核需启用 Landlock，且当前环境需要支持 seccomp filter
 - Linux 下如需排查 sandbox / helper 进程启动问题，安装 `strace`
+- Linux 下如需验证 Landlock ABI，可查看 `/sys/kernel/security/landlock` 或直接运行 sandbox 相关测试观察 fail-fast 错误
 
 1. 复制配置文件
 
@@ -54,6 +56,13 @@ npm install
 ```powershell
 cargo run
 ```
+
+## Sandbox 调试
+
+- `config/capabilities.yaml` 中的 `sandbox.bubblewrap.namespaces / baseline_seccomp_profile / proxy_landlock_profile / command_profiles / compatibility` 定义了 bubblewrap kernel enforcement plan。
+- 当 `compatibility.require_landlock=true` 或 `compatibility.require_seccomp=true` 时，缺少对应内核能力会在 sandbox 启动阶段直接失败，而不是降级运行。
+- `command_profiles.selected_profile` 控制 `exec_command` 默认使用的 child profile；`readonly` profile 会拒绝写入 workspace，可用于本地排查 child helper 是否生效。
+- 排查 proxy 启动失败时，可结合 `RUST_LOG=debug` 与 `strace -f cargo test tests::agent::sandbox -- --nocapture` 观察 helper 收口位置。
 
 ## 本地 Skill
 

@@ -12,4 +12,4 @@ pub use session::{
 pub use tool::{ExecCommandTool, ListUnreadCommandTasksTool, WriteStdinTool};
 
 pub(crate) use output::format_task_listing;
-pub(crate) use process::run_legacy_shell_command;
+pub(crate) use process::{CommandExecHelperSpec, CommandLaunchOptions, run_legacy_shell_command};

@@ -330,11 +330,33 @@ pub enum InternalSandboxCommand {
         /// Host-visible synchronized workspace root mounted into the sandbox.
         #[arg(long)]
         workspace_root: PathBuf,
+        /// Structured sandbox kernel enforcement plan serialized as JSON.
+        #[arg(long, hide = true)]
+        enforcement_plan_json: Option<String>,
         /// Restricted host paths that the proxy must refuse to access.
         #[arg(long = "restricted-host-path")]
         restricted_host_paths: Vec<PathBuf>,
         /// Allow JSON-RPC paths to escape above the synchronized workspace root.
         #[arg(long, default_value_t = false)]
         allow_parent_access: bool,
+    },
+    /// Run one hidden command-child helper that installs enforcement before `execve`.
+    #[command(name = "exec", hide = true)]
+    Exec {
+        /// Host-visible synchronized workspace root mounted into the sandbox.
+        #[arg(long)]
+        workspace_root: PathBuf,
+        /// Structured command-child enforcement profile serialized as JSON.
+        #[arg(long)]
+        profile_json: String,
+        /// Optional working directory that should be entered before executing the real command.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Real program that should be executed after installing enforcement.
+        #[arg(long)]
+        program: String,
+        /// Arguments forwarded to the real program.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }

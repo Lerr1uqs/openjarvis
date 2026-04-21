@@ -228,6 +228,7 @@ fn cli_parses_internal_sandbox_proxy_command() {
     match cli.internal_sandbox_command() {
         Some(InternalSandboxCommand::Proxy {
             workspace_root,
+            enforcement_plan_json,
             restricted_host_paths,
             allow_parent_access,
         }) => {
@@ -235,6 +236,7 @@ fn cli_parses_internal_sandbox_proxy_command() {
                 workspace_root,
                 &std::path::PathBuf::from("/tmp/openjarvis-workspace")
             );
+            assert_eq!(enforcement_plan_json, &None);
             assert_eq!(
                 restricted_host_paths,
                 &[
@@ -245,6 +247,50 @@ fn cli_parses_internal_sandbox_proxy_command() {
             assert!(!allow_parent_access);
         }
         other => panic!("unexpected parsed sandbox command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parses_internal_sandbox_exec_command() {
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-sandbox",
+        "exec",
+        "--workspace-root",
+        "/tmp/openjarvis-workspace",
+        "--profile-json",
+        "{\"name\":\"default\"}",
+        "--workdir",
+        "/tmp/openjarvis-workspace/demo",
+        "--program",
+        "sh",
+        "--arg",
+        "-lc",
+        "--arg",
+        "printf helper",
+    ]);
+
+    match cli.internal_sandbox_command() {
+        Some(InternalSandboxCommand::Exec {
+            workspace_root,
+            profile_json,
+            workdir,
+            program,
+            args,
+        }) => {
+            assert_eq!(
+                workspace_root,
+                &std::path::PathBuf::from("/tmp/openjarvis-workspace")
+            );
+            assert_eq!(profile_json, "{\"name\":\"default\"}");
+            assert_eq!(
+                workdir,
+                &Some(std::path::PathBuf::from("/tmp/openjarvis-workspace/demo"))
+            );
+            assert_eq!(program, "sh");
+            assert_eq!(args, &["-lc".to_string(), "printf helper".to_string()]);
+        }
+        other => panic!("unexpected parsed sandbox exec command: {other:?}"),
     }
 }
 

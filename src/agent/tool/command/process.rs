@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
 };
 use tokio::{
@@ -46,11 +46,58 @@ struct ShellCommandSpec {
     args: Vec<String>,
 }
 
-pub(crate) async fn spawn_command(request: &CommandExecutionRequest) -> Result<SpawnedCommand> {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommandLaunchOptions {
+    pub(crate) exec_helper: Option<CommandExecHelperSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommandExecHelperSpec {
+    pub(crate) helper_executable: PathBuf,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) profile_json: String,
+}
+
+impl CommandExecHelperSpec {
+    fn wrap_command(
+        &self,
+        program: &str,
+        args: &[String],
+        workdir: Option<&Path>,
+    ) -> ShellCommandSpec {
+        let mut helper_args = vec![
+            "internal-sandbox".to_string(),
+            "exec".to_string(),
+            "--workspace-root".to_string(),
+            self.workspace_root.display().to_string(),
+            "--profile-json".to_string(),
+            self.profile_json.clone(),
+            "--program".to_string(),
+            program.to_string(),
+        ];
+        if let Some(workdir) = workdir {
+            helper_args.push("--workdir".to_string());
+            helper_args.push(workdir.display().to_string());
+        }
+        for arg in args {
+            helper_args.push("--arg".to_string());
+            helper_args.push(arg.clone());
+        }
+        ShellCommandSpec {
+            program: self.helper_executable.display().to_string(),
+            args: helper_args,
+        }
+    }
+}
+
+pub(crate) async fn spawn_command(
+    request: &CommandExecutionRequest,
+    launch_options: &CommandLaunchOptions,
+) -> Result<SpawnedCommand> {
     if request.tty {
-        spawn_pty_command(request)
+        spawn_pty_command(request, launch_options)
     } else {
-        spawn_pipe_command(request).await
+        spawn_pipe_command(request, launch_options).await
     }
 }
 
@@ -59,7 +106,7 @@ pub(crate) async fn run_legacy_shell_command(
     timeout_ms: u64,
 ) -> Result<LegacyShellCommandResult> {
     let spec = build_shell_command_spec(command, None);
-    let mut process = spec.into_tokio_command(None);
+    let mut process = spec.into_tokio_command(None, &CommandLaunchOptions::default());
     process.stdin(Stdio::null());
     let output = match timeout(Duration::from_millis(timeout_ms), process.output()).await {
         Ok(result) => result.context("failed to execute shell command")?,
@@ -81,7 +128,10 @@ pub(crate) async fn run_legacy_shell_command(
     })
 }
 
-async fn spawn_pipe_command(request: &CommandExecutionRequest) -> Result<SpawnedCommand> {
+async fn spawn_pipe_command(
+    request: &CommandExecutionRequest,
+    launch_options: &CommandLaunchOptions,
+) -> Result<SpawnedCommand> {
     let spec = build_shell_command_spec(&request.cmd, request.shell.as_deref());
     debug!(
         command = %request.cmd,
@@ -91,7 +141,7 @@ async fn spawn_pipe_command(request: &CommandExecutionRequest) -> Result<Spawned
         "spawning pipe command session"
     );
 
-    let mut command = spec.into_tokio_command(request.workdir.as_deref());
+    let mut command = spec.into_tokio_command(request.workdir.as_deref(), launch_options);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -175,7 +225,10 @@ fn spawn_pipe_reader<R>(
     });
 }
 
-fn spawn_pty_command(request: &CommandExecutionRequest) -> Result<SpawnedCommand> {
+fn spawn_pty_command(
+    request: &CommandExecutionRequest,
+    launch_options: &CommandLaunchOptions,
+) -> Result<SpawnedCommand> {
     let spec = build_shell_command_spec(&request.cmd, request.shell.as_deref());
     debug!(
         command = %request.cmd,
@@ -194,7 +247,7 @@ fn spawn_pty_command(request: &CommandExecutionRequest) -> Result<SpawnedCommand
             pixel_height: 0,
         })
         .context("failed to allocate PTY for command session")?;
-    let builder = spec.into_pty_command_builder(request.workdir.as_deref());
+    let builder = spec.into_pty_command_builder(request.workdir.as_deref(), launch_options);
     let mut child = pair
         .slave
         .spawn_command(builder.clone())
@@ -270,19 +323,41 @@ fn handle_pty_writes(
 }
 
 impl ShellCommandSpec {
-    fn into_tokio_command(&self, workdir: Option<&Path>) -> Command {
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        if let Some(workdir) = workdir {
+    fn into_tokio_command(
+        &self,
+        workdir: Option<&Path>,
+        launch_options: &CommandLaunchOptions,
+    ) -> Command {
+        let wrapped = launch_options
+            .exec_helper
+            .as_ref()
+            .map(|helper| helper.wrap_command(&self.program, &self.args, workdir));
+        let spec = wrapped.as_ref().unwrap_or(self);
+        let mut command = Command::new(&spec.program);
+        command.args(&spec.args);
+        if wrapped.is_none()
+            && let Some(workdir) = workdir
+        {
             command.current_dir(workdir);
         }
         command
     }
 
-    fn into_pty_command_builder(&self, workdir: Option<&Path>) -> CommandBuilder {
-        let mut builder = CommandBuilder::new(&self.program);
-        builder.args(&self.args);
-        if let Some(workdir) = workdir {
+    fn into_pty_command_builder(
+        &self,
+        workdir: Option<&Path>,
+        launch_options: &CommandLaunchOptions,
+    ) -> CommandBuilder {
+        let wrapped = launch_options
+            .exec_helper
+            .as_ref()
+            .map(|helper| helper.wrap_command(&self.program, &self.args, workdir));
+        let spec = wrapped.as_ref().unwrap_or(self);
+        let mut builder = CommandBuilder::new(&spec.program);
+        builder.args(&spec.args);
+        if wrapped.is_none()
+            && let Some(workdir) = workdir
+        {
             builder.cwd(workdir.as_os_str());
         }
         builder

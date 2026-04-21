@@ -2,7 +2,7 @@
 
 use super::{
     output::{format_command_summary, truncate_output},
-    process::{ProcessEvent, spawn_command},
+    process::{CommandLaunchOptions, ProcessEvent, spawn_command},
 };
 use crate::agent::ToolCallResult;
 use anyhow::{Result, bail};
@@ -206,6 +206,16 @@ impl CommandSessionManager {
         thread_id: impl AsRef<str>,
         request: CommandExecutionRequest,
     ) -> Result<CommandExecutionResult> {
+        self.exec_command_with_options(thread_id, request, CommandLaunchOptions::default())
+            .await
+    }
+
+    pub(crate) async fn exec_command_with_options(
+        &self,
+        thread_id: impl AsRef<str>,
+        request: CommandExecutionRequest,
+        launch_options: CommandLaunchOptions,
+    ) -> Result<CommandExecutionResult> {
         let call_started_at = Instant::now();
         if request.cmd.trim().is_empty() {
             bail!("exec_command requires a non-empty `cmd`");
@@ -220,7 +230,7 @@ impl CommandSessionManager {
             shell = ?request.shell,
             "starting command session"
         );
-        let spawned = spawn_command(&request).await?;
+        let spawned = spawn_command(&request, &launch_options).await?;
         let session_id = format!("command-session-{}", Uuid::new_v4());
         let snapshot = CommandTaskSnapshot {
             thread_id: thread_id.clone(),
@@ -413,7 +423,21 @@ impl CommandSessionManager {
         thread_id: Option<&str>,
         request: CommandExecutionRequest,
     ) -> Result<CommandExecutionResult> {
-        self.exec_command(normalize_thread_id(thread_id), request)
+        self.exec_command_from_context_with_options(
+            thread_id,
+            request,
+            CommandLaunchOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn exec_command_from_context_with_options(
+        &self,
+        thread_id: Option<&str>,
+        request: CommandExecutionRequest,
+        launch_options: CommandLaunchOptions,
+    ) -> Result<CommandExecutionResult> {
+        self.exec_command_with_options(normalize_thread_id(thread_id), request, launch_options)
             .await
     }
 

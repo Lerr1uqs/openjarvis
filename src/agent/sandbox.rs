@@ -1,14 +1,25 @@
 //! Sandbox backends, capability policy loading, and internal JSON-RPC proxy helpers.
 
+mod kernel;
+
 use super::tool::command::{
-    CommandExecutionRequest, CommandExecutionResult, CommandSessionManager, CommandTaskSnapshot,
-    CommandWriteRequest,
+    CommandExecHelperSpec, CommandExecutionRequest, CommandExecutionResult, CommandLaunchOptions,
+    CommandSessionManager, CommandTaskSnapshot, CommandWriteRequest,
 };
 use crate::cli::InternalSandboxCommand;
 use anyhow::{Context, Result, bail};
+use kernel::{
+    DEFAULT_BASELINE_SECCOMP_PROFILE, DEFAULT_COMMAND_LANDLOCK_PROFILE,
+    DEFAULT_COMMAND_PROFILE_NAME, DEFAULT_COMMAND_SECCOMP_PROFILE, DEFAULT_PROXY_LANDLOCK_PROFILE,
+    SandboxCommandChildProfilePlan, SandboxKernelEnforcementPlan, compile_kernel_enforcement_plan,
+    install_command_profile, install_proxy_enforcement, validate_kernel_enforcement_config,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsString,
     fs,
@@ -57,14 +68,180 @@ impl SandboxBackendKind {
 /// Bubblewrap-specific runtime options loaded from `config/capabilities.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+pub struct BubblewrapNamespaceConfig {
+    user: bool,
+    ipc: bool,
+    pid: bool,
+    uts: bool,
+    net: bool,
+}
+
+impl Default for BubblewrapNamespaceConfig {
+    fn default() -> Self {
+        Self {
+            user: true,
+            ipc: true,
+            pid: true,
+            uts: true,
+            net: true,
+        }
+    }
+}
+
+impl BubblewrapNamespaceConfig {
+    /// Return whether bubblewrap should unshare the user namespace.
+    pub fn user(&self) -> bool {
+        self.user
+    }
+
+    /// Return whether bubblewrap should unshare the IPC namespace.
+    pub fn ipc(&self) -> bool {
+        self.ipc
+    }
+
+    /// Return whether bubblewrap should unshare the PID namespace.
+    pub fn pid(&self) -> bool {
+        self.pid
+    }
+
+    /// Return whether bubblewrap should unshare the UTS namespace.
+    pub fn uts(&self) -> bool {
+        self.uts
+    }
+
+    /// Return whether bubblewrap should unshare the network namespace.
+    pub fn net(&self) -> bool {
+        self.net
+    }
+}
+
+/// One named command-child enforcement profile reference.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BubblewrapCommandProfileConfig {
+    landlock_profile: String,
+    seccomp_profile: String,
+}
+
+impl Default for BubblewrapCommandProfileConfig {
+    fn default() -> Self {
+        Self {
+            landlock_profile: DEFAULT_COMMAND_LANDLOCK_PROFILE.to_string(),
+            seccomp_profile: DEFAULT_COMMAND_SECCOMP_PROFILE.to_string(),
+        }
+    }
+}
+
+impl BubblewrapCommandProfileConfig {
+    /// Return the builtin Landlock profile name used for command children.
+    pub fn landlock_profile(&self) -> &str {
+        &self.landlock_profile
+    }
+
+    /// Return the builtin Seccomp profile name used for command children.
+    pub fn seccomp_profile(&self) -> &str {
+        &self.seccomp_profile
+    }
+}
+
+/// Command-child profile selection policy for the bubblewrap runtime.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BubblewrapCommandProfilesConfig {
+    selected_profile: String,
+    profiles: BTreeMap<String, BubblewrapCommandProfileConfig>,
+}
+
+impl Default for BubblewrapCommandProfilesConfig {
+    fn default() -> Self {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            DEFAULT_COMMAND_PROFILE_NAME.to_string(),
+            BubblewrapCommandProfileConfig::default(),
+        );
+        Self {
+            selected_profile: DEFAULT_COMMAND_PROFILE_NAME.to_string(),
+            profiles,
+        }
+    }
+}
+
+impl BubblewrapCommandProfilesConfig {
+    /// Return the logical command-child profile selected by default.
+    pub fn selected_profile(&self) -> &str {
+        &self.selected_profile
+    }
+
+    /// Return all declared command-child profile mappings.
+    pub fn profiles(&self) -> &BTreeMap<String, BubblewrapCommandProfileConfig> {
+        &self.profiles
+    }
+}
+
+/// Compatibility requirements for bubblewrap kernel enforcement.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BubblewrapCompatibilityConfig {
+    require_landlock: bool,
+    min_landlock_abi: u8,
+    require_seccomp: bool,
+    strict: bool,
+}
+
+impl Default for BubblewrapCompatibilityConfig {
+    fn default() -> Self {
+        Self {
+            require_landlock: true,
+            min_landlock_abi: 1,
+            require_seccomp: true,
+            strict: true,
+        }
+    }
+}
+
+impl BubblewrapCompatibilityConfig {
+    /// Return whether Landlock support is mandatory for this policy.
+    pub fn require_landlock(&self) -> bool {
+        self.require_landlock
+    }
+
+    /// Return the minimum Landlock ABI required by this policy.
+    pub fn min_landlock_abi(&self) -> u8 {
+        self.min_landlock_abi
+    }
+
+    /// Return whether Seccomp support is mandatory for this policy.
+    pub fn require_seccomp(&self) -> bool {
+        self.require_seccomp
+    }
+
+    /// Return whether any enforcement downgrade should fail closed.
+    pub fn strict(&self) -> bool {
+        self.strict
+    }
+}
+
+/// Bubblewrap-specific runtime options loaded from `config/capabilities.yaml`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct BubblewrapCapabilityConfig {
     executable: PathBuf,
+    namespaces: BubblewrapNamespaceConfig,
+    baseline_seccomp_profile: String,
+    proxy_landlock_profile: String,
+    command_profiles: BubblewrapCommandProfilesConfig,
+    compatibility: BubblewrapCompatibilityConfig,
 }
 
 impl Default for BubblewrapCapabilityConfig {
     fn default() -> Self {
         Self {
             executable: PathBuf::from("bwrap"),
+            namespaces: BubblewrapNamespaceConfig::default(),
+            baseline_seccomp_profile: DEFAULT_BASELINE_SECCOMP_PROFILE.to_string(),
+            proxy_landlock_profile: DEFAULT_PROXY_LANDLOCK_PROFILE.to_string(),
+            command_profiles: BubblewrapCommandProfilesConfig::default(),
+            compatibility: BubblewrapCompatibilityConfig::default(),
         }
     }
 }
@@ -73,6 +250,38 @@ impl BubblewrapCapabilityConfig {
     /// Return the configured `bwrap` executable path or command name.
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    /// Return the namespace policy used when configuring bubblewrap.
+    pub fn namespaces(&self) -> &BubblewrapNamespaceConfig {
+        &self.namespaces
+    }
+
+    /// Return the builtin baseline Seccomp profile name for the proxy process.
+    pub fn baseline_seccomp_profile(&self) -> &str {
+        &self.baseline_seccomp_profile
+    }
+
+    /// Return the builtin proxy Landlock profile name.
+    pub fn proxy_landlock_profile(&self) -> &str {
+        &self.proxy_landlock_profile
+    }
+
+    /// Return the command-child profile selection mapping.
+    pub fn command_profiles(&self) -> &BubblewrapCommandProfilesConfig {
+        &self.command_profiles
+    }
+
+    /// Return the compatibility requirements for kernel enforcement.
+    pub fn compatibility(&self) -> &BubblewrapCompatibilityConfig {
+        &self.compatibility
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.executable.as_os_str().is_empty() {
+            bail!("sandbox.bubblewrap.executable must not be blank");
+        }
+        validate_kernel_enforcement_config(self)
     }
 }
 
@@ -283,10 +492,8 @@ impl SandboxPolicyConfig {
         {
             bail!("sandbox.restricted_host_paths must not contain blank entries");
         }
-        if self.backend == SandboxBackendKind::Bubblewrap
-            && self.bubblewrap.executable().as_os_str().is_empty()
-        {
-            bail!("sandbox.bubblewrap.executable must not be blank");
+        if self.backend == SandboxBackendKind::Bubblewrap {
+            self.bubblewrap.validate()?;
         }
         Ok(())
     }
@@ -385,6 +592,8 @@ struct SandboxReadTextParams {
 struct SandboxCommandExecParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_profile: Option<String>,
     request: CommandExecutionRequest,
 }
 
@@ -406,6 +615,12 @@ struct SandboxPathPolicy {
     workspace_root: PathBuf,
     restricted_host_paths: Vec<PathBuf>,
     allow_parent_access: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SandboxProxyRuntimeContext {
+    path_policy: SandboxPathPolicy,
+    kernel_enforcement: Option<SandboxKernelEnforcementPlan>,
 }
 
 impl SandboxPathPolicy {
@@ -538,16 +753,46 @@ pub async fn run_internal_sandbox_command(command: &InternalSandboxCommand) -> R
     tokio::task::spawn_blocking(move || match command {
         InternalSandboxCommand::Proxy {
             workspace_root,
+            enforcement_plan_json,
             restricted_host_paths,
             allow_parent_access,
-        } => run_sandbox_proxy(SandboxPathPolicy {
-            workspace_root: normalize_path(&workspace_root),
-            restricted_host_paths: restricted_host_paths
-                .iter()
-                .map(|path| normalize_path(path))
-                .collect::<Vec<_>>(),
-            allow_parent_access,
-        }),
+        } => {
+            let kernel_enforcement = enforcement_plan_json
+                .as_deref()
+                .map(|raw| {
+                    serde_json::from_str::<SandboxKernelEnforcementPlan>(raw)
+                        .context("failed to decode sandbox proxy kernel enforcement plan")
+                })
+                .transpose()?;
+            run_sandbox_proxy(SandboxProxyRuntimeContext {
+                path_policy: SandboxPathPolicy {
+                    workspace_root: normalize_path(&workspace_root),
+                    restricted_host_paths: restricted_host_paths
+                        .iter()
+                        .map(|path| normalize_path(path))
+                        .collect::<Vec<_>>(),
+                    allow_parent_access,
+                },
+                kernel_enforcement,
+            })
+        }
+        InternalSandboxCommand::Exec {
+            workspace_root,
+            profile_json,
+            workdir,
+            program,
+            args,
+        } => {
+            let profile = serde_json::from_str::<SandboxCommandChildProfilePlan>(&profile_json)
+                .context("failed to decode sandbox command-child profile")?;
+            run_sandbox_exec(
+                normalize_path(&workspace_root),
+                profile,
+                workdir.map(|path| normalize_path(&path)),
+                program,
+                args,
+            )
+        }
     })
     .await
     .context("internal sandbox helper task failed to join")?
@@ -690,6 +935,7 @@ pub struct BubblewrapSandbox {
     capabilities: SandboxCapabilityConfig,
     workspace_root: PathBuf,
     path_policy: SandboxPathPolicy,
+    kernel_enforcement: SandboxKernelEnforcementPlan,
     child: Mutex<Option<Child>>,
     transport: Mutex<BubblewrapJsonRpcTransport>,
 }
@@ -708,6 +954,9 @@ impl BubblewrapSandbox {
             )
         })?;
         let path_policy = SandboxPathPolicy::from_policy(capabilities.sandbox());
+        let kernel_enforcement =
+            compile_kernel_enforcement_plan(capabilities.sandbox().bubblewrap())
+                .context("failed to compile bubblewrap kernel enforcement plan")?;
         let bwrap_executable = resolve_command_path(
             capabilities.sandbox().bubblewrap().executable(),
         )
@@ -727,6 +976,8 @@ impl BubblewrapSandbox {
             .file_name()
             .context("current executable must have a file name")?
             .to_os_string();
+        let enforcement_plan_json = serde_json::to_string(&kernel_enforcement)
+            .context("failed to serialize bubblewrap kernel enforcement plan")?;
 
         let mut command = Command::new(&bwrap_executable);
         configure_bubblewrap_command(
@@ -735,6 +986,8 @@ impl BubblewrapSandbox {
             &current_executable_name,
             &workspace_root,
             capabilities.sandbox(),
+            &kernel_enforcement,
+            &enforcement_plan_json,
         );
         command
             .stdin(Stdio::piped())
@@ -764,6 +1017,7 @@ impl BubblewrapSandbox {
             capabilities,
             workspace_root,
             path_policy,
+            kernel_enforcement,
             child: Mutex::new(Some(child)),
             transport: Mutex::new(transport),
         })
@@ -891,6 +1145,11 @@ impl Sandbox for BubblewrapSandbox {
     ) -> Result<CommandExecutionResult> {
         let params = SandboxCommandExecParams {
             thread_id: thread_id.map(str::to_string),
+            command_profile: Some(
+                self.kernel_enforcement
+                    .default_command_profile()
+                    .to_string(),
+            ),
             request: self.normalize_command_request(request)?,
         };
         let result = self
@@ -929,12 +1188,17 @@ impl Sandbox for BubblewrapSandbox {
     }
 }
 
-fn run_sandbox_proxy(path_policy: SandboxPathPolicy) -> Result<()> {
+fn run_sandbox_proxy(context: SandboxProxyRuntimeContext) -> Result<()> {
     info!(
-        workspace_root = %path_policy.workspace_root.display(),
-        allow_parent_access = path_policy.allow_parent_access,
+        workspace_root = %context.path_policy.workspace_root.display(),
+        allow_parent_access = context.path_policy.allow_parent_access,
+        has_kernel_enforcement = context.kernel_enforcement.is_some(),
         "sandbox proxy started"
     );
+    if let Some(plan) = context.kernel_enforcement.as_ref() {
+        install_proxy_enforcement(plan, &context.path_policy.workspace_root)
+            .context("failed to install sandbox proxy kernel enforcement")?;
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
@@ -963,7 +1227,8 @@ fn run_sandbox_proxy(path_policy: SandboxPathPolicy) -> Result<()> {
 
         let response = match serde_json::from_str::<SandboxJsonRpcRequest>(&line) {
             Ok(request) => handle_sandbox_proxy_request(
-                &path_policy,
+                &context.path_policy,
+                context.kernel_enforcement.as_ref(),
                 &command_runtime,
                 &command_sessions,
                 request,
@@ -995,8 +1260,47 @@ fn run_sandbox_proxy(path_policy: SandboxPathPolicy) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn run_sandbox_exec(
+    workspace_root: PathBuf,
+    profile: SandboxCommandChildProfilePlan,
+    workdir: Option<PathBuf>,
+    program: String,
+    args: Vec<String>,
+) -> Result<()> {
+    install_command_profile(&profile, &workspace_root).with_context(|| {
+        format!(
+            "failed to install sandbox command profile `{}`",
+            profile.name()
+        )
+    })?;
+    if let Some(workdir) = workdir.as_deref() {
+        env::set_current_dir(workdir).with_context(|| {
+            format!(
+                "failed to enter sandbox command workdir `{}`",
+                workdir.display()
+            )
+        })?;
+    }
+
+    let error = Command::new(&program).args(&args).exec();
+    bail!("failed to exec sandbox command `{program}`: {error}");
+}
+
+#[cfg(not(unix))]
+fn run_sandbox_exec(
+    _workspace_root: PathBuf,
+    _profile: SandboxCommandChildProfilePlan,
+    _workdir: Option<PathBuf>,
+    _program: String,
+    _args: Vec<String>,
+) -> Result<()> {
+    bail!("internal-sandbox exec is only supported on unix")
+}
+
 fn handle_sandbox_proxy_request(
     path_policy: &SandboxPathPolicy,
+    kernel_enforcement: Option<&SandboxKernelEnforcementPlan>,
     command_runtime: &tokio::runtime::Runtime,
     command_sessions: &CommandSessionManager,
     request: SandboxJsonRpcRequest,
@@ -1050,11 +1354,17 @@ fn handle_sandbox_proxy_request(
                     .as_deref()
                     .map(|path| path_policy.resolve_request_path(path))
                     .transpose()?;
+                let launch_options = build_command_launch_options(
+                    kernel_enforcement,
+                    path_policy,
+                    params.command_profile.as_deref(),
+                )?;
                 command_runtime
-                    .block_on(
-                        command_sessions
-                            .exec_command_from_context(params.thread_id.as_deref(), request),
-                    )
+                    .block_on(command_sessions.exec_command_from_context_with_options(
+                        params.thread_id.as_deref(),
+                        request,
+                        launch_options,
+                    ))
                     .map(|result| serde_json::to_value(result))
                     .context("sandbox command.exec failed")?
                     .context("failed to encode sandbox command.exec result")
@@ -1096,12 +1406,35 @@ fn handle_sandbox_proxy_request(
     }
 }
 
+fn build_command_launch_options(
+    kernel_enforcement: Option<&SandboxKernelEnforcementPlan>,
+    path_policy: &SandboxPathPolicy,
+    command_profile: Option<&str>,
+) -> Result<CommandLaunchOptions> {
+    let Some(kernel_enforcement) = kernel_enforcement else {
+        return Ok(CommandLaunchOptions::default());
+    };
+    let profile = kernel_enforcement.command_profile(command_profile)?;
+    let helper_executable =
+        resolve_sandbox_helper_executable().context("failed to resolve sandbox command helper")?;
+    Ok(CommandLaunchOptions {
+        exec_helper: Some(CommandExecHelperSpec {
+            helper_executable,
+            workspace_root: path_policy.workspace_root.clone(),
+            profile_json: serde_json::to_string(profile)
+                .context("failed to serialize sandbox command profile")?,
+        }),
+    })
+}
+
 fn configure_bubblewrap_command(
     command: &mut Command,
     current_executable_dir: &Path,
     current_executable_name: &OsString,
     workspace_root: &Path,
     policy: &SandboxPolicyConfig,
+    kernel_enforcement: &SandboxKernelEnforcementPlan,
+    enforcement_plan_json: &str,
 ) {
     command
         .arg("--die-with-parent")
@@ -1110,6 +1443,30 @@ fn configure_bubblewrap_command(
         .arg("/proc")
         .arg("--dev")
         .arg("/dev");
+
+    if kernel_enforcement.namespace().user() {
+        command
+            .arg("--unshare-user")
+            .arg("--uid")
+            .arg("0")
+            .arg("--gid")
+            .arg("0");
+    }
+    if kernel_enforcement.namespace().ipc() {
+        command.arg("--unshare-ipc");
+    }
+    if kernel_enforcement.namespace().pid() {
+        command.arg("--unshare-pid");
+    }
+    if kernel_enforcement.namespace().uts() {
+        command
+            .arg("--unshare-uts")
+            .arg("--hostname")
+            .arg("openjarvis-sandbox");
+    }
+    if kernel_enforcement.namespace().net() {
+        command.arg("--unshare-net");
+    }
 
     for ro_dir in [
         Path::new("/usr"),
@@ -1147,7 +1504,9 @@ fn configure_bubblewrap_command(
         .arg("internal-sandbox")
         .arg("proxy")
         .arg("--workspace-root")
-        .arg(SANDBOX_WORKSPACE_MOUNT);
+        .arg(SANDBOX_WORKSPACE_MOUNT)
+        .arg("--enforcement-plan-json")
+        .arg(enforcement_plan_json);
 
     for restricted_path in policy.restricted_host_paths() {
         command
