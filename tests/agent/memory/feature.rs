@@ -7,9 +7,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use openjarvis::{
-    agent::{
-        AgentRuntime, AgentWorker, AgentWorkerEvent, HookRegistry, ToolRegistry,
-    },
+    agent::{AgentRuntime, AgentWorker, AgentWorkerEvent, HookRegistry, ToolRegistry},
     context::{ChatMessage, ChatMessageRole},
     llm::{LLMProvider, LLMRequest, LLMResponse, LLMToolCall},
     model::{IncomingMessage, ReplyTarget},
