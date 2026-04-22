@@ -2,7 +2,7 @@ use clap::{Parser, error::ErrorKind};
 use openjarvis::{
     cli::{
         InternalBrowserCommand, InternalBrowserMode, InternalMcpCommand, InternalObswikiCommand,
-        InternalSandboxCommand, OpenJarvisCli, SkillCommand,
+        InternalSandboxCommand, InternalSandboxExecutorKind, OpenJarvisCli, SkillCommand,
     },
     config::{AgentMcpServerTransportConfig, AppConfig, BUILTIN_MCP_SERVER_NAME},
 };
@@ -291,6 +291,30 @@ fn cli_parses_internal_sandbox_exec_command() {
             assert_eq!(args, &["-lc".to_string(), "printf helper".to_string()]);
         }
         other => panic!("unexpected parsed sandbox exec command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_parses_internal_sandbox_executor_command() {
+    let cli = OpenJarvisCli::parse_from([
+        "openjarvis",
+        "internal-sandbox",
+        "executor",
+        "--kind",
+        "command-session",
+        "--snapshot-fd",
+        "7",
+    ]);
+
+    match cli.internal_sandbox_command() {
+        Some(InternalSandboxCommand::Executor { kind, snapshot_fd }) => {
+            assert_eq!(
+                kind.as_str(),
+                InternalSandboxExecutorKind::CommandSession.as_str()
+            );
+            assert_eq!(*snapshot_fd, 7);
+        }
+        other => panic!("unexpected parsed sandbox executor command: {other:?}"),
     }
 }
 

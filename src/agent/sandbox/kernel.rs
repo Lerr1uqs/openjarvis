@@ -2,13 +2,17 @@
 
 use super::{
     BubblewrapCapabilityConfig, BubblewrapCommandProfileConfig, BubblewrapCompatibilityConfig,
+    SandboxExecutorPolicySnapshot,
 };
 use anyhow::{Context, Result, bail};
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus,
     Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
-use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+use seccompiler::{
+    SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    TargetArch,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -183,6 +187,12 @@ struct LandlockBuiltinProfile {
     rules: &'static [LandlockBuiltinRule],
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SeccompBuiltinRule {
+    DenySyscall(&'static str),
+    DenyCloneNamespaceFlags,
+}
+
 /// Validate bubblewrap kernel-enforcement configuration semantics before runtime compilation.
 ///
 /// # 示例
@@ -341,7 +351,7 @@ pub(crate) fn compile_kernel_enforcement_plan(
     Ok(plan)
 }
 
-pub(crate) fn install_proxy_enforcement(
+pub(crate) fn install_proxy_landlock(
     plan: &SandboxKernelEnforcementPlan,
     workspace_root: &Path,
 ) -> Result<()> {
@@ -349,8 +359,7 @@ pub(crate) fn install_proxy_enforcement(
     info!(
         workspace_root = %workspace_root.display(),
         landlock_profile = plan.proxy.landlock_profile(),
-        seccomp_profile = plan.proxy.baseline_seccomp_profile(),
-        "installing sandbox proxy kernel enforcement"
+        "installing sandbox proxy landlock enforcement"
     );
     maybe_install_landlock(
         plan.proxy.landlock_profile(),
@@ -358,7 +367,15 @@ pub(crate) fn install_proxy_enforcement(
         plan.compatibility(),
         "proxy",
     )?;
-    maybe_install_seccomp(
+    Ok(())
+}
+
+pub(crate) fn install_proxy_seccomp(plan: &SandboxKernelEnforcementPlan) -> Result<()> {
+    info!(
+        seccomp_profile = plan.proxy.baseline_seccomp_profile(),
+        "installing sandbox proxy baseline seccomp"
+    );
+    maybe_install_seccomp_all_threads(
         plan.proxy.baseline_seccomp_profile(),
         plan.compatibility(),
         "proxy",
@@ -366,28 +383,35 @@ pub(crate) fn install_proxy_enforcement(
     Ok(())
 }
 
-pub(crate) fn install_command_profile(
-    profile: &SandboxCommandChildProfilePlan,
-    workspace_root: &Path,
+pub(crate) fn install_executor_landlock(
+    snapshot: &SandboxExecutorPolicySnapshot,
+    tty: bool,
 ) -> Result<()> {
-    ensure_no_new_privs().context("failed to enable no_new_privs for sandbox command child")?;
+    ensure_no_new_privs().context("failed to enable no_new_privs for sandbox executor")?;
     info!(
-        workspace_root = %workspace_root.display(),
-        profile_name = profile.name(),
-        landlock_profile = profile.landlock_profile(),
-        seccomp_profile = profile.seccomp_profile(),
-        "installing sandbox command-child kernel enforcement"
+        action = ?snapshot.action,
+        tty,
+        read_paths = ?snapshot.read_paths,
+        write_paths = ?snapshot.write_paths,
+        seccomp_tier = ?snapshot.seccomp_tier,
+        "installing sandbox executor dynamic landlock"
     );
-    maybe_install_landlock(
-        profile.landlock_profile(),
-        workspace_root,
-        profile.compatibility(),
-        "command child",
-    )?;
+    maybe_install_dynamic_landlock(snapshot, tty, "executor")?;
+    Ok(())
+}
+
+pub(crate) fn install_final_command_seccomp(
+    profile: &SandboxCommandChildProfilePlan,
+) -> Result<()> {
+    info!(
+        profile_name = profile.name(),
+        seccomp_profile = profile.seccomp_profile(),
+        "installing sandbox final command seccomp"
+    );
     maybe_install_seccomp(
         profile.seccomp_profile(),
         profile.compatibility(),
-        "command child",
+        "final command child",
     )?;
     Ok(())
 }
@@ -434,7 +458,7 @@ fn validate_builtin_landlock_profile(profile_name: &str) -> Result<()> {
 }
 
 fn validate_builtin_seccomp_profile(profile_name: &str) -> Result<()> {
-    if builtin_seccomp_syscalls(profile_name).is_none() {
+    if builtin_seccomp_rule_map(profile_name)?.is_none() {
         bail!("unknown sandbox seccomp profile `{profile_name}`");
     }
     Ok(())
@@ -492,12 +516,59 @@ fn maybe_install_landlock(
     Ok(())
 }
 
+fn maybe_install_dynamic_landlock(
+    snapshot: &SandboxExecutorPolicySnapshot,
+    tty: bool,
+    subject: &str,
+) -> Result<()> {
+    if let Err(error) = install_dynamic_landlock_profile(snapshot, tty) {
+        if snapshot.compatibility.require_landlock() || snapshot.compatibility.strict() {
+            return Err(error).with_context(|| {
+                format!(
+                    "{subject} Landlock enforcement for action `{:?}` is required but could not be installed",
+                    snapshot.action
+                )
+            });
+        }
+        warn!(
+            subject,
+            action = ?snapshot.action,
+            error = %error,
+            "dynamic landlock was not installed; continuing because the profile is optional"
+        );
+    }
+    Ok(())
+}
+
 fn maybe_install_seccomp(
     profile_name: &str,
     compatibility: &KernelEnforcementCompatibilityPlan,
     subject: &str,
 ) -> Result<()> {
     if let Err(error) = install_seccomp_profile(profile_name) {
+        if compatibility.require_seccomp() || compatibility.strict() {
+            return Err(error).with_context(|| {
+                format!(
+                    "{subject} seccomp enforcement `{profile_name}` is required but could not be installed"
+                )
+            });
+        }
+        warn!(
+            subject,
+            profile_name,
+            error = %error,
+            "seccomp enforcement was not installed; continuing because the profile is optional"
+        );
+    }
+    Ok(())
+}
+
+fn maybe_install_seccomp_all_threads(
+    profile_name: &str,
+    compatibility: &KernelEnforcementCompatibilityPlan,
+    subject: &str,
+) -> Result<()> {
+    if let Err(error) = install_seccomp_profile_all_threads(profile_name) {
         if compatibility.require_seccomp() || compatibility.strict() {
             return Err(error).with_context(|| {
                 format!(
@@ -563,6 +634,100 @@ fn install_landlock_profile(
         "installed sandbox landlock profile"
     );
     Ok(status)
+}
+
+fn install_dynamic_landlock_profile(
+    snapshot: &SandboxExecutorPolicySnapshot,
+    tty: bool,
+) -> Result<RestrictionStatus> {
+    let abi = abi_from_u8(snapshot.compatibility.min_landlock_abi())?;
+    let ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(abi))
+        .context("failed to create handled Landlock access set for dynamic executor")?;
+    let mut created = ruleset
+        .create()
+        .context("failed to create dynamic executor Landlock ruleset")?;
+    let mut rules = BTreeMap::new();
+    if snapshot.action.is_command() {
+        merge_dynamic_landlock_rule(&mut rules, PathBuf::from("/"), LandlockPathMode::ReadOnly);
+    }
+    for read_path in &snapshot.read_paths {
+        merge_dynamic_landlock_rule(&mut rules, read_path.clone(), LandlockPathMode::ReadOnly);
+    }
+    for write_path in &snapshot.write_paths {
+        merge_dynamic_landlock_rule(&mut rules, write_path.clone(), LandlockPathMode::ReadWrite);
+    }
+    if snapshot.action.is_command() && tty {
+        merge_dynamic_landlock_rule(
+            &mut rules,
+            PathBuf::from("/dev/pts"),
+            LandlockPathMode::ReadWrite,
+        );
+        merge_dynamic_landlock_rule(
+            &mut rules,
+            PathBuf::from("/dev/ptmx"),
+            LandlockPathMode::ReadWrite,
+        );
+    }
+
+    for (target, mode) in rules {
+        if !target.exists() {
+            bail!(
+                "dynamic Landlock requires missing path `{}` for action `{:?}`",
+                target.display(),
+                snapshot.action
+            );
+        }
+        let access = landlock_accesses(mode, abi, &target)?;
+        created = created
+            .add_rule(PathBeneath::new(PathFd::new(&target)?, access))
+            .with_context(|| {
+                format!(
+                    "failed to add dynamic Landlock rule for action `{:?}` target `{}`",
+                    snapshot.action,
+                    target.display()
+                )
+            })?;
+    }
+
+    let status = created.restrict_self().with_context(|| {
+        format!(
+            "failed to install dynamic Landlock for `{:?}`",
+            snapshot.action
+        )
+    })?;
+    if status.ruleset == RulesetStatus::NotEnforced {
+        bail!(
+            "dynamic Landlock for action `{:?}` was not enforced",
+            snapshot.action
+        );
+    }
+    debug!(
+        action = ?snapshot.action,
+        tty,
+        landlock_status = ?status.landlock,
+        ruleset_status = ?status.ruleset,
+        "installed dynamic sandbox landlock"
+    );
+    Ok(status)
+}
+
+fn merge_dynamic_landlock_rule(
+    rules: &mut BTreeMap<PathBuf, LandlockPathMode>,
+    target: PathBuf,
+    mode: LandlockPathMode,
+) {
+    match rules.get_mut(&target) {
+        Some(existing) => {
+            if matches!(mode, LandlockPathMode::ReadWrite) {
+                *existing = LandlockPathMode::ReadWrite;
+            }
+        }
+        None => {
+            rules.insert(target, mode);
+        }
+    }
 }
 
 fn landlock_accesses(
@@ -662,23 +827,23 @@ fn install_seccomp_profile(profile_name: &str) -> Result<()> {
     Ok(())
 }
 
+fn install_seccomp_profile_all_threads(profile_name: &str) -> Result<()> {
+    let program = compile_seccomp_program(profile_name)
+        .with_context(|| format!("failed to compile seccomp profile `{profile_name}`"))?;
+    seccompiler::apply_filter_all_threads(&program).with_context(|| {
+        format!("failed to apply seccomp profile `{profile_name}` to all proxy threads")
+    })?;
+    debug!(
+        profile_name,
+        "installed sandbox seccomp profile on all proxy threads"
+    );
+    Ok(())
+}
+
 fn compile_seccomp_program(profile_name: &str) -> Result<seccompiler::BpfProgram> {
     let target_arch = seccomp_target_arch()?;
-    let rules = builtin_seccomp_syscalls(profile_name)
+    let rule_map = builtin_seccomp_rule_map(profile_name)?
         .ok_or_else(|| anyhow::anyhow!("unknown sandbox seccomp profile `{profile_name}`"))?;
-    let rule_map = rules
-        .iter()
-        .map(|syscall| {
-            Ok((
-                syscall_number(syscall).with_context(|| {
-                    format!(
-                        "failed to resolve syscall `{syscall}` for seccomp profile `{profile_name}`"
-                    )
-                })?,
-                Vec::new(),
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
     let filter = SeccompFilter::new(
         rule_map,
         SeccompAction::Allow,
@@ -695,35 +860,135 @@ fn seccomp_target_arch() -> Result<TargetArch> {
     TargetArch::try_from(std::env::consts::ARCH).context("unsupported seccomp target arch")
 }
 
-fn builtin_seccomp_syscalls(profile_name: &str) -> Option<&'static [&'static str]> {
-    const BASELINE_DENYLIST: &[&str] = &[
-        "mount",
-        "umount2",
-        "pivot_root",
-        "setns",
-        "unshare",
-        "bpf",
-        "ptrace",
-        "init_module",
-        "finit_module",
-        "delete_module",
-        "userfaultfd",
-        "keyctl",
-        "kexec_load",
-        "perf_event_open",
-        "process_vm_readv",
-        "process_vm_writev",
-        "reboot",
-        "swapon",
-        "swapoff",
+fn builtin_seccomp_rule_map(profile_name: &str) -> Result<Option<BTreeMap<i64, Vec<SeccompRule>>>> {
+    const PROXY_BASELINE_RULES: &[SeccompBuiltinRule] = &[
+        SeccompBuiltinRule::DenySyscall("mount"),
+        SeccompBuiltinRule::DenySyscall("umount2"),
+        SeccompBuiltinRule::DenySyscall("pivot_root"),
+        SeccompBuiltinRule::DenySyscall("open_tree"),
+        SeccompBuiltinRule::DenySyscall("move_mount"),
+        SeccompBuiltinRule::DenySyscall("fsopen"),
+        SeccompBuiltinRule::DenySyscall("fsmount"),
+        SeccompBuiltinRule::DenySyscall("fspick"),
+        SeccompBuiltinRule::DenySyscall("mount_setattr"),
+        SeccompBuiltinRule::DenySyscall("setns"),
+        SeccompBuiltinRule::DenySyscall("unshare"),
+        SeccompBuiltinRule::DenyCloneNamespaceFlags,
+        SeccompBuiltinRule::DenySyscall("bpf"),
+        SeccompBuiltinRule::DenySyscall("ptrace"),
+        SeccompBuiltinRule::DenySyscall("init_module"),
+        SeccompBuiltinRule::DenySyscall("finit_module"),
+        SeccompBuiltinRule::DenySyscall("delete_module"),
+        SeccompBuiltinRule::DenySyscall("userfaultfd"),
+        SeccompBuiltinRule::DenySyscall("keyctl"),
+        SeccompBuiltinRule::DenySyscall("kexec_load"),
+        SeccompBuiltinRule::DenySyscall("perf_event_open"),
+        SeccompBuiltinRule::DenySyscall("process_vm_readv"),
+        SeccompBuiltinRule::DenySyscall("process_vm_writev"),
+        SeccompBuiltinRule::DenySyscall("reboot"),
+        SeccompBuiltinRule::DenySyscall("swapon"),
+        SeccompBuiltinRule::DenySyscall("swapoff"),
+    ];
+    const COMMAND_CHILD_RULES: &[SeccompBuiltinRule] = &[
+        SeccompBuiltinRule::DenySyscall("mount"),
+        SeccompBuiltinRule::DenySyscall("umount2"),
+        SeccompBuiltinRule::DenySyscall("pivot_root"),
+        SeccompBuiltinRule::DenySyscall("open_tree"),
+        SeccompBuiltinRule::DenySyscall("move_mount"),
+        SeccompBuiltinRule::DenySyscall("fsopen"),
+        SeccompBuiltinRule::DenySyscall("fsmount"),
+        SeccompBuiltinRule::DenySyscall("fspick"),
+        SeccompBuiltinRule::DenySyscall("mount_setattr"),
+        SeccompBuiltinRule::DenySyscall("setns"),
+        SeccompBuiltinRule::DenySyscall("unshare"),
+        SeccompBuiltinRule::DenyCloneNamespaceFlags,
+        // `clone3` hides namespace flags behind a user-space pointer, so baseline seccomp
+        // cannot safely mask-match `CLONE_NEW*` bits. Command children install this stricter
+        // rule after the helper process has already been spawned.
+        SeccompBuiltinRule::DenySyscall("clone3"),
+        SeccompBuiltinRule::DenySyscall("bpf"),
+        SeccompBuiltinRule::DenySyscall("ptrace"),
+        SeccompBuiltinRule::DenySyscall("init_module"),
+        SeccompBuiltinRule::DenySyscall("finit_module"),
+        SeccompBuiltinRule::DenySyscall("delete_module"),
+        SeccompBuiltinRule::DenySyscall("userfaultfd"),
+        SeccompBuiltinRule::DenySyscall("keyctl"),
+        SeccompBuiltinRule::DenySyscall("kexec_load"),
+        SeccompBuiltinRule::DenySyscall("perf_event_open"),
+        SeccompBuiltinRule::DenySyscall("process_vm_readv"),
+        SeccompBuiltinRule::DenySyscall("process_vm_writev"),
+        SeccompBuiltinRule::DenySyscall("reboot"),
+        SeccompBuiltinRule::DenySyscall("swapon"),
+        SeccompBuiltinRule::DenySyscall("swapoff"),
     ];
 
-    match profile_name {
-        DEFAULT_BASELINE_SECCOMP_PROFILE
-        | DEFAULT_COMMAND_SECCOMP_PROFILE
-        | COMMAND_READONLY_SECCOMP_PROFILE => Some(BASELINE_DENYLIST),
-        _ => None,
+    let rules = match profile_name {
+        DEFAULT_BASELINE_SECCOMP_PROFILE => PROXY_BASELINE_RULES,
+        DEFAULT_COMMAND_SECCOMP_PROFILE | COMMAND_READONLY_SECCOMP_PROFILE => COMMAND_CHILD_RULES,
+        _ => return Ok(None),
+    };
+
+    let mut rule_map = BTreeMap::new();
+    for rule in rules {
+        match rule {
+            SeccompBuiltinRule::DenySyscall(syscall) => {
+                let syscall_number = syscall_number(syscall).with_context(|| {
+                    format!(
+                        "failed to resolve syscall `{syscall}` for seccomp profile `{profile_name}`"
+                    )
+                })?;
+                rule_map.entry(syscall_number).or_insert_with(Vec::new);
+            }
+            SeccompBuiltinRule::DenyCloneNamespaceFlags => {
+                let syscall_number = syscall_number("clone").with_context(|| {
+                    format!(
+                        "failed to resolve syscall `clone` for seccomp profile `{profile_name}`"
+                    )
+                })?;
+                rule_map
+                    .entry(syscall_number)
+                    .or_insert_with(Vec::new)
+                    .extend(clone_namespace_seccomp_rules().with_context(|| {
+                        format!(
+                            "failed to build namespace-aware `clone` seccomp rules for profile `{profile_name}`"
+                        )
+                    })?);
+            }
+        }
     }
+    Ok(Some(rule_map))
+}
+
+fn clone_namespace_seccomp_rules() -> Result<Vec<SeccompRule>> {
+    const CLONE_NAMESPACE_FLAGS: &[u64] = &[
+        libc::CLONE_NEWNS as u64,
+        libc::CLONE_NEWCGROUP as u64,
+        libc::CLONE_NEWUTS as u64,
+        libc::CLONE_NEWIPC as u64,
+        libc::CLONE_NEWUSER as u64,
+        libc::CLONE_NEWPID as u64,
+        libc::CLONE_NEWNET as u64,
+        libc::CLONE_NEWTIME as u64,
+    ];
+
+    CLONE_NAMESPACE_FLAGS
+        .iter()
+        .copied()
+        .map(|flag| {
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Qword,
+                    SeccompCmpOp::MaskedEq(flag),
+                    flag,
+                )
+                .with_context(|| {
+                    format!("failed to build `clone` seccomp condition for mask `{flag:#x}`")
+                })?,
+            ])
+            .context("failed to build `clone` seccomp rule")
+        })
+        .collect()
 }
 
 fn syscall_number(name: &str) -> Result<i64> {
@@ -731,8 +996,16 @@ fn syscall_number(name: &str) -> Result<i64> {
         "mount" => libc::SYS_mount,
         "umount2" => libc::SYS_umount2,
         "pivot_root" => libc::SYS_pivot_root,
+        "open_tree" => libc::SYS_open_tree,
+        "move_mount" => libc::SYS_move_mount,
+        "fsopen" => libc::SYS_fsopen,
+        "fsmount" => libc::SYS_fsmount,
+        "fspick" => libc::SYS_fspick,
+        "mount_setattr" => libc::SYS_mount_setattr,
         "setns" => libc::SYS_setns,
         "unshare" => libc::SYS_unshare,
+        "clone" => libc::SYS_clone,
+        "clone3" => libc::SYS_clone3,
         "bpf" => libc::SYS_bpf,
         "ptrace" => libc::SYS_ptrace,
         "init_module" => libc::SYS_init_module,

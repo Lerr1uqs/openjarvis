@@ -231,7 +231,10 @@ impl CommandSessionManager {
             "starting command session"
         );
         let spawned = spawn_command(&request, &launch_options).await?;
-        let session_id = format!("command-session-{}", Uuid::new_v4());
+        let session_id = launch_options
+            .session_id_override
+            .clone()
+            .unwrap_or_else(|| format!("command-session-{}", Uuid::new_v4()));
         let snapshot = CommandTaskSnapshot {
             thread_id: thread_id.clone(),
             session_id: session_id.clone(),

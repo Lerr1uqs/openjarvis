@@ -322,6 +322,24 @@ pub enum InternalObswikiCommand {
 }
 
 /// Demo-only internal sandbox helper commands.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum InternalSandboxExecutorKind {
+    File,
+    CommandOnce,
+    CommandSession,
+}
+
+impl InternalSandboxExecutorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::CommandOnce => "command-once",
+            Self::CommandSession => "command-session",
+        }
+    }
+}
+
+/// Demo-only internal sandbox helper commands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum InternalSandboxCommand {
     /// Run the JSON-RPC proxy used by the bubblewrap sandbox backend.
@@ -358,5 +376,15 @@ pub enum InternalSandboxCommand {
         /// Arguments forwarded to the real program.
         #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Run one hidden executor helper that consumes a one-shot policy snapshot fd.
+    #[command(name = "executor", hide = true)]
+    Executor {
+        /// Executor role selected by the proxy control plane.
+        #[arg(long, value_enum)]
+        kind: InternalSandboxExecutorKind,
+        /// One-shot inherited fd that contains the serialized policy snapshot.
+        #[arg(long)]
+        snapshot_fd: i32,
     },
 }

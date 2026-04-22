@@ -81,33 +81,48 @@
 | `command_profiles.profiles` | 逻辑 profile 到 builtin profile 的映射 |
 | `compatibility` | 内核能力与 fail-closed 要求 |
 
-## 当前未实现或待补齐的问题
+## 近期已补齐的事项
 
-### 1. baseline seccomp denylist 未覆盖完整逃逸面
+### 1. seccomp 已补齐新 mount API，并补强 namespace 逃逸相关规则
 
-这是当前最重要的问题。
+当前 seccomp profile 已补齐以下覆盖：
 
-现有 baseline denylist 只覆盖了传统 syscall，例如：
+- 传统 mount / namespace 逃逸 syscall，如 `mount`、`umount2`、`pivot_root`、`setns`、`unshare`
+- 新 mount API，如 `open_tree`、`move_mount`、`fsopen`、`fsmount`、`fspick`、`mount_setattr`
+- `clone` 上与 `CLONE_NEW*` 相关的 namespace flag
+- command child profile 下的 `clone3`
 
-- `mount`
-- `umount2`
-- `pivot_root`
-- `setns`
-- `unshare`
-- `bpf`
-- `ptrace`
+其中：
 
-但还没有覆盖新 mount API 和部分 namespace 相关入口，例如：
+- proxy baseline profile 负责拦截传统逃逸 syscall、新 mount API 和 `clone` 的 `CLONE_NEW*` 参数位
+- command child profile 在此基础上额外 deny `clone3`
+- `clone3` 因 namespace flag 位于用户态结构体中，seccomp 无法安全按位检查，因此 child profile 里按整条 syscall deny 处理
 
-- `open_tree`
-- `move_mount`
-- `fsopen`
-- `fsmount`
-- `fspick`
-- `mount_setattr`
-- `clone` / `clone3` 上与 `CLONE_NEW*` 相关的参数级限制
+### 2. baseline seccomp 已增加直接回归测试
 
-这意味着当前 spec 对“baseline seccomp 会阻止 sandbox escape syscall”的承诺强于实际实现，需要继续补齐。
+当前已新增 syscall probe 回归测试，直接验证 sandbox 命令链路会对 escape-oriented syscall 返回 `EPERM`，而不只是验证 profile 可以被编译。
+
+当前测试会优先覆盖宿主环境上可观测的 probe case，包括：
+
+- 新 mount API
+- `clone3`
+
+## 当前仍未实现或待补齐的问题
+
+### 1. proxy baseline 仍未直接 deny `clone3`
+
+当前 proxy baseline 还不能直接 deny `clone3`。
+
+原因是：
+
+- proxy 在处理 `command.exec` 时仍需要依赖当前运行时/标准库的进程拉起路径
+- 当前这条路径在宿主环境上会用到 `clone3`
+- 如果直接把 `clone3` 放进 proxy baseline denylist，会导致 command child 无法被正常拉起
+
+当前做法是：
+
+- proxy baseline 先覆盖传统逃逸 syscall、新 mount API 和 `clone` 的 namespace flag
+- `clone3` 由 command child profile 在 helper 进程真正 `exec` 用户命令前收口
 
 ### 2. seccomp denylist 目前不支持自定义
 
@@ -118,18 +133,7 @@
 - 不能通过改配置补齐缺失 syscall。
 - 如果要补齐 denylist，必须修改代码里的 builtin profile 实现。
 
-### 3. baseline seccomp 缺少直接回归测试
-
-当前已有测试主要覆盖：
-
-- 配置解析
-- proxy 启动失败/成功路径
-- readonly profile 对 workspace 写入的拒绝
-- pipe/PTY 两条命令链路都经过 child helper
-
-但还缺少直接验证“某个 escape-oriented syscall 会被 baseline seccomp 拒绝”的测试，因此 seccomp 覆盖不完整时，CI 目前不一定能第一时间发现。
-
-### 4. 能力覆盖范围仍是首版
+### 3. 能力覆盖范围仍是首版
 
 当前 sandbox kernel enforcement 首版主要覆盖 sandbox 内的 command child。
 
@@ -139,8 +143,7 @@
 - browser sidecar / MCP sidecar 的同类 child profile 体系
 - 非 Linux 平台的等价实现
 
-## 建议明天优先处理的事项
+## 后续事项
 
-1. 先补齐 builtin baseline seccomp denylist，至少覆盖新 mount API 和 namespace 逃逸相关 syscall。
-2. 增加 baseline seccomp 的集成测试，直接验证拒绝行为，而不是只验证 profile 可编译。
-3. 再决定是否要设计“可配置 seccomp profile / denylist”能力，避免以后每次补 syscall 都需要改代码。
+1. 再决定是否要设计“可配置 seccomp profile / denylist”能力，避免以后每次补 syscall 都需要改代码。
+2. 评估是否要把 profile 体系扩展到 browser sidecar、MCP sidecar 等长期子进程。

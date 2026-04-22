@@ -49,6 +49,7 @@ struct ShellCommandSpec {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CommandLaunchOptions {
     pub(crate) exec_helper: Option<CommandExecHelperSpec>,
+    pub(crate) session_id_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]

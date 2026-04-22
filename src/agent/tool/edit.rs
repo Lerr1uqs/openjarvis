@@ -58,26 +58,25 @@ impl ToolHandler for EditTool {
             bail!("edit tool requires non-empty `old_text`");
         }
 
-        let content = match context.active_sandbox() {
-            Some(sandbox) => sandbox
-                .read_workspace_text(Path::new(&args.path))
-                .with_context(|| format!("failed to read sandbox file {}", args.path))?,
-            None => fs::read_to_string(&args.path)
-                .with_context(|| format!("failed to read file {}", args.path))?,
-        };
-        let match_count = content.matches(&args.old_text).count();
-        if match_count == 0 {
-            bail!("edit tool did not find target text in {}", args.path);
-        }
-
-        let updated = content.replacen(&args.old_text, &args.new_text, 1);
-
-        match context.active_sandbox() {
-            Some(sandbox) => sandbox
-                .write_workspace_text(Path::new(&args.path), &updated)
-                .with_context(|| format!("failed to write sandbox file {}", args.path))?,
-            None => fs::write(&args.path, &updated)
-                .with_context(|| format!("failed to write file {}", args.path))?,
+        let match_count = match context.active_sandbox() {
+            Some(sandbox) => {
+                sandbox
+                    .edit_workspace_text(Path::new(&args.path), &args.old_text, &args.new_text)
+                    .with_context(|| format!("failed to edit sandbox file {}", args.path))?
+                    .match_count
+            }
+            None => {
+                let content = fs::read_to_string(&args.path)
+                    .with_context(|| format!("failed to read file {}", args.path))?;
+                let match_count = content.matches(&args.old_text).count();
+                if match_count == 0 {
+                    bail!("edit tool did not find target text in {}", args.path);
+                }
+                let updated = content.replacen(&args.old_text, &args.new_text, 1);
+                fs::write(&args.path, &updated)
+                    .with_context(|| format!("failed to write file {}", args.path))?;
+                match_count
+            }
         };
 
         Ok(ToolCallResult {
